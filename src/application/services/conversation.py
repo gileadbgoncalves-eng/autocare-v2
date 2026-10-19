@@ -189,9 +189,16 @@ class ConversationService:
         Processa respostas quando há um rascunho pendente de confirmação.
         """
         is_affirmative = bool(re.search(r"\b(sim|confirmo|confirma|pode\s+salvar|salvar|salva|isso|correto|pode\s+registrar|com\s+certeza|positivo)\b", text_lower))
-        is_negative = bool(re.search(r"\b(n[ãa]o|cancela|cancelar|n[ãa]o\s+salva|abortar|errado|esquece|parar)\b", text_lower))
+        is_negative = bool(re.search(r"\b(n[ãa]o|cancela|cancelar|n[ãa]o\s+salva|abortar|errado|errei|esquece|parar)\b", text_lower))
 
-        # A) Confirmação Positiva: Executa persistência definitiva
+        # Detecta se o usuário está corrigindo dados do rascunho (ex: "Não, a placa é...", "Não, o ano é 2023")
+        is_correction = bool(re.search(
+            r"(\b(placa|ano|km|quilometragem|valor|custo|pre[çc]o|reais|oficina|pe[çc]a|marca|modelo|troc|troquei|troca|era|foi|seria|[ée])\b|"
+            r"\b[a-zA-Z]{3}\d[a-zA-Z0-9]\d{2}\b|\b(19\d\d|20\d\d)\b|\b\d+\s*(km|reais|r\$))",
+            text_lower
+        ))
+
+        # A) Confirmação Positiva Direta: Executa persistência definitiva
         if is_affirmative and not is_negative:
             executed_action = context.state.value
             draft_data = context.draft_payload or {}
@@ -216,8 +223,8 @@ class ConversationService:
                 "committed_data": draft_data,
             }
 
-        # B) Recusa / Cancelamento: Descarta o rascunho
-        if is_negative:
+        # B) Recusa / Cancelamento Puro: Descarta o rascunho apenas se NÃO for uma mensagem de correção de dados
+        if is_negative and not is_correction:
             context.state = ConversationState.NORMAL
             context.draft_payload = None
             return {
@@ -227,7 +234,7 @@ class ConversationService:
                 "details": {}
             }
 
-        # C) Se enviou correção ou nova dúvida durante a confirmação
+        # B) Se enviou correção de dados ("Não, a placa é...", "o ano é 2023") ou dúvida: consulta Gemini
         history_dicts = [{"role": t.role, "content": t.content} for t in context.recent_turns]
         analysis = await self.gemini.analyze_message(
             user_id=user_id,
@@ -259,6 +266,10 @@ class ConversationService:
                 "state": context.state.value,
                 "committed_data": draft_data,
             }
+
+        # Se for correção de dados do rascunho (is_critical_action = True): atualiza rascunho e solicita nova confirmação
+        if analysis.is_critical_action:
+            return self._initiate_confirmation_flow(context, analysis)
 
         # D) Caso permaneça em dúvida: reapresenta a pergunta de confirmação de forma objetiva
         return {

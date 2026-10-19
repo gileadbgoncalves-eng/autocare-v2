@@ -339,6 +339,51 @@ async def test_conversation_service():
     assert service.get_context(user_id).state == ConversationState.NORMAL
     print("  ✅ Comando Universal de Escape ('sair') cancela qualquer rascunho: OK")
 
+    # 5.6 Teste de Correção de Rascunho com "Não, a placa é..." (Reconciliação e não cancelamento)
+    mock_gemini.next_response = GeminiAnalysisResponse(
+        intent=IntentType.REGISTER_VEHICLE,
+        confidence=ConfidenceLevel.HIGH,
+        is_critical_action=True,
+        reply_message="Identifiquei Honda Civic ano 2020. Deseja confirmar?",
+        extracted_entities={"make": "Honda", "model": "Civic", "year": 2020},
+    )
+    await service.handle_incoming_message(user_id, "Cadastra meu Civic 2020", vehicles=vehicles)
+    assert service.get_context(user_id).state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
+
+    # Usuário envia correção: "Não, a placa correta é ABC1234"
+    mock_gemini.next_response = GeminiAnalysisResponse(
+        intent=IntentType.REGISTER_VEHICLE,
+        confidence=ConfidenceLevel.HIGH,
+        is_critical_action=True,
+        reply_message="Corrigido! Alterei a placa para ABC1234. Honda Civic 2020 com placa ABC1234.",
+        extracted_entities={"make": "Honda", "model": "Civic", "year": 2020, "plate": "ABC1234"},
+    )
+    res_correction = await service.handle_incoming_message(user_id, "Não, a placa é ABC1234", vehicles=vehicles)
+    assert res_correction["action_type"] == "awaiting_confirmation"
+    assert service.get_context(user_id).state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
+    assert service.get_context(user_id).draft_payload["plate"] == "ABC1234"
+    assert "Corrigido!" in res_correction["reply"]
+    print("  ✅ Correção de rascunho ('Não, a placa é ABC1234') não cancela e atualiza dados: OK")
+
+    # Confirma o rascunho corrigido com sucesso
+    res_confirmed = await service.handle_incoming_message(user_id, "Sim, pode salvar", vehicles=vehicles)
+    assert res_confirmed["action_type"] == "action_confirmed"
+    assert service.get_context(user_id).state == ConversationState.NORMAL
+
+    # 5.7 Teste de Limite de 3 Veículos na Garagem
+    mock_gemini.next_response = GeminiAnalysisResponse(
+        intent=IntentType.UNKNOWN,
+        confidence=ConfidenceLevel.HIGH,
+        is_critical_action=False,
+        reply_message="Você já atingiu o limite de 3 veículos na sua garagem no plano gratuito. Gerencie seus veículos atuais para adicionar outro.",
+        extracted_entities={},
+    )
+    res_limit = await service.handle_incoming_message(user_id, "Quero cadastrar minha quarta moto", vehicles=vehicles)
+    assert res_limit["action_type"] == IntentType.UNKNOWN.value
+    assert service.get_context(user_id).state == ConversationState.NORMAL
+    assert "limite de 3 veículos" in res_limit["reply"]
+    print("  ✅ Limite de 3 veículos na garagem bloqueado cordialmente com UNKNOWN: OK")
+
 
 # 6. Testes do Webhook FastAPI
 async def test_fastapi_webhook():
