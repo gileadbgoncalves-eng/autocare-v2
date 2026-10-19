@@ -200,6 +200,13 @@ async def test_database_and_repositories():
         assert len(vehs_after) == 0
         print("  ✅ VehicleRepository (delete_all_by_user_id com cascade): OK")
 
+        # 3.9 Reset Completo do Usuário (reset_user_data)
+        stats = await user_repo.reset_user_data(test_user_id)
+        assert "vehicles_deleted" in stats
+        assert "maintenances_deleted" in stats
+        assert "reminders_deleted" in stats
+        print("  ✅ UserRepository (reset_user_data total: veículos, manutenções e lembretes): OK")
+
     await close_db()
 
 
@@ -383,6 +390,17 @@ async def test_conversation_service():
     assert service.get_context(user_id).state == ConversationState.NORMAL
     assert "limite de 3 veículos" in res_limit["reply"]
     print("  ✅ Limite de 3 veículos na garagem bloqueado cordialmente com UNKNOWN: OK")
+
+    # 5.8 Teste do Comando Rápido 'zerar sistema' (Fast-Path <1ms)
+    service.get_context(user_id).state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+    service.get_context(user_id).draft_payload = {"teste": 123}
+    res_reset = await service.handle_incoming_message(user_id, "zerar sistema", vehicles=vehicles)
+    assert res_reset["action_type"] == "system_reset"
+    assert res_reset["committed_data"]["_reset_system"] is True
+    assert service.get_context(user_id).state == ConversationState.NORMAL
+    assert service.get_context(user_id).draft_payload is None
+    assert "Garagem e Sistema zerados" in res_reset["reply"]
+    print("  ✅ Comando Rápido 'zerar sistema' (limpa estados, rascunhos e emite system_reset): OK")
 
 
 # 6. Testes do Webhook FastAPI

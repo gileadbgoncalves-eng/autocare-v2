@@ -78,6 +78,32 @@ class UserRepository:
             await self.save(user)
         return user
 
+    async def reset_user_data(self, user_id: str) -> dict:
+        """
+        Zera completamente todos os dados do usuário no banco:
+        remove todos os veículos, histórico de manutenção, multas e lembretes vinculados.
+        """
+        from .models import ReminderModel, TrafficFineModel
+
+        # 1. Remove lembretes do usuário
+        stmt_rem = delete(ReminderModel).where(ReminderModel.user_id == user_id)
+        res_rem = await self.session.execute(stmt_rem)
+
+        # 2. Remove manutenções do usuário
+        stmt_maint = delete(MaintenanceRecordModel).where(MaintenanceRecordModel.user_id == user_id)
+        res_maint = await self.session.execute(stmt_maint)
+
+        # 3. Remove veículos (cascata limpa relacionamentos restantes)
+        stmt_veh = delete(VehicleModel).where(VehicleModel.user_id == user_id)
+        res_veh = await self.session.execute(stmt_veh)
+
+        await self.session.commit()
+        return {
+            "vehicles_deleted": res_veh.rowcount,
+            "maintenances_deleted": res_maint.rowcount,
+            "reminders_deleted": res_rem.rowcount,
+        }
+
 
 class VehicleRepository:
     """Repositório de persistência para os veículos da garagem."""

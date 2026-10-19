@@ -5,6 +5,7 @@ de estados conversacionais, invoca o Gemini e assegura o fluxo de confirmação 
 """
 
 import re
+import unicodedata
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
@@ -64,6 +65,38 @@ class ConversationService:
                 reply = "✅ Operação cancelada! Seus dados anteriores foram mantidos intactos. Como posso te ajudar agora?"
                 self._record_assistant_turn(context, reply)
                 return {"reply": reply, "action_type": "flow_escaped", "state": context.state.value}
+
+        # 1.5 Comando Direto de Zerar/Resetar Sistema (Zero Latência para Testes)
+        norm_text = "".join(c for c in unicodedata.normalize("NFKD", text_lower) if not unicodedata.combining(c)).strip()
+        reset_triggers = {
+            "zerar", "reset", "resetar", "/reset", "/zerar", "/limpar", "/resetar", "/reset_all",
+            "zerar sistema", "zerar o sistema", "zerar todo o sistema", "zerar todo sistema",
+            "resetar sistema", "resetar o sistema", "resetar todo o sistema",
+            "limpar sistema", "limpar o sistema", "limpar tudo", "zerar tudo", "resetar tudo",
+            "apagar tudo", "excluir tudo", "zerar garagem", "limpar garagem", "resetar garagem",
+            "apagar garagem", "reiniciar sistema", "reiniciar cadastro", "comecar do zero", "iniciar do zero"
+        }
+        if norm_text in reset_triggers:
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            context.recent_turns.clear()
+            self.update_context(context)
+            reply = (
+                "🧹 *Garagem e Sistema zerados com sucesso!*\n\n"
+                "Todos os seus veículos, histórico de manutenção, gastos e lembretes foram removidos.\n"
+                "O seu perfil voltou ao ponto zero, pronto para novos testes!\n\n"
+                "🚀 *O que você gostaria de fazer agora?*\n"
+                "• Cadastrar um novo veículo (ex: *'Cadastrar meu Honda Civic'* ou *'Minha moto Fazer 250'*)\n"
+                "• Mandar uma dúvida técnica ou consulta mecânica"
+            )
+            self._record_assistant_turn(context, reply)
+            return {
+                "reply": reply,
+                "action_type": "system_reset",
+                "state": context.state.value,
+                "committed_data": {"_reset_system": True, "_reset_garage": True, "user_id": user_id},
+                "details": {"reset_all": True}
+            }
 
         # 2. Máquina de Estados: Se estiver aguardando confirmação do usuário
         if context.is_awaiting_confirmation():
@@ -202,6 +235,9 @@ class ConversationService:
         if is_affirmative and not is_negative:
             executed_action = context.state.value
             draft_data = context.draft_payload or {}
+            if executed_action == ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value:
+                draft_data["_reset_system"] = True
+                draft_data["_reset_garage"] = True
             
             # Limpa estado pendente
             context.state = ConversationState.NORMAL

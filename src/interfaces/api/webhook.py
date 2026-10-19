@@ -115,11 +115,11 @@ async def receive_webhook(
     action_type = result.get("action_type")
     committed_data = result.get("committed_data")
 
-    # 4. Se o usuário confirmou uma ação crítica pendente, persiste no banco
-    if action_type == "action_confirmed" and committed_data:
+    # 4. Se o usuário confirmou uma ação crítica pendente ou acionou o reset do sistema
+    if action_type in ("action_confirmed", "system_reset") and committed_data:
         try:
             # Caso A: Confirmação de Cadastro de Veículo
-            if "make" in committed_data and "model" in committed_data and "components" not in committed_data:
+            if "make" in committed_data and "model" in committed_data and "components" not in committed_data and not committed_data.get("_reset_system"):
                 new_vehicle = Vehicle(
                     user_id=user_id,
                     make=committed_data.get("make", "Desconhecido"),
@@ -136,7 +136,7 @@ async def receive_webhook(
                 logger.info(f"Veículo [{saved_vehicle.id}] cadastrado para o condutor [{user_id}]")
 
             # Caso B: Confirmação de Registro de Manutenção
-            elif "components" in committed_data or "labor_cost" in committed_data or "total_cost" in committed_data:
+            elif ("components" in committed_data or "labor_cost" in committed_data or "total_cost" in committed_data) and not committed_data.get("_reset_system"):
                 # Seleciona veículo ativo ou o único veículo da garagem
                 target_vehicle_id = None
                 if vehicles:
@@ -158,10 +158,15 @@ async def receive_webhook(
                     saved_maint = await maintenance_repo.add_record(new_maintenance)
                     logger.info(f"Manutenção [{saved_maint.id}] salva para o veículo [{target_vehicle_id}]")
 
-            # Caso C: Confirmação de Reset de Garagem
-            elif committed_data.get("_reset_garage") or "reset" in str(committed_data).lower():
-                deleted_count = await vehicle_repo.delete_all_by_user_id(user_id=user_id)
-                logger.info(f"Garagem do usuário [{user_id}] resetada ({deleted_count} veículos excluídos)")
+            # Caso C: Confirmação ou Comando Direto de Reset de Garagem / Sistema
+            elif (
+                action_type == "system_reset"
+                or committed_data.get("_reset_system")
+                or committed_data.get("_reset_garage")
+                or "reset" in str(committed_data).lower()
+            ):
+                reset_stats = await user_repo.reset_user_data(user_id=user_id)
+                logger.info(f"Garagem e Sistema do usuário [{user_id}] completamente zerados: {reset_stats}")
 
         except Exception as err:
             logger.error(f"Erro ao persistir ação confirmada no banco: {err}", exc_info=True)

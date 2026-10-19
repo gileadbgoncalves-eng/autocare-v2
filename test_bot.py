@@ -27,7 +27,7 @@ async def main():
     await init_db()
     print("✅ Banco inicializado com sucesso!")
     print("Digite suas mensagens como se estivesse conversando no WhatsApp.")
-    print("Digite 'sair', 'exit' ou 'quit' para encerrar o teste.\n")
+    print("Comandos rápidos: 'zerar sistema' (limpa tudo do zero), 'sair' (encerra o teste).\n")
 
     test_user_id = "5521999998888"
     conversation_service = ConversationService()
@@ -71,11 +71,21 @@ async def main():
             state = result.get("state")
             reply = result.get("reply")
 
-            # 3. Persistência real em caso de ação confirmada
-            if action_type == "action_confirmed" and committed_data:
+            # 3. Persistência real em caso de ação confirmada OU system_reset
+            if action_type in ("action_confirmed", "system_reset") and committed_data:
                 try:
+                    # Reset de Garagem / Sistema
+                    if (
+                        action_type == "system_reset"
+                        or committed_data.get("_reset_system")
+                        or committed_data.get("_reset_garage")
+                        or "reset" in str(committed_data).lower()
+                    ):
+                        reset_stats = await user_repo.reset_user_data(test_user_id)
+                        print(f"  🧹 [BANCO] Sistema e garagem zerados com sucesso: {reset_stats}")
+
                     # Cadastro de Veículo
-                    if "make" in committed_data and "model" in committed_data and "components" not in committed_data:
+                    elif "make" in committed_data and "model" in committed_data and "components" not in committed_data:
                         new_veh = Vehicle(
                             user_id=test_user_id,
                             make=committed_data.get("make", "Veículo"),
@@ -108,11 +118,6 @@ async def main():
                         )
                         saved = await maintenance_repo.add_record(new_maint)
                         print(f"  💾 [BANCO] Manutenção gravada no banco com ID: {saved.id}")
-
-                    # Reset de Garagem
-                    elif committed_data.get("_reset_garage") or "reset" in str(committed_data).lower():
-                        deleted = await vehicle_repo.delete_all_by_user_id(test_user_id)
-                        print(f"  💾 [BANCO] Garagem limpa: {deleted} veículos removidos.")
 
                 except Exception as ex:
                     print(f"  ⚠️ [ERRO AO PERSISTIR]: {ex}")
