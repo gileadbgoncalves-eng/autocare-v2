@@ -14,7 +14,7 @@ from typing import Optional, List, Dict, Any
 from src.config.settings import settings
 from src.domain.enums import IntentType, ConfidenceLevel
 from src.ai.schemas import GeminiAnalysisResponse
-from src.ai.prompts import SYSTEM_INSTRUCTION
+from src.ai.prompts import SYSTEM_INSTRUCTION, build_analysis_prompt
 
 try:
     import httpx
@@ -95,32 +95,13 @@ class GeminiClient:
         context: Optional[Any],
         vehicles: Optional[List[Any]],
     ) -> str:
-        """Monta o prompt com contexto e histórico recente de diálogo."""
-        sections = []
-
-        if vehicles:
-            v_lines = []
-            for v in vehicles:
-                v_name = f"{getattr(v, 'make', '')} {getattr(v, 'model', '')}".strip()
-                v_km = f"{v.current_km:,} km".replace(",", ".") if getattr(v, "current_km", None) else "sem km"
-                v_lines.append(f"- ID {getattr(v, 'id', 'n/d')}: {v_name} ({v_km})")
-            sections.append("[VEÍCULOS CADASTRADOS]:\n" + "\n".join(v_lines))
-
-        if context and hasattr(context, "state"):
-            sections.append(f"[ESTADO ATUAL DO USUÁRIO]: {context.state.value if hasattr(context.state, 'value') else context.state}")
-            if getattr(context, "draft_payload", None):
-                sections.append(f"[RASCUNHO PENDENTE DE CONFIRMAÇÃO]:\n{json.dumps(context.draft_payload, ensure_ascii=False)}")
-
-        if history:
-            h_lines = []
-            for turn in history[-6:]:
-                role = "Condutor" if turn.get("role") == "user" else "Assistente"
-                h_lines.append(f"{role}: {turn.get('content', '')}")
-            sections.append("[HISTÓRICO RECENTE DA CONVERSA]:\n" + "\n".join(h_lines))
-
-        sections.append(f"[MENSAGEM ATUAL DO CONDUTOR]:\n\"{message.strip()}\"")
-        sections.append("\nRetorne estritamente o JSON de acordo com o schema GeminiAnalysisResponse:")
-        return "\n\n".join(sections)
+        """Monta o prompt com contexto enriquecido, veículos completos (com tipo/moto) e histórico recente de diálogo."""
+        return build_analysis_prompt(
+            current_message=message,
+            context=context,
+            vehicles=vehicles,
+            history=history,
+        )
 
     @staticmethod
     def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:

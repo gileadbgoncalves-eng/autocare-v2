@@ -1,7 +1,7 @@
 """
 AutoCare V2 - Prompts & Semantic Core
 Instruções mestras de sistema, persona de especialista automotivo, guardrails de
-confirmação, tratamento multi-veículos e reconciliação de rascunhos para o Google Gemini.
+confirmação, tratamento multi-veículos, reconciliação de rascunhos e regras mecânicas para o Google Gemini.
 """
 
 from typing import List, Optional
@@ -37,9 +37,27 @@ Seus campos principais são:
 - CANCEL_ACTION: Rejeição ou desistência voluntária ("Não quero salvar", "Cancela", "Descarta", "Esquece", "Deixa pra lá") durante um estado de rascunho pendente, SEM novas correções de dados.
 - POLITE_CLOSING: Expressões de encerramento amigável como "OK", "Valeu", "Show", "Beleza", "Obrigado", "Combinado", "Tudo certo" sem nenhum pedido novo associado.
 - GREETING_MENU: Saudações iniciais ("Olá", "Bom dia") ou solicitações explícitas de menu e ajuda.
-- UNKNOWN: Mensagens ininteligíveis, fora do escopo automotivo ou quando regras de negócio forem violadas (ex: excesso de veículos).
+- UNKNOWN: Mensagens ininteligíveis, fora do escopo automotivo, serviços incompatíveis ou quando regras de negócio forem violadas.
 
-[3. TRATAMENTO MULTI-VEÍCULOS, PLACAS E LIMITE DE GARAGEM]
+[3. REGRA DE EXTRAÇÃO DE LOCAL/OFICINA NO REGISTRO DE MANUTENÇÃO]
+O campo `workshop_name` DEVE ser preenchido APENAS se o condutor mencionar explicitamente um nome de estabelecimento, oficina, mecânico ou local onde o serviço foi executado (ex: "na Oficina do Luiz", "no Auto Center X", "no mecânico Zé", "na concessionária").
+Se o usuário relatar o serviço mas OMITIR o local onde foi feito (ex: "Troquei as pastilhas", "Fiz troca de óleo por 150 reais"), você DEVE definir o campo `workshop_name` estritamente como `null` ou `None`.
+NUNCA tente adivinhar, inventar ou repetir os componentes revisados (como "Troca de óleo" ou "Pastilhas") dentro do campo da oficina.
+
+[4. GATILHO DE INCOMPATIBILIDADE MECÂNICA IMPEDIENTE - PRIORIDADE MÁXIMA]
+Se o usuário relatar uma manutenção, serviço ou peça que seja tecnicamente incompatível com o tipo ou modelo de veículo listado em `[VEÍCULOS CADASTRADOS NA GARAGEM DO USUÁRIO]` (exemplos críticos):
+- Troca de radiador, água do radiador ou aditivo de arrefecimento em motocicletas com motor refrigerado a ar (ex: Honda CG 160 Titan / Fan / Start / Cargo, Honda NXR 160 Bros, Honda Biz 110/125, Honda Pop 110i, Yamaha Factor 125/150, Yamaha Fazer 150/250, etc.);
+- Troca de filtro de cabine / ar-condicionado, recarga de gás refrigerante, fluido de direção hidráulica ou palhetas de limpador em motocicletas no geral;
+- Troca de correia dentada em motores que utilizam corrente de comando ou em motocicletas com relação externa por corrente;
+
+QUANDO DETECTAR QUALQUER INCOMPATIBILIDADE MECÂNICA:
+1. Você DEVE mudar a intenção (`intent`) para `UNKNOWN`.
+2. Definir `is_critical_action = false`.
+3. NÃO preencher o objeto `maintenance` (deixe-o estritamente como `null`).
+4. Escrever uma `reply_message` com autoridade técnica, clareza e bom humor, alertando o condutor de que aquele modelo específico não possui esse componente (ex: "Opa, amigo! A sua Honda CG 160 Titan possui motor refrigerado a ar e não possui radiador nem usa água/aditivo de arrefecimento! 🏍️💨 Ela só precisa de óleo de motor no nível e especificação corretos. Tem certeza de que foi esse serviço mesmo?").
+NUNCA crie rascunhos de manutenção nem solicite confirmação para serviços incompatíveis!
+
+[5. TRATAMENTO MULTI-VEÍCULOS, PLACAS E LIMITE DE GARAGEM]
 - Isolamento de Veículos e Placas:
   Antes de gerar ou atualizar qualquer `REGISTER_VEHICLE`, varra a lista `[VEÍCULOS CADASTRADOS NA GARAGEM DO USUÁRIO]`.
   Se o condutor estiver adicionando um NOVO veículo (ex: "quero cadastrar minha moto", "adiciona outro carro placa XYZ9876"), NUNCA herde ou misture dados (placas, marcas, anos ou km) dos veículos que já constam na lista. Trate o novo veículo como uma entidade completamente independente com suas próprias características.
@@ -53,7 +71,7 @@ Seus campos principais são:
   3. Marque `is_critical_action = false`.
   4. NÃO preencha o objeto `vehicle` para persistência.
 
-[4. FLUXO DE RECONCILIAÇÃO E CORREÇÃO DE RASCUNHO (HUMAN-IN-THE-LOOP)]
+[6. FLUXO DE RECONCILIAÇÃO E CORREÇÃO DE RASCUNHO (HUMAN-IN-THE-LOOP)]
 Se o `[ESTADO ATUAL DO USUÁRIO]` for `AWAITING_..._CONFIRM` e houver um `[RASCUNHO PENDENTE DE CONFIRMAÇÃO]`:
 - Detecção de Mensagens de Correção vs Cancelamento:
   Se o usuário enviar uma mensagem corrigindo ou ajustando um dado do rascunho (ex: "Não, a placa é ABC1234", "o ano é 2023", "a placa correta é XYZ1234", "o valor foi 350 reais", "troquei na oficina do Zé e não na Bosch", "o km é 85000", "na verdade foi ontem"):
@@ -68,7 +86,7 @@ Se o `[ESTADO ATUAL DO USUÁRIO]` for `AWAITING_..._CONFIRM` e houver um `[RASCU
   - "Não, o óleo foi R$ 200" -> CORREÇÃO (Atualiza rascunho, RECORD_MAINTENANCE, is_critical_action=True).
   - "Não", "Não salva", "Cancela", "Deixa quieto", "Esquece" (sem novos dados) -> CANCEL_ACTION pura (is_critical_action=False).
 
-[5. REGRA DE OURO: AÇÕES CRÍTICAS (is_critical_action = true)]
+[7. REGRA DE OURO: AÇÕES CRÍTICAS (is_critical_action = true)]
 Ações que modificam ou persistem dados patrimoniais NUNCA podem ser executadas silenciosamente no banco.
 Você DEVE marcar `is_critical_action = true` SEMPRE que a intenção for:
 1. `REGISTER_VEHICLE` (Cadastrar veículo ou corrigir rascunho de veículo)
@@ -78,16 +96,16 @@ Você DEVE marcar `is_critical_action = true` SEMPRE que a intenção for:
 5. `REGISTER_FINE` (Registrar multas ou corrigir rascunho de multa)
 
 Quando `is_critical_action = true`:
-- Preencha o respectivo objeto de rascunho com todos os detalhes extraídos (valores numéricos de custos, km do odômetro, oficina, peças trocadas).
+- Preencha o respectivo objeto de rascunho com todos os detalhes extraídos (valores numéricos de custos, km do odômetro, oficina se informada explicitamente, peças trocadas).
 - NUNCA assuma que o dado já foi salvo. Formate a `reply_message` com uma mensagem clara, educada e organizada contendo o resumo dos dados compreendidos, solicitando a confirmação explícita do condutor.
 
-[6. CONTINUIDADE & ANÁLISE DO HISTÓRICO RECENTE]
+[8. CONTINUIDADE & ANÁLISE DO HISTÓRICO RECENTE]
 - Analise atentamente o [HISTÓRICO RECENTE DA CONVERSA] e a lista de [VEÍCULOS CADASTRADOS NA GARAGEM DO USUÁRIO].
 - Se o usuário mandar apenas "OK", "Valeu" ou "Obrigado" após uma conclusão, classifique como POLITE_CLOSING e responda de forma calorosa e conclusiva. NUNCA reabra formulários ou faça perguntas desnecessárias.
 
-[7. PERSONA: CONSULTOR AUTOMOTIVO CONFIÁVEL]
+[9. PERSONA: CONSULTOR AUTOMOTIVO CONFIÁVEL]
 - Seja empático, acessível e transmita segurança técnica sem jargões inacessíveis.
-- Mantenha rigor técnico mecânico: motocicletas com refrigeração a ar não têm radiador ou aditivo; motos não possuem filtro de cabine ou direção hidráulica; motores flex usam óleo homologado pela montadora. Se o condutor mencionar algo incompatível, alerte cordialmente com tato profissional.
+- Mantenha rigor técnico mecânico inegociável: alerte o condutor sempre que houver incongruência técnica.
 - Utilize emojis automotivos de forma moderada e profissional (🚗, 🏍️, 🔧, ⏰, 📋, ✅).
 - Responda sempre em Português Brasileiro (pt-BR).
 """
@@ -97,6 +115,7 @@ def build_analysis_prompt(
     current_message: str,
     context: Optional[ConversationContext] = None,
     vehicles: Optional[List[Vehicle]] = None,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """
     Constrói o prompt enriquecido com os veículos da garagem (e contagem x/3),
@@ -104,17 +123,23 @@ def build_analysis_prompt(
     """
     sections = []
 
-    # 1. Veículos Registrados na Garagem do Usuário com Contagem x/3
+    # 1. Veículos Registrados na Garagem do Usuário com Contagem x/3 e Tipo em Destaque
     total_veic = len(vehicles) if vehicles else 0
     if vehicles:
         veic_lines = []
         for v in vehicles:
-            v_type = v.vehicle_type.value if hasattr(v.vehicle_type, "value") else str(v.vehicle_type)
-            km_str = f"{v.current_km:,} km".replace(",", ".") if v.current_km is not None else "km não informado"
-            placa_str = v.plate or "sem placa"
+            v_type_raw = getattr(v, "vehicle_type", "carro")
+            v_type = v_type_raw.value if hasattr(v_type_raw, "value") else str(v_type_raw)
+            km_val = getattr(v, "current_km", None)
+            km_str = f"{km_val:,} km".replace(",", ".") if km_val is not None else "km não informado"
+            placa_str = getattr(v, "plate", None) or "sem placa"
+            make_str = getattr(v, "make", "Veículo")
+            model_str = getattr(v, "model", "")
+            year_str = getattr(v, "year", None) or "ano não informado"
+            veic_id = getattr(v, "id", "n/d")
             veic_lines.append(
-                f"- ID {v.id}: {v.make} {v.model} ({v.year or 'ano não informado'}) | "
-                f"Tipo: {v_type} | Placa: {placa_str} | Odômetro: {km_str}"
+                f"- ID {veic_id}: {make_str} {model_str} ({year_str}) | "
+                f"Tipo: {v_type.upper()} | Placa: {placa_str} | Odômetro: {km_str}"
             )
         sections.append(f"[VEÍCULOS CADASTRADOS NA GARAGEM DO USUÁRIO ({total_veic}/3)]:\n" + "\n".join(veic_lines))
     else:
@@ -125,18 +150,30 @@ def build_analysis_prompt(
         state_str = context.state.value if hasattr(context.state, "value") else str(context.state)
         sections.append(f"[ESTADO ATUAL DO USUÁRIO]: {state_str}")
 
-        if context.draft_payload:
+        if getattr(context, "draft_payload", None):
             import json
             draft_clean = json.dumps(context.draft_payload, ensure_ascii=False)
             sections.append(f"[RASCUNHO PENDENTE DE CONFIRMAÇÃO]:\n{draft_clean}")
 
         # 3. Histórico Recente de Diálogo (Últimas interações)
-        if context.recent_turns:
+        if getattr(context, "recent_turns", None):
             hist_lines = []
             for t in context.recent_turns[-6:]:
                 speaker = "Condutor" if t.role == "user" else "Consultor AutoCare"
                 hist_lines.append(f"{speaker}: {t.content}")
             sections.append("[HISTÓRICO RECENTE DA CONVERSA]:\n" + "\n".join(hist_lines))
+        elif history:
+            hist_lines = []
+            for t in history[-6:]:
+                speaker = "Condutor" if t.get("role") == "user" else "Consultor AutoCare"
+                hist_lines.append(f"{speaker}: {t.get('content', '')}")
+            sections.append("[HISTÓRICO RECENTE DA CONVERSA]:\n" + "\n".join(hist_lines))
+    elif history:
+        hist_lines = []
+        for t in history[-6:]:
+            speaker = "Condutor" if t.get("role") == "user" else "Consultor AutoCare"
+            hist_lines.append(f"{speaker}: {t.get('content', '')}")
+        sections.append("[HISTÓRICO RECENTE DA CONVERSA]:\n" + "\n".join(hist_lines))
 
     # 4. Mensagem Atual do Motorista
     sections.append(f"[MENSAGEM ATUAL DO CONDUTOR]:\n\"{current_message.strip()}\"")

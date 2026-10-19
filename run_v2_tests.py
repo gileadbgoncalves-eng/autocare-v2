@@ -240,15 +240,25 @@ def test_ai_layer():
 
     # 4.2 Construção de Prompt Contextualizado
     v = Vehicle(user_id="123", make="Honda", model="Civic", current_km=80000)
+    moto = Vehicle(user_id="123", make="Honda", model="CG 160 Titan", vehicle_type="moto", current_km=12000)
     ctx = ConversationContext(user_id="123")
-    prompt = build_analysis_prompt("troquei o óleo dele hoje", context=ctx, vehicles=[v])
+    prompt = build_analysis_prompt("troquei o óleo dele hoje", context=ctx, vehicles=[v, moto])
     assert "Honda Civic" in prompt
-    assert "troquei o óleo dele hoje" in prompt
-    assert len(SYSTEM_INSTRUCTION) > 500
-    print("  ✅ build_analysis_prompt (injeção de veículos, odômetro e turnos): OK")
+    assert "CG 160 Titan" in prompt
+    assert "Tipo: MOTO" in prompt
+    assert "Tipo: CARRO" in prompt
+    assert "REGRA DE EXTRAÇÃO DE LOCAL/OFICINA" in SYSTEM_INSTRUCTION
+    assert "GATILHO DE INCOMPATIBILIDADE MECÂNICA IMPEDIENTE" in SYSTEM_INSTRUCTION
+    print("  ✅ build_analysis_prompt (injeção de veículos, destaque de MOTO e regras mecânicas): OK")
 
-    # 4.3 Fallback de Contingência do GeminiClient
+    # 4.3 Validação de Injeção no GeminiClient._format_prompt
     client = GeminiClient(api_key="")
+    client_prompt = client._format_prompt("troquei o radiador da moto", history=[], context=ctx, vehicles=[moto])
+    assert "Tipo: MOTO" in client_prompt
+    assert "CG 160 Titan" in client_prompt
+    print("  ✅ GeminiClient._format_prompt (garante que Tipo: MOTO é entregue ao Gemini): OK")
+
+    # 4.4 Fallback de Contingência do GeminiClient
     fallback_resp = client._build_contingency_fallback("Valeu, obrigado!", "Teste")
     assert fallback_resp.intent == IntentType.POLITE_CLOSING
     assert "Show de bola" in fallback_resp.reply_message
