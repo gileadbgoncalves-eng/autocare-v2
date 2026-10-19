@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+venv/
+.venv/
+
+# Bancos de dados locais
+*.db
+*.sqlite3
+
+# Arquivos temporários, binários e executáveis
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+cloudflared.exe
+*.exe
+
+# Variáveis de ambiente secretas
+.env
+*.env
+
+# Backups e relatórios gerados
+backups/
+**/backups/
+*.pdf
+**/dossiers/
+
+# Pasta isolada de arquivos legados da V1
+v1_ponto_de_parada_total/
