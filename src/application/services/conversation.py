@@ -220,8 +220,11 @@ class ConversationService:
     ) -> Dict[str, Any]:
         """
         Processa respostas quando há um rascunho pendente de confirmação.
+        Garante que apenas respostas curtas diretas de afirmação/negação sejam tratadas
+        via Fast-Path, enviando comandos complexos, correções e novas ações para o Gemini.
         """
-        is_affirmative = bool(re.search(r"\b(sim|confirmo|confirma|pode\s+salvar|salvar|salva|isso|correto|pode\s+registrar|com\s+certeza|positivo)\b", text_lower))
+        words = clean_text.strip().split()
+        is_affirmative = bool(re.search(r"\b(sim|confirmo|confirma|pode\s+salvar|salvar|salva|isso|correto|pode\s+registrar|com\s+certeza|positivo|fecho|fechado)\b", text_lower))
         is_negative = bool(re.search(r"\b(n[ãa]o|cancela|cancelar|n[ãa]o\s+salva|abortar|errado|errei|esquece|parar)\b", text_lower))
 
         # Detecta se o usuário está corrigindo dados do rascunho (ex: "Não, a placa é...", "Não, o ano é 2023")
@@ -231,8 +234,10 @@ class ConversationService:
             text_lower
         ))
 
-        # A) Confirmação Positiva Direta: Executa persistência definitiva
-        if is_affirmative and not is_negative:
+        # A) Confirmação Positiva Direta: Apenas mensagens curtas (<= 4 palavras) e sem entidades complexas novas
+        is_short_affirmative = is_affirmative and not is_negative and not is_correction and len(words) <= 4
+
+        if is_short_affirmative:
             executed_action = context.state.value
             draft_data = context.draft_payload or {}
             if executed_action == ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value:
@@ -259,8 +264,8 @@ class ConversationService:
                 "committed_data": draft_data,
             }
 
-        # B) Recusa / Cancelamento Puro: Descarta o rascunho apenas se NÃO for uma mensagem de correção de dados
-        if is_negative and not is_correction:
+        # B) Recusa / Cancelamento Puro Curto
+        if is_negative and not is_correction and len(words) <= 4:
             context.state = ConversationState.NORMAL
             context.draft_payload = None
             return {
@@ -270,7 +275,7 @@ class ConversationService:
                 "details": {}
             }
 
-        # B) Se enviou correção de dados ("Não, a placa é...", "o ano é 2023") ou dúvida: consulta Gemini
+        # C) Mensagens complexas, correções de dados, novas instruções ou dúvidas: consulta o Gemini
         history_dicts = [{"role": t.role, "content": t.content} for t in context.recent_turns]
         analysis = await self.gemini.analyze_message(
             user_id=user_id,
@@ -294,20 +299,53 @@ class ConversationService:
         # Se o usuário confirmou por vias semânticas
         if analysis.intent == IntentType.CONFIRM_ACTION:
             draft_data = context.draft_payload or {}
+            executed_action = context.state.value
             context.state = ConversationState.NORMAL
             context.draft_payload = None
+            success_messages = {
+                ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value: "🚗 *Veículo cadastrado com sucesso na sua garagem!*",
+                ConversationState.AWAITING_MAINTENANCE_CONFIRM.value: "✅ *Manutenção salva com sucesso no histórico oficial do seu veículo!*",
+                ConversationState.AWAITING_REMINDER_CONFIRM.value: "⏰ *Lembrete agendado com sucesso! Vou te alertar pontualmente no WhatsApp.*",
+                ConversationState.AWAITING_FINE_CONFIRM.value: "📋 *Multa registrada no painel de controle do veículo!*",
+                ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value: "🗑️ *Garagem zerada com sucesso! Todos os registros foram limpos.*",
+            }
+            msg = success_messages.get(executed_action, "✅ *Perfeito! Informações salvas com sucesso no seu histórico oficial!*")
             return {
-                "reply": "✅ *Perfeito! Informações salvas com sucesso no seu histórico oficial!*",
+                "reply": f"{msg}\n\nSe precisar de algo mais, é só me chamar!",
                 "action_type": "action_confirmed",
                 "state": context.state.value,
                 "committed_data": draft_data,
             }
 
-        # Se for correção de dados do rascunho (is_critical_action = True): atualiza rascunho e solicita nova confirmação
+        # Se for nova ação crítica OU correção de dados do rascunho (is_critical_action = True):
+        # Substitui/atualiza o rascunho e solicita confirmação para o novo dado
         if analysis.is_critical_action:
             return self._initiate_confirmation_flow(context, analysis)
 
-        # D) Caso permaneça em dúvida: reapresenta a pergunta de confirmação de forma objetiva
+        # Se for UNKNOWN (ex: incompatibilidade mecânica, serviço recusado, prompt injection ou fora de escopo):
+        # Retorna a resposta explicativa do Gemini e limpa o rascunho pendente incompatível
+        if analysis.intent == IntentType.UNKNOWN:
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            return {
+                "reply": analysis.reply_message,
+                "action_type": "unknown",
+                "state": context.state.value,
+                "details": analysis.extracted_entities
+            }
+
+        # Se for POLITE_CLOSING ou GREETING:
+        if analysis.intent in (IntentType.POLITE_CLOSING, IntentType.GREETING_MENU):
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            return {
+                "reply": analysis.reply_message,
+                "action_type": analysis.intent.value,
+                "state": context.state.value,
+                "details": {}
+            }
+
+        # D) Caso permaneça em dúvida genuína sobre o rascunho: reapresenta a pergunta de confirmação
         return {
             "reply": (
                 f"Você possui um registro aguardando sua resposta:\n\n"
