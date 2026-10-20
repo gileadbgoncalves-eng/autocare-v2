@@ -182,7 +182,7 @@ class GeminiClient:
 
             except (urllib.error.HTTPError, GeminiClientException) as err:
                 if attempt < self.max_retries:
-                    backoff = (2 ** attempt) + random.uniform(0.1, 0.4)
+                    backoff = (3.0 * attempt) + random.uniform(0.5, 1.5)
                     await asyncio.sleep(backoff)
                     continue
                 raise err

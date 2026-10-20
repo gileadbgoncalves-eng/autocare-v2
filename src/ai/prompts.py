@@ -4,7 +4,7 @@ Instruções mestras de sistema, persona de especialista automotivo, guardrails 
 confirmação, tratamento multi-veículos, reconciliação de rascunhos e regras mecânicas para o Google Gemini.
 """
 
-from typing import List, Optional
+from typing import dict, List, Optional
 from src.domain.entities import Vehicle, ConversationContext
 
 
@@ -115,7 +115,7 @@ def build_analysis_prompt(
     current_message: str,
     context: Optional[ConversationContext] = None,
     vehicles: Optional[List[Vehicle]] = None,
-    history: Optional[List[Dict[str, str]]] = None,
+    history: Optional[List[dict[str, str]]] = None,
 ) -> str:
     """
     Constrói o prompt enriquecido com os veículos da garagem (e contagem x/3),
