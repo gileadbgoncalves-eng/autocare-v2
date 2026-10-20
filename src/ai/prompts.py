@@ -4,7 +4,7 @@ Instruções mestras de sistema, persona de especialista automotivo, guardrails 
 confirmação, tratamento multi-veículos, reconciliação de rascunhos e regras mecânicas para o Google Gemini.
 """
 
-from typing import dict, List, Optional
+from typing import Dict, List, Optional
 from src.domain.entities import Vehicle, ConversationContext
 
 
