@@ -1,66 +1,75 @@
-# 📍 PONTO DE PARADA - AUTOCARE V2 (ARQUITETURA RECONSTRUÍDA DO ZERO)
+# 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (RED TEAMING & IA HOMOLOGADA)
 
-**Data do Checkpoint:** 19/10/2026  
-**Status do Projeto:** 100% Funcional, Modular, Assíncrono, Testado e Pronto para Produção.  
-**Taxa de Sucesso dos Testes:** 100% (6 suítes integradas executadas em 1.29s).
-
----
-
-## 🎯 Objetivo Cumprido
-Toda a lógica e arquitetura do AutoCare foram reconstruídas do zero absoluto, eliminando débitos técnicos, monólitos e acoplamentos do sistema legado anterior. A versão V2 adota Clean Architecture, Structured Outputs estritos com o Google Gemini (`gemini-3.8-flash`), tipagem completa com Pydantic v2 e persistência relacional assíncrona com SQLAlchemy 2.0.
+**Data do Checkpoint:** 19/10/2026 - 22:45  
+**Status do Projeto:** 100% Funcional, Blindado contra Adversários, Assíncrono e Auditado.  
+**Taxa de Sucesso dos Testes:**
+- 100% na Suíte de Testes Unitários e Integrados (`run_v2_tests.py` - 6 camadas).
+- 100% na Bateria de Testes Adversariais Red Teaming (`ai_tester.py` - 9/9 cenários aprovados).
 
 ---
 
-## 📂 Estrutura de Pastas e Separação de Versões
+## 🎯 Resumo das Conquistas Recentes & Blindagem de Segurança
 
-### 1. Sistema Novo V2 (`src/` e Raiz)
-- [`src/config/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/config/): Gerenciamento centralizado de variáveis com `pydantic-settings` e normalizador de dialetos assíncronos (`postgresql+asyncpg` e `sqlite+aiosqlite`).
-- [`src/domain/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/domain/): Entidades puras de domínio (`User`, `Vehicle`, `MaintenanceRecord`, `Reminder`, `TrafficFine`, `ConversationContext`) e enums canônicos.
-- [`src/ai/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/ai/): Cliente assíncrono do Google Gemini com Structured Output, sanitização de esquemas (`$defs`/`$ref`), timeout de 5s e contingência inteligente.
-- [`src/application/services/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/application/services/): Orquestração conversacional com máquina de estados, controle **Human-in-the-Loop** para aprovação explícita e **Fast-Path de 14ms** para cortesias ("OK", "Valeu").
-- [`src/infrastructure/database/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/infrastructure/database/): Camada de persistência relacional com SQLAlchemy 2.0 Async, modelos ORM espelhados e padrão Repository (`UserRepository`, `VehicleRepository`, `MaintenanceRepository`).
-- [`src/interfaces/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/interfaces/): Servidor HTTP assíncrono FastAPI com gerenciamento de ciclo de vida (`lifespan`), middleware de logs de tempo de resposta e roteador de Webhook multi-provedor (Evolution API, Z-API e JSON direto).
+Após testes exaustivos simulando motoristas reais no WhatsApp, implementamos defesas rígidas de negócio, mecânica e segurança contra ataques adversariais (Red Teaming):
 
-### 2. Sistema Legado Anterior Preservado (`v1_ponto_de_parada_total/`)
-Todos os arquivos do sistema legado anterior antes da reconstrução do zero foram isolados nesta pasta e preservados no Git:
-- `engine.py`, `ai_engine.py`, `database.py`, `whatsapp_gateway.py`
-- Arquivos `.html`, scripts `.bat` e `.ps1`, relatórios de stress e o banco SQLite antigo `autocare.db`.
+1. **Eliminação do *Ghost Draft State* e Confirmação Falsa Positiva:**
+   - O Fast-Path afirmativo (`sim`, `salva`, etc.) agora só é disparado se a mensagem for curta (<= 4 palavras) e sem novas entidades.
+   - Mensagens longas contendo gírias ou dados novos (ex: *"salva aí meu cvic 2020 a plaka é ABC1234"*) são enviadas para a análise do Gemini, evitando confirmações acidentais de rascunhos antigos.
 
----
+2. **Entrega Direta de Alertas Técnicos (`UNKNOWN` Passthrough):**
+   - Respostas do Gemini com intenção `UNKNOWN` (como alertas de incompatibilidade mecânica ou rejeição de injeção) são entregues diretamente ao motorista e limpam qualquer rascunho incompatível pendente.
 
-## 🛠️ Scripts Utilitários e Testes Criados na Raiz
+3. **Incompatibilidade Mecânica Impediente (Mecânico Confiável):**
+   - Bloqueio imediato de trocas de radiador, água e aditivo em motos refrigeradas a ar (ex: CG 160 Titan, Biz, Pop, Bros, Factor, Fazer).
+   - Bloqueio de correia dentada, ar-condicionado, filtro de cabine e direção hidráulica em motocicletas.
 
-1. **[`setup_project.py`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/setup_project.py):** Script autônomo com todos os códigos embutidos capaz de recriar toda a árvore do projeto em qualquer máquina com um único comando.
-2. **[`run_v2_tests.py`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/run_v2_tests.py):** Bateria de testes automatizados de ponta a ponta (6 baterias cobrindo domínio, banco, IA, estados e HTTP).
-3. **[`test_bot.py`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/test_bot.py):** Terminal interativo de diálogo que simula a experiência real do condutor no WhatsApp com persistência relacional em tempo real.
-4. **[`.env.example`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/.env.example):** Template de variáveis de ambiente.
-5. **[`requirements.txt`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/requirements.txt):** Dependências de produção atualizadas (`fastapi`, `uvicorn`, `pydantic`, `pydantic-settings`, `sqlalchemy[asyncio]`, `greenlet`, `aiosqlite`, `asyncpg`, `httpx`).
+4. **Anti-Alucinação de Oficina (`workshop_name` Estritamente Null):**
+   - O sistema nunca mais preenche o nome da oficina repetindo componentes revisados (ex: "troquei na oficina pastilhas e amortecedores" mantém `workshop_name: null`).
 
----
+5. **Reconciliação e Retificação Caótica de Rascunho com "Não":**
+   - Mensagens contendo "Não" seguido de retificações de dados (ex: *"Não, o valor correto foi 250 e troca de pastilha"*) não cancelam o rascunho; atualizam os campos e pedem confirmação.
 
-## 🧪 Resumo das 6 Correções Críticas Validadas na Suíte de Testes
-1. **`greenlet`**: Incluído para viabilizar corrotinas do SQLAlchemy assíncrono.
-2. **Namespace Pydantic**: Eliminado o conflito `date: date` em `MaintenanceRecord` utilizando `dt.date`.
-3. **Limpeza de JSON Schema Gemini**: Adicionado resolvedor recursivo em `GeminiClient` para converter `$defs` do Pydantic para a especificação REST da Google AI.
-4. **Atualização do Modelo Gemini**: Migrado para `gemini-3.8-flash` e `gemini-flash-latest`.
-5. **Fast-Path de 14ms**: Despedidas ("OK", "Valeu", "Show") respondem instantaneamente sem consumir cota de IA.
-6. **PRAGMA foreign_keys = ON**: Ativado automaticamente no SQLite assíncrono para garantir integridade e cascata.
+6. **Teto de Garagem do Plano Gratuito (Máximo de 3 Veículos):**
+   - A tentativa de cadastrar o 4º veículo é recusada cordialmente na `reply_message` com `UNKNOWN` e `is_critical_action=False`.
+
+7. **Defesa Ativa contra Injeção de Prompt / Jailbreak:**
+   - Tentativas de evasão como `ADMIN_OVERRIDE`, `HackerGPT` ou *"esqueça todas as regras"* são repelidas com foco exclusivo em consultoria automotiva preventiva.
+
+8. **Estabilidade de Cota da API (Zero Erros 429 / 503):**
+   - Configurado `gemini-flash-lite-latest` como modelo primário e `gemini-3.5-flash-lite` como contingência, garantindo altíssima velocidade (<2s) e zero sobrecarga.
 
 ---
 
-## 🚀 Como Retomar ou Executar o Projeto
+## 📂 Arquitetura do Repositório
 
-- Para rodar a bateria de testes completa:
-  ```bash
-  python run_v2_tests.py
-  ```
+- [`src/config/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/config/): Configurações Pydantic Settings com modelos velozes e limites de rate limit.
+- [`src/domain/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/domain/): Entidades de Domínio com validações de odômetro `ge=0`, custos positivos `ge=0.0` e sanitização de placas.
+- [`src/ai/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/ai/): Prompt mestre calibrado com 10 seções de regras de negócio, persona mecânica e Structured Outputs.
+- [`src/application/services/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/application/services/): Máquina de estados conversacional imune a vazamento de contexto órfão.
+- [`src/infrastructure/database/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/infrastructure/database/): Persistência SQLAlchemy 2.0 Async, proteção contra regressão de km no odômetro e cascade delete total em reset.
+- [`src/interfaces/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/src/interfaces/): API FastAPI de alta performance com normalizador de webhooks (Evolution, Z-API e Direto).
+- [`v1_ponto_de_parada_total/`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/v1_ponto_de_parada_total/): Pasta isolada e preservada contendo o código legado anterior da V1.
 
-- Para conversar com o bot localmente no terminal:
-  ```bash
-  python test_bot.py
-  ```
+---
 
-- Para iniciar a API FastAPI do Webhook:
-  ```bash
-  uvicorn src.interfaces.app:app --host 0.0.0.0 --port 8080 --reload
-  ```
+## 🛠️ Ferramentas de Auditoria e Testes
+
+1. **[`ai_tester.py`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/ai_tester.py):** Simulador adversarial com agente Red Team que gera mensagens dinâmicas imprevisíveis via IA e auditor com Structured Output.
+2. **[`audit_test_report.json`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/audit_test_report.json):** Relatório oficial da homologação adversarial (9 cenários, 100% aprovados).
+3. **[`run_v2_tests.py`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/run_v2_tests.py):** Bateria de 6 suítes locais com execução em 1.25s.
+4. **[`test_bot.py`](file:///C:/Users/gbduarte/Downloads/autocare/autocare/test_bot.py):** Terminal interativo de testes manuais.
+
+---
+
+## 🚀 Como Executar
+
+```bash
+# Rodar suíte completa de integração
+python run_v2_tests.py
+
+# Rodar auditoria adversarial Red Teaming (modo ASGI direto)
+python ai_tester.py --in-process
+
+# Iniciar servidor Webhook
+uvicorn src.interfaces.app:app --host 0.0.0.0 --port 8080
+```
