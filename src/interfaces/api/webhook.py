@@ -157,6 +157,8 @@ async def receive_webhook(
                     )
                     saved_maint = await maintenance_repo.add_record(new_maintenance)
                     logger.info(f"Manutenção [{saved_maint.id}] salva para o veículo [{target_vehicle_id}]")
+                    if new_maintenance.km:
+                        await vehicle_repo.update_km(target_vehicle_id, new_maintenance.km)
 
             # Caso C: Confirmação ou Comando Direto de Reset de Garagem / Sistema
             elif (

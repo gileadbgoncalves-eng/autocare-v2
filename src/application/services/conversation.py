@@ -37,6 +37,11 @@ class ConversationService:
         context.updated_at = datetime.utcnow()
         self._contexts[context.user_id] = context
 
+    def clear_context(self, user_id: str):
+        """Limpa o contexto em memória do usuário."""
+        if user_id in self._contexts:
+            del self._contexts[user_id]
+
     async def handle_incoming_message(
         self,
         user_id: str,

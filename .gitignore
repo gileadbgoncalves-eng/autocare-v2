@@ -28,6 +28,7 @@ backups/
 *.pdf
 **/dossiers/
 audit_test_report.json
+security_audit_report.json
 
 # Pasta isolada de arquivos legados da V1
 v1_ponto_de_parada_total/
