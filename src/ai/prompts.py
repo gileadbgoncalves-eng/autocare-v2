@@ -4,7 +4,7 @@ Instruções mestras de sistema, persona de especialista automotivo, guardrails 
 confirmação, tratamento multi-veículos, reconciliação de rascunhos e regras mecânicas para o Google Gemini.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from src.domain.entities import Vehicle, ConversationContext
 
 
@@ -144,10 +144,13 @@ def build_analysis_prompt(
     context: Optional[ConversationContext] = None,
     vehicles: Optional[List[Vehicle]] = None,
     history: Optional[List[dict[str, str]]] = None,
+    maintenances: Optional[List[Any]] = None,
+    reminders: Optional[List[Any]] = None,
+    fines: Optional[List[Any]] = None,
 ) -> str:
     """
     Constrói o prompt enriquecido com os veículos da garagem (e contagem x/3),
-    o estado atual e o histórico recente.
+    dados históricos persistidos no banco de dados, o estado atual e o histórico recente.
     """
     sections = []
 
@@ -173,7 +176,57 @@ def build_analysis_prompt(
     else:
         sections.append("[VEÍCULOS CADASTRADOS NA GARAGEM DO USUÁRIO (0/3)]:\nNenhum veículo cadastrado no momento.")
 
-    # 2. Contexto de Sessão e Rascunhos Pendentes
+    # 2. Histórico de Manutenções Registradas no Banco de Dados
+    if maintenances:
+        maint_lines = []
+        for m in maintenances:
+            m_date = getattr(m, "date", None)
+            m_date_str = m_date.strftime("%d/%m/%Y") if hasattr(m_date, "strftime") else str(m_date or "Data n/d")
+            m_desc = getattr(m, "description", None) or ", ".join(getattr(m, "components", [])) or "Serviço mecânico"
+            m_cost = getattr(m, "total_cost", 0.0) or 0.0
+            m_km = getattr(m, "km", None)
+            m_km_str = f" | {m_km:,} km".replace(",", ".") if m_km else ""
+            m_shop = getattr(m, "workshop_name", None)
+            m_shop_str = f" | Oficina: {m_shop}" if m_shop else ""
+            m_v_id = getattr(m, "vehicle_id", None)
+            maint_lines.append(f"- [{m_date_str}] Veículo ID {m_v_id}: {m_desc}{m_km_str} | R$ {m_cost:.2f}{m_shop_str}")
+        sections.append("[HISTÓRICO DE MANUTENÇÕES REGISTRADAS NO BANCO DE DADOS]:\n" + "\n".join(maint_lines))
+    else:
+        sections.append("[HISTÓRICO DE MANUTENÇÕES REGISTRADAS NO BANCO DE DADOS]:\nNenhuma manutenção registrada até o momento.")
+
+    # 3. Lembretes Ativos no Banco de Dados
+    if reminders:
+        rem_lines = []
+        for r in reminders:
+            r_desc = getattr(r, "description", "")
+            r_dt = getattr(r, "due_datetime", None)
+            r_dt_str = r_dt.strftime("%d/%m/%Y %H:%M") if hasattr(r_dt, "strftime") else (str(r_dt) if r_dt else "")
+            r_km = getattr(r, "due_km", None)
+            r_km_str = f"{r_km:,} km".replace(",", ".") if r_km else ""
+            due_info = f"Vencimento: {r_dt_str}" if r_dt_str else (f"Hodômetro: {r_km_str}" if r_km_str else "Sem data fixa")
+            r_status = getattr(r, "status", "pending")
+            r_stat_str = r_status.value if hasattr(r_status, "value") else str(r_status)
+            rem_lines.append(f"- Lembrete ID {getattr(r, 'id', 'n/d')}: {r_desc} ({due_info}) | Status: {r_stat_str}")
+        sections.append("[LEMBRETES ATIVOS NO BANCO DE DADOS]:\n" + "\n".join(rem_lines))
+    else:
+        sections.append("[LEMBRETES ATIVOS NO BANCO DE DADOS]:\nNenhum lembrete cadastrado.")
+
+    # 4. Multas e Infrações Registradas no Banco de Dados
+    if fines:
+        fine_lines = []
+        for f in fines:
+            f_desc = getattr(f, "description", "Infração de Trânsito")
+            f_code = getattr(f, "infraction_code", None) or "Código n/d"
+            f_pts = getattr(f, "points", 0)
+            f_amt = getattr(f, "amount", 0.0)
+            f_stat = getattr(f, "status", "notificada")
+            f_stat_str = f_stat.value if hasattr(f_stat, "value") else str(f_stat)
+            fine_lines.append(f"- Multa ID {getattr(f, 'id', 'n/d')}: {f_desc} (Cód: {f_code}) | {f_pts} pts | R$ {f_amt:.2f} | Status: {f_stat_str}")
+        sections.append("[MULTAS E INFRAÇÕES REGISTRADAS NO BANCO DE DADOS]:\n" + "\n".join(fine_lines))
+    else:
+        sections.append("[MULTAS E INFRAÇÕES REGISTRADAS NO BANCO DE DADOS]:\nNenhuma multa ou infração registrada.")
+
+    # 5. Contexto de Sessão e Rascunhos Pendentes
     if context:
         state_str = context.state.value if hasattr(context.state, "value") else str(context.state)
         sections.append(f"[ESTADO ATUAL DO USUÁRIO]: {state_str}")
@@ -183,27 +236,21 @@ def build_analysis_prompt(
             draft_clean = json.dumps(context.draft_payload, ensure_ascii=False)
             sections.append(f"[RASCUNHO PENDENTE DE CONFIRMAÇÃO]:\n{draft_clean}")
 
-        # 3. Histórico Recente de Diálogo (Últimas interações)
-        if getattr(context, "recent_turns", None):
-            hist_lines = []
-            for t in context.recent_turns[-6:]:
-                speaker = "Condutor" if t.role == "user" else "Consultor AutoCare"
-                hist_lines.append(f"{speaker}: {t.content}")
-            sections.append("[HISTÓRICO RECENTE DA CONVERSA]:\n" + "\n".join(hist_lines))
-        elif history:
-            hist_lines = []
-            for t in history[-6:]:
-                speaker = "Condutor" if t.get("role") == "user" else "Consultor AutoCare"
-                hist_lines.append(f"{speaker}: {t.get('content', '')}")
-            sections.append("[HISTÓRICO RECENTE DA CONVERSA]:\n" + "\n".join(hist_lines))
+    # 6. Histórico Recente de Diálogo (Últimas interações)
+    turns_source = None
+    if context and getattr(context, "recent_turns", None):
+        turns_source = [{"role": t.role, "content": t.content} for t in context.recent_turns]
     elif history:
+        turns_source = history
+
+    if turns_source:
         hist_lines = []
-        for t in history[-6:]:
+        for t in turns_source[-6:]:
             speaker = "Condutor" if t.get("role") == "user" else "Consultor AutoCare"
             hist_lines.append(f"{speaker}: {t.get('content', '')}")
         sections.append("[HISTÓRICO RECENTE DA CONVERSA]:\n" + "\n".join(hist_lines))
 
-    # 4. Mensagem Atual do Motorista
+    # 7. Mensagem Atual do Motorista
     sections.append(f"[MENSAGEM ATUAL DO CONDUTOR]:\n\"{current_message.strip()}\"")
     sections.append("\nAnalise os dados e gere a resposta estritamente conforme o schema estruturado `GeminiAnalysisResponse`:")
 

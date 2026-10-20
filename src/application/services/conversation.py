@@ -5,6 +5,7 @@ de estados conversacionais, invoca o Gemini e assegura o fluxo de confirmação 
 """
 
 import re
+import asyncio
 import unicodedata
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -25,6 +26,12 @@ class ConversationService:
         self.gemini = gemini_client or GeminiClient()
         # Repositório de contexto em memória com persistência por sessão de usuário
         self._contexts: Dict[str, ConversationContext] = {}
+        self._user_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_user_lock(self, user_id: str) -> asyncio.Lock:
+        if user_id not in self._user_locks:
+            self._user_locks[user_id] = asyncio.Lock()
+        return self._user_locks[user_id]
 
     def get_context(self, user_id: str) -> ConversationContext:
         """Recupera ou inicializa o contexto conversacional do usuário."""
@@ -47,10 +54,34 @@ class ConversationService:
         user_id: str,
         message_text: str,
         vehicles: Optional[List[Any]] = None,
+        maintenances: Optional[List[Any]] = None,
+        reminders: Optional[List[Any]] = None,
+        fines: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """
         Ponto de entrada do processamento de mensagens recebidas via Webhook.
+        Protegido por asyncio.Lock individual por user_id contra concorrência e race conditions.
         """
+        lock = self._get_user_lock(user_id)
+        async with lock:
+            return await self._handle_incoming_message_locked(
+                user_id=user_id,
+                message_text=message_text,
+                vehicles=vehicles,
+                maintenances=maintenances,
+                reminders=reminders,
+                fines=fines,
+            )
+
+    async def _handle_incoming_message_locked(
+        self,
+        user_id: str,
+        message_text: str,
+        vehicles: Optional[List[Any]] = None,
+        maintenances: Optional[List[Any]] = None,
+        reminders: Optional[List[Any]] = None,
+        fines: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
         clean_text = (message_text or "").strip()
         context = self.get_context(user_id)
 
@@ -73,14 +104,7 @@ class ConversationService:
 
         # 1.5 Comando Direto de Zerar/Resetar Sistema (Zero Latência para Testes)
         norm_text = "".join(c for c in unicodedata.normalize("NFKD", text_lower) if not unicodedata.combining(c)).strip()
-        reset_triggers = {
-            "zerar", "reset", "resetar", "/reset", "/zerar", "/limpar", "/resetar", "/reset_all",
-            "zerar sistema", "zerar o sistema", "zerar todo o sistema", "zerar todo sistema",
-            "resetar sistema", "resetar o sistema", "resetar todo o sistema",
-            "limpar sistema", "limpar o sistema", "limpar tudo", "zerar tudo", "resetar tudo",
-            "apagar tudo", "excluir tudo", "zerar garagem", "limpar garagem", "resetar garagem",
-            "apagar garagem", "reiniciar sistema", "reiniciar cadastro", "comecar do zero", "iniciar do zero"
-        }
+        reset_triggers = {"zerar sistema", "zerar o sistema", "/reset_all"}
         if norm_text in reset_triggers:
             context.state = ConversationState.NORMAL
             context.draft_payload = None
@@ -105,7 +129,16 @@ class ConversationService:
 
         # 2. Máquina de Estados: Se estiver aguardando confirmação do usuário
         if context.is_awaiting_confirmation():
-            result = await self._handle_pending_confirmation_state(user_id, clean_text, text_lower, context, vehicles)
+            result = await self._handle_pending_confirmation_state(
+                user_id=user_id,
+                clean_text=clean_text,
+                text_lower=text_lower,
+                context=context,
+                vehicles=vehicles,
+                maintenances=maintenances,
+                reminders=reminders,
+                fines=fines,
+            )
             self._record_assistant_turn(context, result["reply"])
             self.update_context(context)
             return result
@@ -134,6 +167,9 @@ class ConversationService:
             history=history_dicts,
             context=context,
             vehicles=vehicles,
+            maintenances=maintenances,
+            reminders=reminders,
+            fines=fines,
         )
 
         # 4. Tratamento de Ações Críticas (Human-in-the-Loop)
@@ -187,17 +223,57 @@ class ConversationService:
         }
         context.state = state_map.get(intent, ConversationState.AWAITING_MAINTENANCE_CONFIRM)
 
-        # Consolida payload do rascunho
-        payload = analysis.extracted_entities or {}
-        if analysis.vehicle and not payload:
-            payload = analysis.vehicle.model_dump(exclude_none=True)
-        elif analysis.maintenance and not payload:
-            payload = analysis.maintenance.model_dump(exclude_none=True)
-        elif analysis.reminder and not payload:
-            payload = analysis.reminder.model_dump(exclude_none=True)
-        elif analysis.fine and not payload:
-            payload = analysis.fine.model_dump(exclude_none=True)
+        # Consolida payload do rascunho com merge profundo das entidades tipadas
+        payload = dict(analysis.extracted_entities or {})
+        if analysis.vehicle:
+            payload.update(analysis.vehicle.model_dump(exclude_none=True))
+        elif analysis.maintenance:
+            payload.update(analysis.maintenance.model_dump(exclude_none=True))
+        elif analysis.reminder:
+            payload.update(analysis.reminder.model_dump(exclude_none=True))
+        elif analysis.fine:
+            payload.update(analysis.fine.model_dump(exclude_none=True))
 
+        last_user_msg = context.recent_turns[-1].content if context.recent_turns else ""
+        combined_text = f"{last_user_msg} {analysis.reply_message} {analysis.reasoning or ''}"
+
+        # Heurística de complementação e integridade dos rascunhos
+        if context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM:
+            if not payload.get("total_cost"):
+                cost_m = re.search(r"(?:r\$|reais)\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*(?:reais|r\$)", combined_text, re.I)
+                if cost_m:
+                    val_s = cost_m.group(1) or cost_m.group(2)
+                    payload["total_cost"] = float(val_s.replace(",", "."))
+            if not payload.get("components"):
+                comps = []
+                for term in ["relação", "lona de freio", "lona", "pastilha", "óleo", "filtro", "amortecedor", "vela", "correia", "pneu", "embreagem", "bateria"]:
+                    if term in combined_text.lower() and term not in comps:
+                        comps.append(term)
+                payload["components"] = comps or [last_user_msg]
+            if not payload.get("description"):
+                payload["description"] = payload.get("service_summary") or ", ".join(payload.get("components", [])) or last_user_msg
+
+        elif context.state == ConversationState.AWAITING_FINE_CONFIRM:
+            if not payload.get("amount"):
+                cost_m = re.search(r"(?:r\$|reais)\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*(?:reais|r\$)", combined_text, re.I)
+                if cost_m:
+                    val_s = cost_m.group(1) or cost_m.group(2)
+                    payload["amount"] = float(val_s.replace(",", "."))
+            if not payload.get("infraction_code"):
+                code_m = re.search(r"\b\d{3}-\d{1,2}-\d\b", combined_text)
+                if code_m:
+                    payload["infraction_code"] = code_m.group(0)
+            if not payload.get("points"):
+                pts_m = re.search(r"(\d+)\s*pontos?", combined_text, re.I)
+                payload["points"] = int(pts_m.group(1)) if pts_m else 4
+            if not payload.get("description"):
+                payload["description"] = last_user_msg
+
+        elif context.state == ConversationState.AWAITING_REMINDER_CONFIRM:
+            if not payload.get("task_description") and not payload.get("description"):
+                payload["task_description"] = last_user_msg
+
+        payload["_action_state"] = context.state.value
         payload["_target_vehicle_ref"] = analysis.target_vehicle_ref
         context.draft_payload = payload
 
@@ -222,6 +298,9 @@ class ConversationService:
         text_lower: str,
         context: ConversationContext,
         vehicles: Optional[List[Any]],
+        maintenances: Optional[List[Any]] = None,
+        reminders: Optional[List[Any]] = None,
+        fines: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """
         Processa respostas quando há um rascunho pendente de confirmação.
@@ -245,6 +324,7 @@ class ConversationService:
         if is_short_affirmative:
             executed_action = context.state.value
             draft_data = context.draft_payload or {}
+            draft_data["_action_state"] = executed_action
             if executed_action == ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value:
                 draft_data["_reset_system"] = True
                 draft_data["_reset_garage"] = True
@@ -288,6 +368,9 @@ class ConversationService:
             history=history_dicts,
             context=context,
             vehicles=vehicles,
+            maintenances=maintenances,
+            reminders=reminders,
+            fines=fines,
         )
 
         # Se o Gemini identificar cancelamento explícito
@@ -305,6 +388,9 @@ class ConversationService:
         if analysis.intent == IntentType.CONFIRM_ACTION:
             draft_data = context.draft_payload or {}
             executed_action = context.state.value
+            if executed_action == ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value:
+                draft_data["_reset_system"] = True
+                draft_data["_reset_garage"] = True
             context.state = ConversationState.NORMAL
             context.draft_payload = None
             success_messages = {

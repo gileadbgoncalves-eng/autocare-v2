@@ -1,0 +1,104 @@
+{
+  "suite": "deep_validation_suite",
+  "executed_at": "2026-10-20T07:37:09.144410",
+  "total_time_seconds": 84.05,
+  "summary": {
+    "total": 7,
+    "passed": 7,
+    "failed": 0,
+    "success_rate": "100.0%"
+  },
+  "results": [
+    {
+      "test_name": "Roteamento Exato para Moto vs Carro validado via SQL",
+      "status": "PASS",
+      "timestamp": "2026-10-20T07:35:53.096453",
+      "details": {
+        "moto_id": 32,
+        "car_id": 31,
+        "record_vehicle_id": 32,
+        "total_cost": 180.0
+      }
+    },
+    {
+      "test_name": "Persistência SQL de Lembretes, Multas e Odômetro",
+      "status": "PASS",
+      "timestamp": "2026-10-20T07:36:26.503781",
+      "details": {
+        "reminders_count": 1,
+        "reminder_desc": "Calibrar os pneus",
+        "fines_count": 1,
+        "fine_amount": 130.0,
+        "updated_km": 52000
+      }
+    },
+    {
+      "test_name": "Teste Cego de Consulta ao Banco (Gasto R$ 800, Oficina e Pontos de Multa)",
+      "status": "PASS",
+      "timestamp": "2026-10-20T07:36:46.823280",
+      "details": {
+        "reply_fin": "Analisando o histórico do seu Volkswagen Golf TSI (Placa: GLF1919), você registrou um total de R$ 800,00 em manutenções até o momento (sendo R$ 350,00 na troca de óleo e R$ 450,00 na troca de pastilhas de freio). 🚗💨",
+        "reply_shop": "A última manutenção registrada no seu Volkswagen Golf TSI foi a troca de pastilhas Bosch, realizada na oficina Freios & Cia. 🚗🔧",
+        "reply_fines": "Analisando os registros do seu Volkswagen Golf TSI (Placa: GLF1919), você possui atualmente 1 multa cadastrada (Excesso de velocidade até 20%), totalizando 4 pontos na sua CNH e R$ 130,16 em penalidades. 📋🚗"
+      }
+    },
+    {
+      "test_name": "Idempotência e Proteção contra Double-Click Concorrente",
+      "status": "PASS",
+      "timestamp": "2026-10-20T07:36:55.633957",
+      "details": {
+        "maintenance_records_count": 1,
+        "record_id": 15
+      }
+    },
+    {
+      "test_name": "Bypass de Reset Bloqueado (Exige Confirmação e 'Não' Preserva Garagem)",
+      "status": "PASS",
+      "timestamp": "2026-10-20T07:37:02.370956",
+      "details": {
+        "action_type": "awaiting_confirmation",
+        "state": "awaiting_garage_reset_confirm",
+        "vehicles_preserved": 2
+      }
+    },
+    {
+      "test_name": "Auditoria de Logs: Zero Vazamento da API_KEY em URLs ou Headers",
+      "status": "PASS",
+      "timestamp": "2026-10-20T07:37:09.120255",
+      "details": {
+        "log_bytes_analyzed": 520,
+        "key_found": false
+      }
+    },
+    {
+      "test_name": "Parser de Payloads Reais de Gateways (Evolution e Z-API)",
+      "status": "PASS",
+      "timestamp": "2026-10-20T07:37:09.144362",
+      "details": {
+        "evolution_group": {
+          "status": "ignored",
+          "reason": "non_actionable_event"
+        },
+        "evolution_from_me": {
+          "status": "ignored",
+          "reason": "non_actionable_event"
+        },
+        "zapi_group": {
+          "status": "ignored",
+          "reason": "non_actionable_event"
+        },
+        "zapi_from_me": {
+          "status": "ignored",
+          "reason": "non_actionable_event"
+        },
+        "zapi_valid": {
+          "status": "success",
+          "user_id": "5521999998888",
+          "reply": "Show de bola! Qualquer novidade ou manutenção no seu veículo, estou por aqui. Um abraço! 👍",
+          "action_type": "polite_closing",
+          "state": "normal"
+        }
+      }
+    }
+  ]
+}

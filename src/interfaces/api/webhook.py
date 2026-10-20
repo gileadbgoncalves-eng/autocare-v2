@@ -5,19 +5,29 @@ Ponto de entrada assíncrono para eventos e mensagens de provedores de WhatsApp
 """
 
 import logging
-from typing import Dict, Any, Optional, Tuple
-from fastapi import APIRouter, Depends, status, HTTPException
+from datetime import datetime, date
+from typing import Dict, Any, Optional, Tuple, List
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config.settings import settings
 from src.infrastructure.database.session import get_async_session
 from src.infrastructure.database.repositories import (
     UserRepository,
     VehicleRepository,
     MaintenanceRepository,
+    ReminderRepository,
+    TrafficFineRepository,
 )
 from src.application.services.conversation import ConversationService
-from src.domain.entities import Vehicle, MaintenanceRecord
+from src.domain.entities import Vehicle, MaintenanceRecord, Reminder, TrafficFine
 from src.domain.enums import VehicleType, FuelType, UsageProfile
+
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
 
 logger = logging.getLogger("autocare.webhook")
 router = APIRouter(tags=["Webhook"])
@@ -42,20 +52,20 @@ def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Opti
         return user_id, str(payload["message"]).strip()
 
     # 2. Formato Evolution API
-    data = payload.get("data", {})
-    key = data.get("key", {})
-    # Ignora mensagens enviadas pelo próprio bot
-    if key.get("fromMe", False):
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    key = data.get("key", {}) if isinstance(data, dict) else {}
+    # Ignora mensagens enviadas pelo próprio bot (fromMe: true)
+    if key.get("fromMe", False) or payload.get("fromMe", False):
         return None, None
 
-    remote_jid = key.get("remoteJid", "")
+    remote_jid = str(key.get("remoteJid", "") or payload.get("remoteJid", ""))
     # Ignora mensagens de grupos (@g.us)
-    if "@g.us" in remote_jid:
+    if "@g.us" in remote_jid or payload.get("isGroup", False):
         return None, None
 
     if "@s.whatsapp.net" in remote_jid:
         user_id = "".join(filter(str.isdigit, remote_jid.split("@")[0]))
-        msg_obj = data.get("message", {})
+        msg_obj = data.get("message", {}) if isinstance(data, dict) else {}
         text = (
             msg_obj.get("conversation")
             or msg_obj.get("extendedTextMessage", {}).get("text")
@@ -63,20 +73,132 @@ def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Opti
             or msg_obj.get("listResponseMessage", {}).get("singleSelectReply", {}).get("selectedRowId")
         )
         if text:
-            return user_id, text.strip()
+            return user_id, str(text).strip()
 
     # 3. Formato Z-API
-    phone = payload.get("phone") or payload.get("senderPhone")
+    if payload.get("isGroup", False) or payload.get("fromMe", False):
+        return None, None
+    phone = payload.get("phone") or payload.get("senderPhone") or payload.get("connectedPhone")
     if phone:
-        if payload.get("isGroup", False):
+        phone_str = str(phone)
+        if "@g.us" in phone_str or "g.us" in str(payload.get("chatId", "")):
             return None, None
-        user_id = "".join(filter(str.isdigit, str(phone)))
+        user_id = "".join(filter(str.isdigit, phone_str.split("@")[0]))
         text_obj = payload.get("text", {})
         text = text_obj.get("message") if isinstance(text_obj, dict) else payload.get("message")
         if text:
             return user_id, str(text).strip()
 
     return None, None
+
+
+def resolve_target_vehicle(
+    vehicles: List[Vehicle],
+    ref: Optional[str] = None,
+    payload_hint: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """
+    Resolve o veículo alvo com base em placa, modelo específico, tipo de veículo (moto vs carro)
+    ou identificador antes de recorrer ao fallback padrão.
+    """
+    if not vehicles:
+        return None
+    if len(vehicles) == 1:
+        return vehicles[0].id
+
+    ref_clean = (str(ref or "")).strip().lower()
+    hint = payload_hint or {}
+    plate_hint = (str(hint.get("plate") or "")).strip().upper().replace("-", "")
+    type_hint = (str(hint.get("vehicle_type") or "")).strip().lower()
+
+    # 1. Correspondência exata ou substring por placa
+    for v in vehicles:
+        v_plate = (v.plate or "").upper().replace("-", "").strip()
+        if v_plate:
+            if plate_hint and plate_hint == v_plate:
+                return v.id
+            if ref_clean and (v_plate.lower() in ref_clean or ref_clean in v_plate.lower()):
+                return v.id
+
+    # 2. Correspondência específica por MODELO (ex: 'CG 160', 'Civic', 'Golf', 'Corolla')
+    for v in vehicles:
+        model_str = (v.model or "").lower()
+        if model_str:
+            if model_str in ref_clean:
+                return v.id
+            for part in model_str.split():
+                if len(part) >= 3 and part in ref_clean:
+                    return v.id
+            if "model" in hint and str(hint["model"]).lower() in model_str:
+                return v.id
+
+    # 3. Correspondência por TIPO DE VEÍCULO (ex: 'moto' vs 'carro')
+    is_moto_ref = any(m in ref_clean for m in ["moto", "motoca", "motocicleta", "cg", "fazer", "titan", "biz", "twister", "scooter"]) or type_hint == "moto"
+    is_carro_ref = any(c in ref_clean for c in ["carro", "automovel", "caranga", "veiculo", "caminhonete", "suv", "sedan", "hatch"]) or type_hint in ("carro", "caminhonete")
+
+    if is_moto_ref:
+        for v in vehicles:
+            v_type = v.vehicle_type.value if hasattr(v.vehicle_type, "value") else str(v.vehicle_type).lower()
+            if "moto" in v_type:
+                return v.id
+
+    if is_carro_ref:
+        for v in vehicles:
+            v_type = v.vehicle_type.value if hasattr(v.vehicle_type, "value") else str(v.vehicle_type).lower()
+            if "carro" in v_type or "caminhonete" in v_type:
+                return v.id
+
+    # 4. Correspondência combinada make + model
+    for v in vehicles:
+        make_str = (v.make or "").lower()
+        model_str = (v.model or "").lower()
+        if f"{make_str} {model_str}" in ref_clean:
+            return v.id
+
+    # 5. Fallback para o primeiro veículo registrado
+    return vehicles[0].id
+
+
+async def send_whatsapp_reply(user_id: str, message: str) -> bool:
+    """
+    Dispara mensagem de volta para o condutor via WhatsApp Gateway configurado (com fallback silencioso).
+    """
+    if not message or not HAS_HTTPX:
+        return False
+
+    try:
+        if settings.PROVIDER == "evolution" and settings.EVOLUTION_BASE_URL and settings.EVOLUTION_API_KEY:
+            url = f"{settings.EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{settings.EVOLUTION_INSTANCE}"
+            headers = {
+                "apikey": settings.EVOLUTION_API_KEY,
+                "Content-Type": "application/json",
+            }
+            body = {
+                "number": user_id,
+                "text": message,
+                "delay": settings.EVOLUTION_TYPING_DELAY_MS,
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(url, json=body, headers=headers)
+            return True
+
+        elif settings.PROVIDER == "zapi" and settings.ZAPI_INSTANCE_ID and settings.ZAPI_TOKEN:
+            url = f"https://api.z-api.io/instances/{settings.ZAPI_INSTANCE_ID}/token/{settings.ZAPI_TOKEN}/send-text"
+            headers = {"Content-Type": "application/json"}
+            if settings.ZAPI_CLIENT_TOKEN:
+                headers["Client-Token"] = settings.ZAPI_CLIENT_TOKEN
+            body = {
+                "phone": user_id,
+                "message": message,
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(url, json=body, headers=headers)
+            return True
+
+    except Exception as e:
+        logger.warning(f"Gateway WhatsApp outbound ignorado ou indisponível: {e}")
+
+    return False
 
 
 @router.post("/webhook", status_code=status.HTTP_200_OK)
@@ -98,18 +220,26 @@ async def receive_webhook(
     user_repo = UserRepository(session)
     vehicle_repo = VehicleRepository(session)
     maintenance_repo = MaintenanceRepository(session)
+    reminder_repo = ReminderRepository(session)
+    fine_repo = TrafficFineRepository(session)
 
     # 1. Garante que o usuário existe no banco
     await user_repo.get_or_create(user_id=user_id)
 
-    # 2. Carrega veículos cadastrados na garagem
+    # 2. Carrega veículos cadastrados na garagem e dados persistidos
     vehicles = await vehicle_repo.get_vehicles_by_user_id(user_id=user_id)
+    maintenances = await maintenance_repo.get_by_user_id(user_id=user_id)
+    reminders = await reminder_repo.get_by_user_id(user_id=user_id)
+    fines = await fine_repo.get_by_user_id(user_id=user_id)
 
-    # 3. Processa mensagem através da máquina de estados e Gemini
+    # 3. Processa mensagem através da máquina de estados e Gemini com injeção completa de dados
     result = await conversation_service.handle_incoming_message(
         user_id=user_id,
         message_text=message_text,
         vehicles=vehicles,
+        maintenances=maintenances,
+        reminders=reminders,
+        fines=fines,
     )
 
     action_type = result.get("action_type")
@@ -118,8 +248,24 @@ async def receive_webhook(
     # 4. Se o usuário confirmou uma ação crítica pendente ou acionou o reset do sistema
     if action_type in ("action_confirmed", "system_reset") and committed_data:
         try:
+            action_state = committed_data.get("_action_state", "")
+
+            # Caso C: Confirmação ou Comando Direto de Reset de Garagem / Sistema
+            if (
+                action_type == "system_reset"
+                or committed_data.get("_reset_system") is True
+                or committed_data.get("_reset_garage") is True
+                or action_state == "awaiting_garage_reset_confirm"
+            ):
+                reset_stats = await user_repo.reset_user_data(user_id=user_id)
+                logger.info(f"Garagem e Sistema do usuário [{user_id}] completamente zerados: {reset_stats}")
+
             # Caso A: Confirmação de Cadastro de Veículo
-            if "make" in committed_data and "model" in committed_data and "components" not in committed_data and not committed_data.get("_reset_system"):
+            elif (
+                action_state == "awaiting_vehicle_registration_confirm"
+                or ("make" in committed_data and "model" in committed_data and "components" not in committed_data and not committed_data.get("_reset_system"))
+            ):
+                km_val = committed_data.get("current_km") or committed_data.get("odometer_km")
                 new_vehicle = Vehicle(
                     user_id=user_id,
                     make=committed_data.get("make", "Desconhecido"),
@@ -127,7 +273,7 @@ async def receive_webhook(
                     year=committed_data.get("year"),
                     plate=committed_data.get("plate"),
                     engine=committed_data.get("engine"),
-                    current_km=committed_data.get("current_km"),
+                    current_km=int(km_val) if km_val is not None else None,
                     vehicle_type=VehicleType(committed_data.get("vehicle_type", "carro")) if committed_data.get("vehicle_type") in [e.value for e in VehicleType] else VehicleType.CARRO,
                     fuel_type=FuelType(committed_data.get("fuel_type", "flex")) if committed_data.get("fuel_type") in [e.value for e in FuelType] else FuelType.FLEX,
                     usage_profile=UsageProfile(committed_data.get("usage_profile", "convencional")) if committed_data.get("usage_profile") in [e.value for e in UsageProfile] else UsageProfile.CONVENCIONAL,
@@ -135,21 +281,76 @@ async def receive_webhook(
                 saved_vehicle = await vehicle_repo.add_vehicle(new_vehicle)
                 logger.info(f"Veículo [{saved_vehicle.id}] cadastrado para o condutor [{user_id}]")
 
+            # Caso D: Confirmação de Agendamento de Lembrete
+            elif (
+                action_state == "awaiting_reminder_confirm"
+                or "task_description" in committed_data
+                or ("description" in committed_data and ("due_date" in committed_data or "due_km" in committed_data or "due_datetime" in committed_data))
+            ) and not committed_data.get("_reset_system"):
+                target_vehicle_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
+                task_desc = committed_data.get("task_description") or committed_data.get("description", "Lembrete automotivo")
+                due_dt = None
+                raw_dt = committed_data.get("due_datetime") or committed_data.get("due_date")
+                if isinstance(raw_dt, datetime):
+                    due_dt = raw_dt
+                elif isinstance(raw_dt, str):
+                    try:
+                        due_dt = datetime.fromisoformat(raw_dt)
+                    except Exception:
+                        pass
+                new_reminder = Reminder(
+                    user_id=user_id,
+                    vehicle_id=target_vehicle_id,
+                    description=task_desc,
+                    due_datetime=due_dt,
+                    due_km=committed_data.get("due_km"),
+                )
+                saved_reminder = await reminder_repo.add_reminder(new_reminder)
+                logger.info(f"Lembrete [{saved_reminder.id}] cadastrado para o condutor [{user_id}]")
+
+            # Caso E: Confirmação de Multa / Infração de Trânsito
+            elif (
+                action_state == "awaiting_fine_confirm"
+                or "infraction_code" in committed_data
+                or "amount" in committed_data
+            ) and not committed_data.get("_reset_system"):
+                target_vehicle_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data) or (vehicles[0].id if vehicles else None)
+                if target_vehicle_id:
+                    amt = committed_data.get("amount", 0.0)
+                    new_fine = TrafficFine(
+                        vehicle_id=target_vehicle_id,
+                        description=committed_data.get("description", "Infração de Trânsito"),
+                        infraction_code=committed_data.get("infraction_code"),
+                        issuing_body=committed_data.get("issuing_body"),
+                        points=int(committed_data.get("points", 0) or 0),
+                        amount=float(amt or 0.0),
+                        discounted_amount=float(committed_data.get("discounted_amount", 0.0) or 0.0),
+                    )
+                    saved_fine = await fine_repo.add_fine(new_fine)
+                    logger.info(f"Multa [{saved_fine.id}] cadastrada para o veículo [{target_vehicle_id}]")
+
             # Caso B: Confirmação de Registro de Manutenção
-            elif ("components" in committed_data or "labor_cost" in committed_data or "total_cost" in committed_data) and not committed_data.get("_reset_system"):
-                # Seleciona veículo ativo ou o único veículo da garagem
-                target_vehicle_id = None
-                if vehicles:
-                    target_vehicle_id = vehicles[0].id
+            elif (
+                action_state == "awaiting_maintenance_confirm"
+                or "components" in committed_data
+                or "labor_cost" in committed_data
+                or "total_cost" in committed_data
+                or "service_summary" in committed_data
+            ) and not committed_data.get("_reset_system"):
+                target_vehicle_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
 
                 if target_vehicle_id:
+                    km_val = committed_data.get("km") or committed_data.get("odometer_km")
+                    desc_val = committed_data.get("description") or committed_data.get("service_summary") or "Manutenção realizada"
+                    comp_val = committed_data.get("components") or [desc_val]
+                    cost_val = committed_data.get("total_cost", 0.0)
                     new_maintenance = MaintenanceRecord(
                         vehicle_id=target_vehicle_id,
                         user_id=user_id,
-                        components=committed_data.get("components") or [committed_data.get("description", "Manutenção Geral")],
-                        description=committed_data.get("description", "Manutenção realizada"),
-                        km=committed_data.get("km"),
-                        total_cost=float(committed_data.get("total_cost", 0.0) or 0.0),
+                        components=comp_val if isinstance(comp_val, list) else [str(comp_val)],
+                        description=desc_val,
+                        km=int(km_val) if km_val is not None else None,
+                        total_cost=float(cost_val or 0.0),
                         parts_cost=float(committed_data.get("parts_cost", 0.0) or 0.0),
                         labor_cost=float(committed_data.get("labor_cost", 0.0) or 0.0),
                         workshop_name=committed_data.get("workshop_name"),
@@ -160,23 +361,30 @@ async def receive_webhook(
                     if new_maintenance.km:
                         await vehicle_repo.update_km(target_vehicle_id, new_maintenance.km)
 
-            # Caso C: Confirmação ou Comando Direto de Reset de Garagem / Sistema
-            elif (
-                action_type == "system_reset"
-                or committed_data.get("_reset_system")
-                or committed_data.get("_reset_garage")
-                or "reset" in str(committed_data).lower()
-            ):
-                reset_stats = await user_repo.reset_user_data(user_id=user_id)
-                logger.info(f"Garagem e Sistema do usuário [{user_id}] completamente zerados: {reset_stats}")
-
         except Exception as err:
             logger.error(f"Erro ao persistir ação confirmada no banco: {err}", exc_info=True)
+
+    # 5. Tratamento de Atualização Direta de Odômetro (UPDATE_ODOMETER)
+    elif action_type in ("update_odometer", "odometer_updated"):
+        try:
+            details = result.get("details") or {}
+            target_vehicle_id = resolve_target_vehicle(vehicles, details.get("_target_vehicle_ref"), details)
+            new_km = details.get("odometer_km") or details.get("km")
+            if target_vehicle_id and new_km:
+                await vehicle_repo.update_km(target_vehicle_id, int(new_km))
+                logger.info(f"Odômetro do veículo [{target_vehicle_id}] atualizado para {new_km} km")
+        except Exception as err:
+            logger.error(f"Erro ao atualizar odômetro: {err}", exc_info=True)
+
+    # 6. Disparo outbound transparente via WhatsApp Gateway
+    reply_text = result.get("reply")
+    if reply_text:
+        await send_whatsapp_reply(user_id, reply_text)
 
     return {
         "status": "success",
         "user_id": user_id,
-        "reply": result.get("reply"),
+        "reply": reply_text,
         "action_type": action_type,
         "state": result.get("state"),
     }

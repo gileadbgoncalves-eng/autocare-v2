@@ -59,6 +59,9 @@ class GeminiClient:
         history: Optional[List[Dict[str, str]]] = None,
         context: Optional[Any] = None,
         vehicles: Optional[List[Any]] = None,
+        maintenances: Optional[List[Any]] = None,
+        reminders: Optional[List[Any]] = None,
+        fines: Optional[List[Any]] = None,
     ) -> GeminiAnalysisResponse:
         """
         Analisa a mensagem do usuário com contexto conversacional e Structured Output.
@@ -68,7 +71,7 @@ class GeminiClient:
             return self._build_offline_fallback(current_message)
 
         # Montagem do prompt com injeção do histórico de diálogo
-        prompt = self._format_prompt(current_message, history, context, vehicles)
+        prompt = self._format_prompt(current_message, history, context, vehicles, maintenances, reminders, fines)
         schema_dict = self._clean_schema_for_gemini(GeminiAnalysisResponse.model_json_schema())
 
         models_to_try = [self.primary_model, self.fallback_model]
@@ -94,13 +97,19 @@ class GeminiClient:
         history: Optional[List[Dict[str, str]]],
         context: Optional[Any],
         vehicles: Optional[List[Any]],
+        maintenances: Optional[List[Any]] = None,
+        reminders: Optional[List[Any]] = None,
+        fines: Optional[List[Any]] = None,
     ) -> str:
-        """Monta o prompt com contexto enriquecido, veículos completos (com tipo/moto) e histórico recente de diálogo."""
+        """Monta o prompt com contexto enriquecido, veículos completos, histórico recente e dados do banco."""
         return build_analysis_prompt(
             current_message=message,
             context=context,
             vehicles=vehicles,
             history=history,
+            maintenances=maintenances,
+            reminders=reminders,
+            fines=fines,
         )
 
     @staticmethod
@@ -139,7 +148,11 @@ class GeminiClient:
         """
         Executa chamada com timeout estrito de 5s e retry exponencial com jitter para 429 e 5xx.
         """
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
         payload = {
             "system_instruction": {
                 "parts": [{"text": SYSTEM_INSTRUCTION}]
@@ -158,7 +171,7 @@ class GeminiClient:
             try:
                 if HAS_HTTPX:
                     async with httpx.AsyncClient(timeout=self.timeout) as client:
-                        resp = await client.post(url, json=payload)
+                        resp = await client.post(url, json=payload, headers=headers)
                         if resp.status_code == 200:
                             data = resp.json()
                             candidates = data.get("candidates", [])
@@ -200,7 +213,7 @@ class GeminiClient:
         req = urllib.request.Request(
             url,
             data=data_bytes,
-            headers={"Content-Type": "application/json", "User-Agent": "AutoCare-V2/1.0"},
+            headers={"Content-Type": "application/json", "User-Agent": "AutoCare-V2/1.0", "x-goog-api-key": self.api_key},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:

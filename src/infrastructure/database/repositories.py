@@ -9,9 +9,29 @@ from datetime import datetime
 from sqlalchemy import select, delete, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.domain.entities import User, UserPreferences, Vehicle, MaintenanceRecord
-from src.domain.enums import VehicleType, FuelType, UsageProfile
-from .models import UserModel, VehicleModel, MaintenanceRecordModel
+from src.domain.entities import (
+    User,
+    UserPreferences,
+    Vehicle,
+    MaintenanceRecord,
+    Reminder,
+    TrafficFine,
+)
+from src.domain.enums import (
+    VehicleType,
+    FuelType,
+    UsageProfile,
+    ReminderRecurrence,
+    ReminderStatus,
+    FineStatus,
+)
+from .models import (
+    UserModel,
+    VehicleModel,
+    MaintenanceRecordModel,
+    ReminderModel,
+    TrafficFineModel,
+)
 
 
 class UserRepository:
@@ -335,9 +355,147 @@ class MaintenanceRepository:
         total = result.scalar()
         return float(total) if total is not None else 0.0
 
+    async def get_by_user_id(self, user_id: str, limit: int = 50) -> List[MaintenanceRecord]:
+        """Retorna histórico cronológico de todas as manutenções dos veículos do usuário."""
+        stmt = (
+            select(MaintenanceRecordModel)
+            .where(MaintenanceRecordModel.user_id == user_id)
+            .order_by(desc(MaintenanceRecordModel.date), desc(MaintenanceRecordModel.id))
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        models = result.scalars().all()
+        return [self._to_entity(m) for m in models]
+
     async def delete_all_by_user_id(self, user_id: str) -> int:
         """Remove todos os registros de manutenção do usuário."""
         stmt = delete(MaintenanceRecordModel).where(MaintenanceRecordModel.user_id == user_id)
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount
+
+
+
+class ReminderRepository:
+    """Repositório de persistência para lembretes automotivos."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    @staticmethod
+    def _to_entity(model: ReminderModel) -> Reminder:
+        return Reminder(
+            id=model.id,
+            user_id=model.user_id,
+            vehicle_id=model.vehicle_id,
+            description=model.description,
+            due_datetime=model.due_datetime,
+            due_km=model.due_km,
+            recurrence=ReminderRecurrence(model.recurrence) if model.recurrence in [e.value for e in ReminderRecurrence] else ReminderRecurrence.ONCE,
+            status=ReminderStatus(model.status) if model.status in [e.value for e in ReminderStatus] else ReminderStatus.PENDING,
+            created_at=model.created_at,
+        )
+
+    async def add_reminder(self, reminder: Reminder) -> Reminder:
+        new_model = ReminderModel(
+            user_id=reminder.user_id,
+            vehicle_id=reminder.vehicle_id,
+            description=reminder.description,
+            due_datetime=reminder.due_datetime,
+            due_km=reminder.due_km,
+            recurrence=reminder.recurrence.value if hasattr(reminder.recurrence, "value") else str(reminder.recurrence),
+            status=reminder.status.value if hasattr(reminder.status, "value") else str(reminder.status),
+            created_at=reminder.created_at,
+        )
+        self.session.add(new_model)
+        await self.session.commit()
+        await self.session.refresh(new_model)
+        return self._to_entity(new_model)
+
+    async def get_by_user_id(self, user_id: str) -> List[Reminder]:
+        stmt = (
+            select(ReminderModel)
+            .where(ReminderModel.user_id == user_id)
+            .order_by(desc(ReminderModel.created_at))
+        )
+        result = await self.session.execute(stmt)
+        models = result.scalars().all()
+        return [self._to_entity(m) for m in models]
+
+    async def get_by_id(self, reminder_id: int) -> Optional[Reminder]:
+        stmt = select(ReminderModel).where(ReminderModel.id == reminder_id)
+        result = await self.session.execute(stmt)
+        model = result.scalar_one_or_none()
+        return self._to_entity(model) if model else None
+
+    async def delete(self, reminder_id: int) -> bool:
+        stmt = delete(ReminderModel).where(ReminderModel.id == reminder_id)
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.rowcount > 0
+
+
+class TrafficFineRepository:
+    """Repositório de persistência para multas e infrações de trânsito."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    @staticmethod
+    def _to_entity(model: TrafficFineModel) -> TrafficFine:
+        return TrafficFine(
+            id=model.id,
+            vehicle_id=model.vehicle_id,
+            description=model.description,
+            infraction_code=model.infraction_code,
+            issuing_body=model.issuing_body,
+            points=model.points,
+            amount=model.amount,
+            discounted_amount=model.discounted_amount,
+            infraction_date=model.infraction_date,
+            due_date=model.due_date,
+            status=FineStatus(model.status) if model.status in [e.value for e in FineStatus] else FineStatus.NOTIFICADA,
+            created_at=model.created_at,
+        )
+
+    async def add_fine(self, fine: TrafficFine) -> TrafficFine:
+        new_model = TrafficFineModel(
+            vehicle_id=fine.vehicle_id,
+            description=fine.description,
+            infraction_code=fine.infraction_code,
+            issuing_body=fine.issuing_body,
+            points=fine.points,
+            amount=fine.amount,
+            discounted_amount=fine.discounted_amount,
+            infraction_date=fine.infraction_date,
+            due_date=fine.due_date,
+            status=fine.status.value if hasattr(fine.status, "value") else str(fine.status),
+            created_at=fine.created_at,
+        )
+        self.session.add(new_model)
+        await self.session.commit()
+        await self.session.refresh(new_model)
+        return self._to_entity(new_model)
+
+    async def get_by_user_id(self, user_id: str) -> List[TrafficFine]:
+        stmt = (
+            select(TrafficFineModel)
+            .join(VehicleModel, TrafficFineModel.vehicle_id == VehicleModel.id)
+            .where(VehicleModel.user_id == user_id)
+            .order_by(desc(TrafficFineModel.created_at))
+        )
+        result = await self.session.execute(stmt)
+        models = result.scalars().all()
+        return [self._to_entity(m) for m in models]
+
+    async def get_by_id(self, fine_id: int) -> Optional[TrafficFine]:
+        stmt = select(TrafficFineModel).where(TrafficFineModel.id == fine_id)
+        result = await self.session.execute(stmt)
+        model = result.scalar_one_or_none()
+        return self._to_entity(model) if model else None
+
+    async def delete(self, fine_id: int) -> bool:
+        stmt = delete(TrafficFineModel).where(TrafficFineModel.id == fine_id)
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.rowcount > 0

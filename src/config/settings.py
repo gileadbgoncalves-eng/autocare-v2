@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = Field(default="", description="Chave de API do Google AI Studio / Gemini")
     GEMINI_PRIMARY_MODEL: str = Field(default="gemini-flash-lite-latest", description="Modelo veloz e inteligente para análise de intenções")
     GEMINI_FALLBACK_MODEL: str = Field(default="gemini-3.5-flash-lite", description="Modelo alternativo para contingência de timeout")
-    GEMINI_TIMEOUT_SECONDS: float = Field(default=5.0, description="Timeout estrito para requisições de IA")
+    GEMINI_TIMEOUT_SECONDS: float = Field(default=15.0, description="Timeout estrito para requisições de IA")
     GEMINI_MAX_RETRIES: int = Field(default=3, description="Tentativas com backoff exponencial em 429/5xx")
 
     # 3. Banco de Dados Relacional (SQLAlchemy 2.0 Async)
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # 4. Provedores de WhatsApp
     PROVIDER: str = Field(default="evolution", description="evolution, zapi ou twilio")
     EVOLUTION_BASE_URL: str = Field(default="https://evolution-api-production-6ecb.up.railway.app")
-    EVOLUTION_API_KEY: str = Field(default="8b5aafc3215bb38743847011ea655f2fae031f0b003edbbd32d45b4f32097e9f")
+    EVOLUTION_API_KEY: str = Field(default="")
     EVOLUTION_INSTANCE: str = Field(default="autocare")
     EVOLUTION_TYPING_DELAY_MS: int = Field(default=200, description="Simulação de digitação em milissegundos")
 
