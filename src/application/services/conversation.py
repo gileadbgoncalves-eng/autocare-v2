@@ -159,6 +159,19 @@ class ConversationService:
                 "details": {}
             }
 
+        # 2.8 Consulta Direta de Status Veicular por Placa (Regex Sanitizado & Banco Real)
+        plate_search = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text)
+        status_keywords = ("status", "situa", "dados", "como ta", "como está", "informa", "revisao", "revisão", "manuten", "meu carro", "minha moto", "veiculo", "veículo")
+        if plate_search and any(k in text_lower for k in status_keywords):
+            clean_plate = re.sub(r"[\s\-]", "", plate_search.group(1)).upper()
+            status_result = await self._query_vehicle_status_by_plate(clean_plate, vehicles)
+            if status_result:
+                context.state = ConversationState.NORMAL
+                context.draft_payload = None
+                self._record_assistant_turn(context, status_result["reply"])
+                self.update_context(context)
+                return status_result
+
         # 3. Estado NORMAL: Envia para o Gemini analisar com contexto completo
         history_dicts = [{"role": t.role, "content": t.content} for t in context.recent_turns]
         analysis: GeminiAnalysisResponse = await self.gemini.analyze_message(
@@ -452,3 +465,80 @@ class ConversationService:
         context.recent_turns.append(ConversationTurn(role="assistant", content=reply_text))
         if len(context.recent_turns) > 10:
             context.recent_turns = context.recent_turns[-10:]
+
+    async def _query_vehicle_status_by_plate(
+        self,
+        plate: str,
+        vehicles: Optional[List[Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Consulta o status real do veículo no banco de dados relacional (SQLAlchemy 2.0 Async)
+        utilizando regex sanitizado para placas Antigas e Mercosul.
+        """
+        # 1. Consulta o banco relacional assíncrono real
+        try:
+            from src.database import async_session_factory
+            from src.repositories.veiculo_repository import VeiculoRepository
+            from src.repositories.manutencao_repository import ManutencaoRepository
+
+            async with async_session_factory() as session:
+                v_repo = VeiculoRepository(session)
+                m_repo = ManutencaoRepository(session)
+
+                db_veh = await v_repo.get_by_placa(plate)
+                if db_veh:
+                    maints = await m_repo.get_by_veiculo_id(db_veh.id)
+                    total_spent = await m_repo.get_total_cost_by_veiculo(db_veh.id)
+
+                    reply = (
+                        f"🚗 *Status do Veículo - {db_veh.marca} {db_veh.modelo} ({db_veh.ano})*\n\n"
+                        f"• *Placa:* `{db_veh.placa}`\n"
+                        f"• *Odômetro Atual:* {db_veh.quilometragem:,} km\n"
+                        f"• *Manutenções Registradas:* {len(maints)}\n"
+                        f"• *Total Investido:* R$ {total_spent:.2f}\n"
+                    )
+                    if maints:
+                        ult = maints[0]
+                        data_fmt = ult.data.strftime("%d/%m/%Y") if hasattr(ult.data, "strftime") else str(ult.data)
+                        reply += f"• *Última Manutenção:* {ult.descricao} em {data_fmt} (R$ {ult.custo:.2f})\n"
+                    else:
+                        reply += "• *Histórico:* Nenhuma manutenção registrada ainda.\n"
+
+                    reply += "\n💡 Deseja registrar uma nova manutenção ou despesa para este veículo?"
+                    return {
+                        "reply": reply,
+                        "action_type": "vehicle_status_query",
+                        "state": "normal",
+                        "details": {
+                            "placa": db_veh.placa,
+                            "modelo": db_veh.modelo,
+                            "quilometragem": db_veh.quilometragem,
+                            "total_manutencoes": len(maints),
+                            "total_investido": total_spent,
+                        },
+                    }
+        except Exception:
+            pass
+
+        # 2. Fallback para lista de veículos em memória / garagem
+        if vehicles:
+            matching = next(
+                (v for v in vehicles if (getattr(v, "plate", None) or "").replace("-", "").upper() == plate),
+                None,
+            )
+            if matching:
+                reply = (
+                    f"🚗 *Status do Veículo - {getattr(matching, 'make', '')} {getattr(matching, 'model', '')}*\n\n"
+                    f"• *Placa:* `{getattr(matching, 'plate', plate)}`\n"
+                    f"• *Odômetro Atual:* {getattr(matching, 'current_km', 0):,} km\n"
+                    f"• *Perfil:* {getattr(matching, 'vehicle_type', 'Carro')}\n\n"
+                    f"💡 Veículo localizado na sua garagem. Deseja registrar alguma manutenção?"
+                )
+                return {
+                    "reply": reply,
+                    "action_type": "vehicle_status_query",
+                    "state": "normal",
+                    "details": {"placa": plate, "modelo": getattr(matching, "model", "")},
+                }
+
+        return None

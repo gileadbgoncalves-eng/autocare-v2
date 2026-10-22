@@ -78,16 +78,22 @@ async def test_criar_veiculo_placa_invalida_retorna_422(proprietario_teste):
         assert "placa" in erros_campos
 
 
+import random
+
 @pytest.mark.asyncio
 async def test_criar_veiculo_placa_valida_antiga_retorna_201(proprietario_teste):
     """
     Deve aceitar placas válidas no formato antigo ('ABC-1234'),
     sanitizando hífen e salvando como 'ABC1234' com status 201 Created.
     """
+    placa_num = random.randint(1000, 9999)
+    placa_antiga = f"OLD-{placa_num}"
+    placa_esperada = f"OLD{placa_num}"
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         payload_valido_antigo = {
-            "placa": "KZZ-9876",
+            "placa": placa_antiga,
             "marca": "Honda",
             "modelo": "Civic Touring",
             "ano": 2019,
@@ -97,14 +103,9 @@ async def test_criar_veiculo_placa_valida_antiga_retorna_201(proprietario_teste)
 
         response = await client.post("/veiculos", json=payload_valido_antigo)
 
-        # Se já existir devido a execuções prévias, testamos com variação
-        if response.status_code == 400 and "Já existe" in response.text:
-            payload_valido_antigo["placa"] = "OLD-9871"
-            response = await client.post("/veiculos", json=payload_valido_antigo)
-
         assert response.status_code == 201, f"Esperado 201, recebido {response.status_code}: {response.text}"
         data = response.json()
-        assert data["placa"] in ("KZZ9876", "OLD9871")
+        assert data["placa"] == placa_esperada
         assert data["marca"] == "Honda"
         assert data["modelo"] == "Civic Touring"
         assert data["proprietario_id"] == proprietario_teste.id
@@ -117,10 +118,15 @@ async def test_criar_veiculo_placa_valida_mercosul_retorna_201(proprietario_test
     Deve aceitar placas válidas no padrão Mercosul em minúsculas ('bra2e19'),
     sanitizando e normalizando para 'BRA2E19' com status 201 Created.
     """
+    dig1 = random.randint(1, 9)
+    dig2 = random.randint(10, 99)
+    placa_mercosul_input = f"bra{dig1}e{dig2}"
+    placa_mercosul_esperada = f"BRA{dig1}E{dig2}"
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         payload_mercosul = {
-            "placa": "bra2e19",
+            "placa": placa_mercosul_input,
             "marca": "Toyota",
             "modelo": "Corolla Altis Hybrid",
             "ano": 2023,
@@ -130,13 +136,9 @@ async def test_criar_veiculo_placa_valida_mercosul_retorna_201(proprietario_test
 
         response = await client.post("/veiculos", json=payload_mercosul)
 
-        if response.status_code == 400 and "Já existe" in response.text:
-            payload_mercosul["placa"] = "mer1c23"
-            response = await client.post("/veiculos", json=payload_mercosul)
-
         assert response.status_code == 201, f"Esperado 201, recebido {response.status_code}: {response.text}"
         data = response.json()
-        assert data["placa"] in ("BRA2E19", "MER1C23")
+        assert data["placa"] == placa_mercosul_esperada
         assert data["modelo"] == "Corolla Altis Hybrid"
 
 

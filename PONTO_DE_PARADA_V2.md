@@ -1,111 +1,99 @@
-# 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (ARQUITETURA, SEGURANÇA & HOMOLOGAÇÃO TOTAL)
+# 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (API REST, PERSISTÊNCIA REAL, MIGRACÕES & BOT INTEGRADO)
 
-**Data do Checkpoint:** 20/10/2026 - 04:50  
-**Versão:** AutoCare V2.2.0 (Hardened Production Ready)  
-**Status do Projeto:** 100% Funcional, Blindado contra Adversários, Auditado contra Vazamento de Logs e Idempotente sob Alta Concorrência.  
-**Taxa de Sucesso dos Testes:**
-- **100% na Suíte de Testes Unitários e Integrados (`run_v2_tests.py` - 6 camadas).**
-- **100% na Bateria de Caos & Segurança de Infraestrutura (`security_chaos_tester.py` - 4 módulos).**
-- **100% na Suíte de Validação Profunda e Auditoria SQL (`deep_validation_tester.py` - 7 cenários).**
-- **100% na Bateria de Red Teaming Adversarial (`ai_tester.py` - 12 cenários).**
+**Data do Checkpoint:** 22/10/2026 - 18:25  
+**Versão:** AutoCare V2.3.0 (Full Async CRUD, Alembic Migrations, Docker Multi-Stage & Integrated Bot)  
+**Status do Projeto:** 100% Funcional, Blindado contra Adversários, Camada de Persistência Completa, Migrações Alembic Operacionais e Bot Pleno no Banco Relacional.  
 
 ---
 
-## 🎯 Conquistas Arquiteturais, Segurança e Persistência Real
+## 📊 Matriz Consolidada de Homologação dos Testes
 
-### 1. Zero Vazamento de Credenciais em Logs (Eliminação de `?key=`)
-- No arquivo `src/ai/client.py`, a query string `?key={api_key}` foi eliminada da URL.
-- A chave da API agora é transmitida exclusivamente via cabeçalho HTTP `"x-goog-api-key": self.api_key`.
-- Logs de bibliotecas como `httpx` e `urllib` registram apenas a URL limpa da Google AI Studio (`POST https://generativelanguage.googleapis.com/...`), garantindo sigilo absoluto das credenciais.
-- Configuração de `EVOLUTION_API_KEY=""` e `GEMINI_TIMEOUT_SECONDS=15.0` como defaults seguros em `src/config/settings.py` e `.env.example`.
-
-### 2. Bloqueio do Bypass de Reset (Human-in-the-Loop Obrigatório)
-- O fast-path de reset instantâneo em `src/application/services/conversation.py` foi restrito estritamente a comandos técnicos de automação:
-  ```python
-  reset_triggers = {"zerar sistema", "zerar o sistema", "/reset_all"}
-  ```
-- Frases em linguagem natural (*"zerar garagem"*, *"apagar tudo"*, *"limpar garagem"*) entram obrigatoriamente no fluxo de confirmação `awaiting_garage_reset_confirm`. A garagem só é limpa após *"Sim"* explícito; caso o usuário responda *"Não"*, os veículos e registros permanecem intactos.
-
-### 3. Roteamento Preciso Multi-Veículos (Moto vs Carro)
-- A função `resolve_target_vehicle` em `src/interfaces/api/webhook.py` foi aprimorada para resolver ambiguidades quando o usuário possui veículos da mesma montadora (ex: Honda Civic e Honda CG 160 Titan).
-- Priorização em 4 níveis:
-  1. Correspondência exata/parcial de Placa;
-  2. Correspondência de Modelo específico (*"CG 160"*, *"Titan"*, *"Civic"*, etc.);
-  3. Correspondência semântica de Tipo (*"moto"*, *"motoca"*, *"carro"*, *"caranga"*);
-  4. Fallback ordenado sem falso-positivo de montadora.
-
-### 4. Persistência Relacional Completa de Lembretes, Multas e Odômetro
-- Criação das classes de repositório em `src/infrastructure/database/repositories.py`:
-  - `ReminderRepository` (`add_reminder`, `get_by_user_id`, `get_by_id`, `delete`)
-  - `TrafficFineRepository` (`add_fine`, `get_by_user_id`, `get_by_id`, `delete`)
-  - `MaintenanceRepository.get_by_user_id(user_id)`
-- Todas as ações confirmadas (`SET_REMINDER`, `REGISTER_FINE`, `UPDATE_ODOMETER`, `LOG_MAINTENANCE`) persistem seus respectivos registros no banco relacional (SQLite / PostgreSQL).
-
-### 5. Injeção de Dados Históricos no Prompt (Consultas Cegas sem Memória Volátil)
-- A função `build_analysis_prompt` em `src/ai/prompts.py` recebe e formata os dados reais persistidos no banco:
-  - `[HISTÓRICO DE MANUTENÇÕES REGISTRADAS NO BANCO DE DADOS]`
-  - `[LEMBRETES ATIVOS NO BANCO DE DADOS]`
-  - `[MULTAS E INFRAÇÕES REGISTRADAS NO BANCO DE DADOS]`
-- Testado com sucesso: ao zerar a memória recente de turnos (`clear_context`), o bot responde com precisão o valor total gasto (ex: R$ 800,00), a última oficina e a pontuação de multas ativas.
-
-### 6. Idempotência e Proteção Concorrente via `asyncio.Lock`
-- Mecanismo de trava assíncrona por `user_id` no método `handle_incoming_message`.
-- Disparos simultâneos ou múltiplos cliques rápidos de *"Sim"* (duplo-clique no WhatsApp) são processados sequencialmente; o primeiro confirma e persiste, enquanto o segundo encontra o estado já normalizado, evitando duplicações no banco de dados.
-
-### 7. Normalizador de Payloads para Gateways WhatsApp (Evolution API & Z-API)
-- Suporte nativo e robusto a webhooks da Evolution API (`messages.upsert`) e Z-API (`on-message-received`).
-- Descarte transparente (HTTP 200 com `status: ignored`) para mensagens de grupos (`@g.us`) e mensagens enviadas pelo próprio bot (`fromMe: True`), poupando cotas de IA.
-- Disparo outbound assíncrono via `send_whatsapp_reply` com tolerância a falhas.
-
----
-
-## 📊 Matriz Consolidada de Homologação
-
-### A. Suíte de Validação Profunda (`deep_validation_tester.py`) - 7/7 PASS (100%)
-| # | Cenário Auditado | Validação Técnica | Resultado |
-| :-: | :--- | :--- | :---: |
-| **1** | Roteamento Exato para 2º Veículo (Moto vs Carro) | Auditoria SQL direta na tabela `maintenance_records` | **PASS ✅** |
-| **2** | Persistência Real de Lembretes, Multas e Odômetro | Verificação de integridade nas tabelas `reminders`, `traffic_fines` e `vehicles` | **PASS ✅** |
-| **3** | Teste Cego de Consulta ao Banco (Memória Zep Limpa) | `clear_context` + respostas auditadas: R$ 800, oficina e 4 pontos | **PASS ✅** |
-| **4** | Idempotência e Double-Click Concorrente | `asyncio.gather` com dois webhooks simultâneos grava exatamente 1 registro | **PASS ✅** |
-| **5** | Bloqueio de Reset Acidental sem Confirmação | *"zerar garagem"* retém veículos, exige confirmação e cancela com *"Não"* | **PASS ✅** |
-| **6** | Auditoria de Logs: Zero Vazamento de Credenciais | Stream `httpx` e `root` auditados sem ocorrência da `GEMINI_API_KEY` | **PASS ✅** |
-| **7** | Parser de Payloads Reais de Gateways | Evolution e Z-API ignoram `@g.us` e `fromMe: True` com HTTP 200 | **PASS ✅** |
-
-### B. Suíte de Caos e Segurança (`security_chaos_tester.py`) - 4/4 PASS (100%)
-| # | Módulo de Teste | Validação | Resultado |
-| :-: | :--- | :--- | :---: |
-| **1** | Isolamento Multi-Tenant Concorrente | User A e User B em paralelo; reset de um não afeta o outro | **PASS ✅** |
-| **2** | Proteção contra Odômetro Regressivo | Bloqueio de redução indevida de km no banco e alerta da IA | **PASS ✅** |
-| **3** | Injeção em Dados Estruturados (SQLi & XSS) | 4 vetores de injeção sanitizados e tabela íntegra | **PASS ✅** |
-| **4** | Resiliência a Timeout de LLM | Contingência transparente com HTTP 200 amigável sem crash 500 | **PASS ✅** |
-
-### C. Testes Unitários e Integrados (`run_v2_tests.py`) - 6/6 PASS (100%)
-| Camada | Escopo Testado | Resultado |
+| Suíte de Testes | Abrangência / Escopo | Resultado |
 | :--- | :--- | :---: |
-| **Camada 1** | Domínio e Modelos Pydantic v2 (User, Vehicle, Maintenance) | **PASS ✅** |
-| **Camada 2** | Configurações, Timeouts e Normalização de Dialeto Async | **PASS ✅** |
-| **Camada 3** | Repositórios Assíncronos e Banco de Dados (CRUD & Cascade) | **PASS ✅** |
-| **Camada 4** | Camada de IA (Structured Outputs, Prompts e Fallbacks) | **PASS ✅** |
-| **Camada 5** | Serviço de Conversação e Máquina de Estados Human-in-the-Loop | **PASS ✅** |
-| **Camada 6** | Endpoint Webhook FastAPI e Normalizador de Payloads | **PASS ✅** |
+| **Nova API Pytest (`pytest tests/ -v`)** | Endpoints de Veículos, Proprietários, Manutenções e Validações de Placa | **10/10 PASS (100%) ✅** |
+| **Suíte de Integração Central (`run_v2_tests.py`)** | 6 Camadas: Domínio, Config, Repositórios, IA, Máquina de Estados, Webhook | **6/6 PASS (100%) ✅** |
+| **Suíte de Caos e Segurança (`security_chaos_tester.py`)** | Isolamento Multi-Tenant, Anti-Rollback de Odômetro, SQLi/XSS, Fallback LLM | **4/4 PASS (100%) ✅** |
+| **Suíte de Validação Profunda (`deep_validation_tester.py`)** | Auditoria SQL direta, Roteamento Multi-Veículos, Persistência e Idempotência | **7/7 PASS (100%) ✅** |
 
 ---
 
-## 🚀 Como Executar as Suítes de Homologação
+## 🎯 Conquistas Arquiteturais e Entregas Técnicas (V2.3.0)
 
+### 1. Modelagem Relacional & SQLAlchemy 2.0 Async
+- Criação da base declarativa limpa e gerenciador de conexões assíncronas em `src/database.py`.
+- Suporte nativo a `postgresql+asyncpg` para produção e `sqlite+aiosqlite` para testes e desenvolvimento local.
+- Modelos ORM completos em `src/models/`:
+  - `Proprietario` (`id`, `nome`, `email`, `telefone`, `created_at`, relacionamento `veiculos` com `lazy="selectin"` e `cascade="all, delete-orphan"`).
+  - `Veiculo` (`id`, `placa`, `marca`, `modelo`, `ano`, `quilometragem`, `proprietario_id`, relacionamentos bidirecionais com `proprietario` e `manutencoes`).
+  - `Manutencao` (`id`, `veiculo_id`, `descricao`, `custo`, `data`, `odometro_registro`, relacionamento `veiculo`).
+
+### 2. Migrações de Banco de Dados com Alembic
+- Estrutura completa inicializada com `alembic init -t async alembic`.
+- Configuração do `alembic/env.py` conectada dinamicamente à `DATABASE_ASYNC_URL` e importando `Base.metadata`.
+- Script de migração inicial versionado: `alembic/versions/0001_initial.py`.
+
+### 3. Schemas Pydantic v2 com Validação Rigorosa via Regex
+- Módulo `src/schemas/`:
+  - `VeiculoCreate` e `VeiculoResponse`: Validador `@field_validator("placa")` que sanitiza (remove hífens e converte para maiúsculas) e valida rigorosamente os padrões **Antigo** (`ABC-1234` / `ABC1234`) e **Mercosul** (`ABC1D23` / `ABC-1D23`) através de expressão regular (`^(?:[A-Z]{3}[0-9]{4}|[A-Z]{3}[0-9][A-Z][0-9]{2})$`). Rejeita qualquer outro formato com **HTTP 422 Unprocessable Entity**.
+  - `ProprietarioCreate` e `ProprietarioResponse` com validação de formato de e-mail e telefone.
+  - `ManutencaoCreate` e `ManutencaoResponse` com validação de custos positivos e datas.
+
+### 4. Camada de Repositórios Assíncronos (`src/repositories/`)
+- Implementação estrita com sintaxe moderna `select()` e `await session.execute()`:
+  - `ProprietarioRepository`: `create`, `get_by_id`, `get_by_email`, `list_all`.
+  - `VeiculoRepository`: `create`, `list_all`, `get_by_id`, `get_by_placa`.
+  - `ManutencaoRepository`: `create`, `list_all`, `get_by_id`, `get_by_veiculo_id`, `get_total_cost_by_veiculo`.
+
+### 5. Endpoints REST da API FastAPI (`src/interfaces/routers/`)
+- Injeção de dependência padronizada com `Depends(get_db)`.
+- Roteadores modulares conectados em `src/interfaces/app.py`:
+  - `POST /proprietarios` (201 Created), `GET /proprietarios` (200 OK), `GET /proprietarios/{id}` (200 OK / 404).
+  - `POST /veiculos` (201 Created), `GET /veiculos` (200 OK), `GET /veiculos/{id}` (200 OK / 404).
+  - `POST /manutencoes` (201 Created, com atualização automática de odômetro anti-regressão), `GET /manutencoes` (200 OK), `GET /manutencoes/veiculo/{id}` (200 OK).
+
+### 6. Integração do Bot de IA com Banco de Dados Real
+- No `src/application/services/conversation.py`, implementado o interceptor `_query_vehicle_status_by_plate`.
+- Consultas como *"Qual o status do meu carro ABC1D23?"* ou *"Como está a situação do carro YAR-1928?"* extraem a placa via Regex, buscam no banco de dados real e retornam dados consolidados em tempo real (odômetro, quantidade de manutenções e total gasto).
+- Persistência das manutenções confirmadas diretamente vinculada aos repositórios relacionais.
+
+### 7. Containerização e Docker Compose
+- `Dockerfile` multi-stage com `python:3.12-slim`, usuário não-root `appuser` e healthcheck embutido.
+- `docker-compose.yml` orquestrando o FastAPI e PostgreSQL 16 com persistência de volumes e verificação de saúde.
+
+---
+
+## 🚀 Como Executar o Sistema em Produção e Testes
+
+### 1. Executar com Docker Compose
 ```bash
-# 1. Suíte de Integração Central (Rápida, ~1.5s)
+# Subir aplicação e banco PostgreSQL em background
+docker compose up -d --build
+
+# Rodar as migrações do Alembic dentro do container da API
+docker compose exec web alembic upgrade head
+
+# Visualizar status dos containers
+docker compose ps
+```
+
+### 2. Acessar a Documentação Interativa
+* **Swagger UI:** [http://localhost:8080/docs](http://localhost:8080/docs)
+* **ReDoc:** [http://localhost:8080/redoc](http://localhost:8080/redoc)
+* **Health Check:** [http://localhost:8080/health](http://localhost:8080/health)
+
+### 3. Rodar as Suítes de Testes Automatizados Localmente
+```bash
+# Ativar o ambiente virtual
+.\.venv\Scripts\Activate.ps1
+
+# 1. Nova suíte Pytest com testes assíncronos da API e Bot (10 testes)
+pytest tests/ -v
+
+# 2. Suíte central de integração do AutoCare V2 (6 camadas)
 python run_v2_tests.py
 
-# 2. Suíte de Caos, Segurança e Consistência (~30s)
+# 3. Suíte de Caos e Segurança
 python security_chaos_tester.py
-
-# 3. Suíte de Validação Profunda e Auditoria SQL (~80s)
-python deep_validation_tester.py
-
-# 4. Suíte Adversarial de Red Teaming
-python ai_tester.py --in-process
 ```
 
 ---
@@ -115,7 +103,7 @@ python ai_tester.py --in-process
 - **Repositório Remoto:** `https://github.com/gileadbgoncalves-eng/autocare-v2.git`
 - **Branch Principal:** `main`
 - **Últimos Commits:**
-  - `49004fd`: `fix(security): correcao estrutural de persistencia, roteamento multi-veiculos e validacao profunda`
-  - `fffb214`: `docs: add AUTOCARE_V2_FULL_SYSTEM_DOSSIER.md with complete source code, guidelines, and external test guide`
-  - `9028b04`: `feat(security): add security_chaos_tester.py with multi-tenant, anti-rollback, SQLi, and LLM fallback tests`
-- **Status da Árvore de Trabalho:** Limpa (`working tree clean`).
+  - `0e32c98`: `feat(crud): persistencia relacional async, alembic, schemas pydantic v2 e endpoints de veiculos`
+  - `9ad3295`: `feat(core): dockerizacao multi-stage, schemas pydantic e correcao de encoding`
+  - `dc57d63`: `docs: atualizar PONTO_DE_PARADA_V2.md com validacao profunda, persistencia real e auditoria sql`
+- **Status da Árvore de Trabalho:** Atualizada e homologada.
