@@ -15,6 +15,14 @@ import traceback
 from datetime import datetime, date
 from typing import List, Dict, Any
 
+# Garante suporte a emojis e caracteres UTF-8 no terminal Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # 1. Testes de Domínio
 def test_domain():
     print("\n--- [TESTE 1] Domínio & Modelos Pydantic v2 ---")

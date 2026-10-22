@@ -8,6 +8,13 @@ import asyncio
 import sys
 from typing import Optional
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from src.infrastructure.database.session import init_db, close_db, async_session_factory
 from src.infrastructure.database.repositories import (
     UserRepository,

@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config.settings import settings
 from src.infrastructure.database.session import init_db, close_db
 from src.interfaces.api.webhook import router as webhook_router
+from pydantic import BaseModel, Field
 
 # Configuração de Logs
 logging.basicConfig(
@@ -21,6 +22,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("autocare.app")
+
+
+class HealthCheckResponse(BaseModel):
+    """Modelo canônico para o endpoint de verificação de integridade."""
+    status: str = Field(..., description="Estado de saúde da aplicação")
+    service: str = Field(..., description="Nome do microsserviço")
+    version: str = Field(..., description="Versão semântica da aplicação")
+    environment: str = Field(..., description="Ambiente de execução (development/production)")
+    provider: str = Field(..., description="Gateway WhatsApp padrão configurado")
 
 
 @asynccontextmanager
@@ -82,16 +92,16 @@ def create_app() -> FastAPI:
         )
 
     # 4. Endpoints de Diagnóstico e Saúde (Health Check)
-    @app.get("/", tags=["Health"])
-    @app.get("/health", tags=["Health"])
+    @app.get("/", tags=["Health"], response_model=HealthCheckResponse, summary="Verificação de integridade do serviço")
+    @app.get("/health", tags=["Health"], response_model=HealthCheckResponse, summary="Verificação de integridade do serviço")
     async def health_check():
-        return {
-            "status": "healthy",
-            "service": "AutoCare V2",
-            "version": "2.0.0",
-            "environment": settings.ENVIRONMENT,
-            "provider": settings.PROVIDER,
-        }
+        return HealthCheckResponse(
+            status="healthy",
+            service="AutoCare V2",
+            version="2.0.0",
+            environment=settings.ENVIRONMENT,
+            provider=settings.PROVIDER,
+        )
 
     # 5. Inclusão das Rotas de Webhook
     app.include_router(webhook_router)

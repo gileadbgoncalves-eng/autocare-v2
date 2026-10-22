@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: autocare-web
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+      - DATABASE_URL=postgresql+asyncpg://autocare_user:autocare_pass@db:5432/autocare_db
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_PRIMARY_MODEL=${GEMINI_PRIMARY_MODEL:-gemini-3.8-flash}
+      - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemini-flash-latest}
+      - PROVIDER=${PROVIDER:-evolution}
+      - EVOLUTION_BASE_URL=${EVOLUTION_BASE_URL}
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
+      - EVOLUTION_INSTANCE=${EVOLUTION_INSTANCE}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    container_name: autocare-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: autocare_user
+      POSTGRES_PASSWORD: autocare_pass
+      POSTGRES_DB: autocare_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autocare_user -d autocare_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
