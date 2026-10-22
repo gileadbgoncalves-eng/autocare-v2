@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config.settings import settings
 from src.infrastructure.database.session import init_db, close_db
 from src.interfaces.api.webhook import router as webhook_router
+from src.interfaces.routers.veiculos import router as veiculos_router
 from pydantic import BaseModel, Field
 
 # Configuração de Logs
@@ -103,8 +104,9 @@ def create_app() -> FastAPI:
             provider=settings.PROVIDER,
         )
 
-    # 5. Inclusão das Rotas de Webhook
+    # 5. Inclusão das Rotas de Webhook e Veículos
     app.include_router(webhook_router)
+    app.include_router(veiculos_router)
 
     return app
 

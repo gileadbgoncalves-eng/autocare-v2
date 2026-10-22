@@ -95,6 +95,11 @@ async def init_db() -> None:
     """Cria tabelas no banco de dados se não existirem (ideal para bootstrap e migrações iniciais)."""
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        try:
+            from src.models import Base as NewBase
+            await conn.run_sync(NewBase.metadata.create_all)
+        except Exception:
+            pass
 
 
 async def close_db() -> None:
