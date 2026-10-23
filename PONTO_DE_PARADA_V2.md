@@ -1,6 +1,6 @@
 # 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (API REST, PERSISTÊNCIA REAL, MIGRACÕES & BOT INTEGRADO)
 
-**Data do Checkpoint:** 22/10/2026 - 22:50  
+**Data do Checkpoint:** 22/10/2026 - 23:10  
 **Versão:** AutoCare V2.4.0 (QA Refactoring: Temporal/Location Entities, Multi-Intent UX, Garage Checkup & Fuzzy Matching)  
 **Status do Projeto:** 100% Funcional, 4 Falhas Críticas de QA Refatoradas e Homologadas, 17/17 Testes Pytest Aprovados e Suíte Central 6/6 PASS.  
 
@@ -108,7 +108,7 @@ docker compose ps
 # Ativar o ambiente virtual
 .\.venv\Scripts\Activate.ps1
 
-# 1. Nova suíte Pytest com testes assíncronos da API e Bot (10 testes)
+# 1. Nova suíte Pytest com testes assíncronos da API, Bot e QA Fixes (17 testes)
 pytest tests/ -v
 
 # 2. Suíte central de integração do AutoCare V2 (6 camadas)
@@ -125,7 +125,10 @@ python security_chaos_tester.py
 - **Repositório Remoto:** `https://github.com/gileadbgoncalves-eng/autocare-v2.git`
 - **Branch Principal:** `main`
 - **Últimos Commits:**
+  - `68023ab`: `refactor(ai-core): correcao de extracao temporal/oficina, alertas enxutos, multi-intencao, checkup global e fuzzy matching`
+  - `d3b5536`: `feat(api): integracao do bot ao banco real, rotas de proprietarios/manutencoes e ponto de parada v2.3.0`
   - `0e32c98`: `feat(crud): persistencia relacional async, alembic, schemas pydantic v2 e endpoints de veiculos`
   - `9ad3295`: `feat(core): dockerizacao multi-stage, schemas pydantic e correcao de encoding`
   - `dc57d63`: `docs: atualizar PONTO_DE_PARADA_V2.md com validacao profunda, persistencia real e auditoria sql`
-- **Status da Árvore de Trabalho:** Atualizada e homologada.
+- **Status da Árvore de Trabalho:** Atualizada, sincronizada e 100% homologada.
+
