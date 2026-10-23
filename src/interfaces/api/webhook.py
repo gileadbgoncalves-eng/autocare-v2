@@ -155,6 +155,28 @@ def resolve_target_vehicle(
         if f"{make_str} {model_str}" in ref_clean:
             return v.id
 
+    # 4.5 Correspondência por similaridade aproximada (Fuzzy Matching) para modelo/marca
+    import difflib
+    ref_words = ref_clean.split()
+    best_id = None
+    best_score = 0.0
+    for v in vehicles:
+        model_str = (v.model or "").lower()
+        make_str = (v.make or "").lower()
+        targets = [model_str, make_str] + model_str.split() + make_str.split()
+        for rw in ref_words:
+            if len(rw) < 3:
+                continue
+            for target in targets:
+                if not target or len(target) < 3:
+                    continue
+                ratio = difflib.SequenceMatcher(None, rw, target).ratio()
+                if ratio > best_score and ratio >= 0.70:
+                    best_score = ratio
+                    best_id = v.id
+    if best_id is not None:
+        return best_id
+
     # 5. Fallback para o primeiro veículo registrado
     return vehicles[0].id
 
@@ -246,7 +268,7 @@ async def receive_webhook(
     committed_data = result.get("committed_data")
 
     # 4. Se o usuário confirmou uma ação crítica pendente ou acionou o reset do sistema
-    if action_type in ("action_confirmed", "system_reset") and committed_data:
+    if action_type in ("action_confirmed", "system_reset", "action_confirmed_with_chained_reminder") and committed_data:
         try:
             action_state = committed_data.get("_action_state", "")
 
@@ -360,6 +382,29 @@ async def receive_webhook(
                     logger.info(f"Manutenção [{saved_maint.id}] salva para o veículo [{target_vehicle_id}]")
                     if new_maintenance.km:
                         await vehicle_repo.update_km(target_vehicle_id, new_maintenance.km)
+
+            # Caso F: Confirmação Exclusiva de Atualização de Odômetro
+            elif (
+                committed_data.get("_is_odometer_update")
+                or ("odometer_km" in committed_data and "components" not in committed_data and "make" not in committed_data)
+            ):
+                target_vehicle_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
+                km_val = committed_data.get("odometer_km") or committed_data.get("km")
+                if target_vehicle_id and km_val:
+                    await vehicle_repo.update_km(target_vehicle_id, int(km_val))
+                    logger.info(f"Odômetro do veículo [{target_vehicle_id}] atualizado para {km_val} km")
+
+            # Caso G: Lembrete Encadeado (Chained Reminder)
+            if committed_data.get("chained_reminder"):
+                c_rem = committed_data["chained_reminder"]
+                target_vehicle_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
+                new_reminder = Reminder(
+                    user_id=user_id,
+                    vehicle_id=target_vehicle_id,
+                    description=c_rem.get("task_description", "Revisão preventiva"),
+                )
+                await reminder_repo.add_reminder(new_reminder)
+                logger.info(f"Lembrete encadeado salvo para o condutor [{user_id}]")
 
         except Exception as err:
             logger.error(f"Erro ao persistir ação confirmada no banco: {err}", exc_info=True)

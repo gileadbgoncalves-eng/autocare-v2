@@ -79,7 +79,7 @@ async def main():
             reply = result.get("reply")
 
             # 3. Persistência real em caso de ação confirmada OU system_reset
-            if action_type in ("action_confirmed", "system_reset") and committed_data:
+            if action_type in ("action_confirmed", "system_reset", "action_confirmed_with_chained_reminder") and committed_data:
                 try:
                     # Reset de Garagem / Sistema
                     if (
@@ -125,6 +125,29 @@ async def main():
                         )
                         saved = await maintenance_repo.add_record(new_maint)
                         print(f"  💾 [BANCO] Manutenção gravada no banco com ID: {saved.id}")
+
+                    # Atualização Exclusiva de Odômetro
+                    elif "odometer_km" in committed_data or committed_data.get("_is_odometer_update"):
+                        target_id = vehicles[0].id if vehicles else 1
+                        new_km = committed_data.get("odometer_km") or committed_data.get("km")
+                        if new_km:
+                            await vehicle_repo.update_km(target_id, int(new_km))
+                            print(f"  💾 [BANCO] Odômetro atualizado no banco para {new_km} km")
+
+                    # Lembrete Encadeado
+                    if committed_data.get("chained_reminder"):
+                        c_rem = committed_data["chained_reminder"]
+                        target_id = vehicles[0].id if vehicles else 1
+                        from src.domain.entities import Reminder
+                        from src.infrastructure.database.repositories import ReminderRepository
+                        rem_repo = ReminderRepository(session)
+                        new_rem = Reminder(
+                            user_id=test_user_id,
+                            vehicle_id=target_id,
+                            description=c_rem.get("task_description", "Revisão preventiva"),
+                        )
+                        saved_rem = await rem_repo.add_reminder(new_rem)
+                        print(f"  💾 [BANCO] Lembrete encadeado gravado com ID: {saved_rem.id}")
 
                 except Exception as ex:
                     print(f"  ⚠️ [ERRO AO PERSISTIR]: {ex}")

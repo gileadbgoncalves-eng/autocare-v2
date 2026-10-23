@@ -5,7 +5,7 @@ Garante que a resposta da IA venha sempre formatada em JSON previsível e 100% v
 """
 
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.domain.enums import (
     IntentType,
@@ -43,6 +43,84 @@ class MaintenanceDraft(BaseModel):
     workshop_name: Optional[str] = Field(default=None, description="Nome da oficina mecânica")
     parts_brand: Optional[str] = Field(default=None, description="Marca das peças instaladas")
     warranty_months: Optional[int] = Field(default=None, ge=0, description="Meses de garantia")
+
+    @field_validator("workshop_name", mode="before")
+    @classmethod
+    def validate_workshop_name(cls, v: Optional[str]) -> Optional[str]:
+        """Garante que workshop_name seja apenas nome próprio de estabelecimento ou None."""
+        if not v:
+            return None
+        v_clean = str(v).strip()
+        if len(v_clean) < 3:
+            return None
+        v_lower = v_clean.lower()
+        blacklist = {
+            "época", "epoca", "momento", "tempo", "lugar", "rua", "oficina",
+            "concessionária", "concessionaria", "mecânico", "mecanico", "casa",
+            "garagem", "loja", "ontem", "hoje", "mês passado", "mes passado",
+            "ano passado", "semana passada", "auto center", "centro automotivo",
+            "período", "periodo", "na época", "na epoca", "naquele dia", "naquele momento",
+            "ali", "lá", "la", "aqui", "posto", "posto de gasolina", "posto de combustível",
+            "concessionária autorizada", "oficina mecânica"
+        }
+        if v_lower in blacklist or v_lower.startswith("na época") or v_lower.startswith("na epoca"):
+            return None
+        return v_clean
+
+    @field_validator("date_str", mode="before")
+    @classmethod
+    def normalize_date_str(cls, v: Optional[str]) -> Optional[str]:
+        """
+        Prioriza datas absolutas sobre referências relativas e normaliza para DD/MM/YYYY.
+        Ex: 'mês passado, no dia 15 de setembro' -> '15/09/2026'
+        """
+        if not v:
+            return None
+        import re
+        from datetime import datetime
+
+        s = str(v).strip()
+        current_year = datetime.now().year
+
+        months_map = {
+            "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+            "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+            "outubro": 10, "novembro": 11, "dezembro": 12,
+            "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+            "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+        }
+
+        # 1. Busca por padrão textual: (dia )?15 de setembro (de 2026)?
+        textual_match = re.search(
+            r"(?:dia\s+)?(\d{1,2})\s+de\s+([a-zA-ZçÇ]+)(?:\s+de\s+(\d{4}))?",
+            s,
+            re.IGNORECASE,
+        )
+        if textual_match:
+            day = int(textual_match.group(1))
+            month_name = textual_match.group(2).lower()
+            year = int(textual_match.group(3)) if textual_match.group(3) else current_year
+            month = months_map.get(month_name)
+            if month and 1 <= day <= 31:
+                return f"{day:02d}/{month:02d}/{year}"
+
+        # 2. Busca por padrão numérico DD/MM/YYYY ou DD/MM
+        numeric_match = re.search(r"\b(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?\b", s)
+        if numeric_match:
+            day = int(numeric_match.group(1))
+            month = int(numeric_match.group(2))
+            year_grp = numeric_match.group(3)
+            if year_grp:
+                year = int(year_grp)
+                if year < 100:
+                    year += 2000
+            else:
+                year = current_year
+            if 1 <= day <= 31 and 1 <= month <= 12:
+                return f"{day:02d}/{month:02d}/{year}"
+
+        # Se for apenas termo relativo simples sem data absoluta associada
+        return s
 
 
 class ReminderDraft(BaseModel):

@@ -181,6 +181,44 @@ class VehicleRepository:
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
 
+    async def search_by_model_fuzzy(
+        self, user_id: str, query: str, threshold: float = 0.7
+    ) -> List[Vehicle]:
+        """Busca aproximada de veículos por modelo/marca tolerando erros de digitação (ex: sandeiro -> Sandero)."""
+        import difflib
+
+        vehs = await self.get_vehicles_by_user_id(user_id)
+        query_clean = query.strip().lower()
+        query_words = query_clean.split()
+        matched: List[tuple[Vehicle, float]] = []
+
+        for v in vehs:
+            model_lower = (v.model or "").lower()
+            make_lower = (v.make or "").lower()
+            plate_lower = (v.plate or "").lower().replace("-", "")
+
+            if query_clean in model_lower or query_clean in make_lower or query_clean == plate_lower:
+                matched.append((v, 1.0))
+                continue
+
+            highest_score = 0.0
+            targets = [model_lower, make_lower] + model_lower.split() + make_lower.split()
+            for word in query_words:
+                if len(word) < 3:
+                    continue
+                for target in targets:
+                    if len(target) < 3:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, word, target).ratio()
+                    if ratio > highest_score:
+                        highest_score = ratio
+
+            if highest_score >= threshold:
+                matched.append((v, highest_score))
+
+        matched.sort(key=lambda x: x[1], reverse=True)
+        return [item[0] for item in matched]
+
     async def save(self, vehicle: Vehicle) -> Vehicle:
         """Insere ou atualiza os dados cadastrais do veículo."""
         if vehicle.id:

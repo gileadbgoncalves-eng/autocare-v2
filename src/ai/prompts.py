@@ -39,10 +39,13 @@ Seus campos principais são:
 - GREETING_MENU: Saudações iniciais ("Olá", "Bom dia") ou solicitações explícitas de menu e ajuda.
 - UNKNOWN: Mensagens ininteligíveis, fora do escopo automotivo, serviços incompatíveis ou quando regras de negócio forem violadas.
 
-[3. REGRA DE EXTRAÇÃO DE LOCAL/OFICINA NO REGISTRO DE MANUTENÇÃO]
-O campo `workshop_name` DEVE ser preenchido APENAS se o condutor mencionar explicitamente um nome de estabelecimento, oficina, mecânico ou local onde o serviço foi executado (ex: "na Oficina do Luiz", "no Auto Center X", "no mecânico Zé", "na concessionária").
-Se o usuário relatar o serviço mas OMITIR o local onde foi feito (ex: "Troquei as pastilhas", "Fiz troca de óleo por 150 reais"), você DEVE definir o campo `workshop_name` estritamente como `null` ou `None`.
-NUNCA tente adivinhar, inventar ou repetir os componentes revisados (como "Troca de óleo" ou "Pastilhas") dentro do campo da oficina.
+[3. REGRA DE EXTRAÇÃO DE LOCAL/OFICINA E DATAS]
+- Nome da Oficina (workshop_name):
+  O campo `workshop_name` DEVE ser preenchido APENAS se o condutor mencionar explicitamente um NOME PRÓPRIO de estabelecimento, oficina, concessionária ou mecânico (ex: "Oficina do Luiz", "Auto Center Bosch", "Mecânica Daitan", "Porto Seguro").
+  Se o condutor mencionar termos genéricos, circunstanciais, temporais ou advérbios (ex: "na época", "no momento", "na rua", "na oficina", "no mecânico", "em casa", "mês passado", "ano passado"), você DEVE definir o campo `workshop_name` estritamente como `null` ou `None`.
+  NUNCA extraia "época", "lugar", "rua" ou "momento" como nome de oficina!
+- Prioridade Absoluta de Datas (date_str):
+  Se o condutor mencionar uma data absoluta e uma expressão temporal relativa na mesma mensagem (ex: "mês passado, no dia 15 de setembro", "semana passada no dia 10/10"), você DEVE PRIORIZAR A DATA ABSOLUTA e convertê-la rigorosamente para o padrão DD/MM/YYYY (ex: '15/09/2026'). NUNCA preencha o campo com expressões relativas como "mês passado" quando houver dia e mês especificados.
 
 [4. GATILHO DE INCOMPATIBILIDADE MECÂNICA IMPEDIENTE - PRIORIDADE MÁXIMA]
 Se o usuário relatar uma manutenção, serviço ou peça que seja tecnicamente incompatível com o tipo ou modelo de veículo listado em `[VEÍCULOS CADASTRADOS NA GARAGEM DO USUÁRIO]` (exemplos críticos):

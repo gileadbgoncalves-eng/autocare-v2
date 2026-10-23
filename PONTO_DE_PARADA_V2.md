@@ -1,8 +1,8 @@
 # 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (API REST, PERSISTÊNCIA REAL, MIGRACÕES & BOT INTEGRADO)
 
-**Data do Checkpoint:** 22/10/2026 - 18:25  
-**Versão:** AutoCare V2.3.0 (Full Async CRUD, Alembic Migrations, Docker Multi-Stage & Integrated Bot)  
-**Status do Projeto:** 100% Funcional, Blindado contra Adversários, Camada de Persistência Completa, Migrações Alembic Operacionais e Bot Pleno no Banco Relacional.  
+**Data do Checkpoint:** 22/10/2026 - 22:50  
+**Versão:** AutoCare V2.4.0 (QA Refactoring: Temporal/Location Entities, Multi-Intent UX, Garage Checkup & Fuzzy Matching)  
+**Status do Projeto:** 100% Funcional, 4 Falhas Críticas de QA Refatoradas e Homologadas, 17/17 Testes Pytest Aprovados e Suíte Central 6/6 PASS.  
 
 ---
 
@@ -10,10 +10,32 @@
 
 | Suíte de Testes | Abrangência / Escopo | Resultado |
 | :--- | :--- | :---: |
-| **Nova API Pytest (`pytest tests/ -v`)** | Endpoints de Veículos, Proprietários, Manutenções e Validações de Placa | **10/10 PASS (100%) ✅** |
+| **Nova API & QA Pytest (`pytest tests/ -v`)** | Endpoints de Veículos, Proprietários, Manutenções, Regex de Placa e 4 Correções de QA | **17/17 PASS (100%) ✅** |
 | **Suíte de Integração Central (`run_v2_tests.py`)** | 6 Camadas: Domínio, Config, Repositórios, IA, Máquina de Estados, Webhook | **6/6 PASS (100%) ✅** |
 | **Suíte de Caos e Segurança (`security_chaos_tester.py`)** | Isolamento Multi-Tenant, Anti-Rollback de Odômetro, SQLi/XSS, Fallback LLM | **4/4 PASS (100%) ✅** |
 | **Suíte de Validação Profunda (`deep_validation_tester.py`)** | Auditoria SQL direta, Roteamento Multi-Veículos, Persistência e Idempotência | **7/7 PASS (100%) ✅** |
+
+---
+
+## 🛠️ Correções Críticas da Refatoração de QA (V2.4.0)
+
+### 1. Extração de Entidades Temporais e Locais (Problema 1)
+- **Normalização Estrita de `workshop_name`**: Implementado validador em `MaintenanceDraft` com blacklist rigorosa de termos circunstanciais e temporais (`{"época", "lugar", "tempo", "rua", "oficina", "casa", "momento", ...}`). Qualquer palavra genérica que não seja nome próprio de estabelecimento é estritamente convertida para `None`.
+- **Priorização Absoluta de Datas (`DD/MM/YYYY`)**: Adicionada regra e validador Regex que detecta datas absolutas (ex: *"mês passado, no dia 15 de setembro"* ou *"15/09"*) e converte rigorosamente para o padrão `DD/MM/YYYY` (`15/09/2026`), descartando termos relativos quando dia/mês forem explicitados.
+
+### 2. UX Enxuta e Suporte a Multi-Intenção / Chained Actions (Problema 2)
+- **Pré-confirmação Enxuta para KM Excedido**: Quando o condutor informa um odômetro que ultrapassa a revisão preventiva, o bot gera a confirmação limpa e padronizada:
+  `"Entendi a atualização do hodômetro com [X] km. 🔴 ALERTA: Você passou da revisão em [Y] km! Posso confirmar?"`
+- **Supressão de Alertas Redundantes**: Após a confirmação ("Sim"), o salvamento do odômetro é confirmado diretamente sem repetir alertas espalhafatosos.
+- **Tratamento de Intenção Múltipla ("sim, me lembra amanhã às 8h")**: A máquina de estados (`_handle_pending_confirmation_state`) agora processa a confirmação do rascunho anterior E extrai os parâmetros da nova ação secundária (agendamento de lembrete com horário e data alvo), retornando resposta unificada sem menus burocráticos.
+
+### 3. Consulta Global / Visão Geral da Garagem (Problema 3)
+- **Check-up Consolidado da Garagem**: Implementado o roteador e método `_handle_garage_checkup` no `ConversationService` para responder a comandos como *"Tem alguma manutenção atrasada para os meus carros?"*.
+- Itera sobre **todos** os veículos vinculados ao motorista, calcula os marcos de revisão preventiva e lembretes para cada um, e retorna um relatório consolidado com o status de cada carro (`🟢 Em dia` ou `🔴 Revisão atrasada`).
+
+### 4. Fuzzy Matching e Troca Imediata de Contexto (Problema 4)
+- **Busca Aproximada com `difflib.SequenceMatcher`**: Implementado `search_by_model_fuzzy` nos repositórios e `_resolve_vehicle_fuzzy` no `ConversationService` para reconhecer erros de digitação (ex: *"sandeiro"* -> *"Sandero"* com score > 0.85).
+- **Troca Imediata de Contexto**: Sempre que um modelo ou marca for citado na mensagem, o `context.active_vehicle_id` é imediatamente atualizado na memória, evitando miopia de contexto e garantindo que perguntas como *"o sandeiro está em dia?"* sejam respondidas exclusivamente com os dados do Sandero, mesmo que o Civic tenha sido o foco anterior.
 
 ---
 
