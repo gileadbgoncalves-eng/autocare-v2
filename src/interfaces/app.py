@@ -19,6 +19,7 @@ from src.interfaces.routers import (
     proprietarios_router,
     manutencoes_router,
 )
+from src.application.services.notification_service import notification_scheduler
 from pydantic import BaseModel, Field
 
 # Configuração de Logs
@@ -48,9 +49,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Falha ao inicializar banco de dados: {e}", exc_info=True)
 
+    # Inicia o agendador de notificações em segundo plano
+    notification_scheduler.start()
+
     yield
 
     logger.info("🛑 Encerrando AutoCare V2...")
+    await notification_scheduler.stop()
     await close_db()
     logger.info("✅ Conexões do banco liberadas.")
 

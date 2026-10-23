@@ -25,6 +25,7 @@ class UserPreferences(BaseModel):
     notify_maintenance: bool = Field(default=True, description="Alertas preventivos do manual da montadora")
     notify_minor_checks: bool = Field(default=True, description="Lembretes de calibragem de pneus e fluidos")
     quiet_mode: bool = Field(default=False, description="Modo silencioso global (suspende disparos ativos)")
+    horario_notificacao_padrao: dt.time = Field(default=dt.time(9, 0), description="Horário preferido para receber o Check-up Diário")
     updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
 
 
@@ -100,6 +101,7 @@ class Reminder(BaseModel):
     vehicle_id: Optional[int] = Field(default=None, description="Veículo opcionalmente associado")
     description: str = Field(..., description="Conteúdo da tarefa / verificação")
     due_datetime: Optional[dt.datetime] = Field(default=None, description="Data e hora exatas do disparo")
+    data_hora_agendada: Optional[dt.datetime] = Field(default=None, description="Data e hora do agendamento explícito")
     due_km: Optional[int] = Field(default=None, ge=0, description="Disparo por hodômetro atingido")
     recurrence: ReminderRecurrence = Field(default=ReminderRecurrence.ONCE)
     status: ReminderStatus = Field(default=ReminderStatus.PENDING)

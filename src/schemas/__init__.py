@@ -5,6 +5,7 @@ AutoCare V2 - Schemas Pydantic v2
 from src.schemas.proprietario import (
     ProprietarioBase,
     ProprietarioCreate,
+    ProprietarioUpdate,
     ProprietarioResponse,
 )
 from src.schemas.veiculo import (
@@ -18,10 +19,17 @@ from src.schemas.manutencao import (
     ManutencaoCreate,
     ManutencaoResponse,
 )
+from src.schemas.lembrete import (
+    LembreteBase,
+    LembreteCreate,
+    LembreteUpdate,
+    LembreteResponse,
+)
 
 __all__ = [
     "ProprietarioBase",
     "ProprietarioCreate",
+    "ProprietarioUpdate",
     "ProprietarioResponse",
     "VeiculoBase",
     "VeiculoCreate",
@@ -30,4 +38,9 @@ __all__ = [
     "ManutencaoBase",
     "ManutencaoCreate",
     "ManutencaoResponse",
+    "LembreteBase",
+    "LembreteCreate",
+    "LembreteUpdate",
+    "LembreteResponse",
 ]
+

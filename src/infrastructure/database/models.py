@@ -3,7 +3,7 @@ AutoCare V2 - SQLAlchemy 2.0 ORM Models
 Mapeamento declarativo relacional espelhando as entidades de domínio Pydantic.
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, time
 from typing import Optional, List
 from sqlalchemy import (
     String,
@@ -12,6 +12,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Date,
+    Time,
     Text,
     ForeignKey,
     JSON,
@@ -39,6 +40,7 @@ class UserModel(Base):
     notify_maintenance: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_minor_checks: Mapped[bool] = mapped_column(Boolean, default=True)
     quiet_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    horario_notificacao_padrao: Mapped[time] = mapped_column(Time, default=time(9, 0), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # Relacionamentos
@@ -142,6 +144,7 @@ class ReminderModel(Base):
     )
     description: Mapped[str] = mapped_column(Text, nullable=False)
     due_datetime: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    data_hora_agendada: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     due_km: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     recurrence: Mapped[str] = mapped_column(String(30), default=ReminderRecurrence.ONCE.value)
     status: Mapped[str] = mapped_column(String(30), default=ReminderStatus.PENDING.value)

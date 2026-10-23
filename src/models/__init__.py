@@ -6,5 +6,7 @@ from src.database import Base
 from src.models.proprietario import Proprietario
 from src.models.veiculo import Veiculo
 from src.models.manutencao import Manutencao
+from src.models.lembrete import Lembrete
 
-__all__ = ["Base", "Proprietario", "Veiculo", "Manutencao"]
+__all__ = ["Base", "Proprietario", "Veiculo", "Manutencao", "Lembrete"]
+

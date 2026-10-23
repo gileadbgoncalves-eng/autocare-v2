@@ -2,9 +2,9 @@
 AutoCare V2 - Modelo ORM: Proprietário
 """
 
-from datetime import datetime
+from datetime import datetime, time
 from typing import Optional, List, TYPE_CHECKING
-from sqlalchemy import String, Integer, DateTime
+from sqlalchemy import String, Integer, DateTime, Time
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.database import Base
@@ -21,6 +21,9 @@ class Proprietario(Base):
     nome: Mapped[str] = mapped_column(String(100), nullable=False)
     email: Mapped[str] = mapped_column(String(120), unique=True, index=True, nullable=False)
     telefone: Mapped[str] = mapped_column(String(20), nullable=False)
+    horario_notificacao_padrao: Mapped[time] = mapped_column(
+        Time, default=time(9, 0), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relacionamento 1:N com Veículo (carregamento assíncrono otimizado com selectin)

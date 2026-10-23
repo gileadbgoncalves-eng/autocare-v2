@@ -13,6 +13,8 @@ class ManutencaoBase(BaseModel):
     custo: float = Field(default=0.0, ge=0.0, description="Valor total da manutenção")
     data: date = Field(default_factory=date.today, description="Data da realização do serviço")
     odometro_registro: int = Field(..., ge=0, description="Quilometragem registrada no momento da manutenção")
+    data_hora_agendada: Optional[datetime] = Field(default=None, description="Data e hora específicas agendadas")
+    status: str = Field(default="concluido", description="Status da intervenção: pendente, agendado, concluido")
 
 
 class ManutencaoCreate(ManutencaoBase):

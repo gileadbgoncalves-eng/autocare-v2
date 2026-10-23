@@ -25,6 +25,8 @@ class ManutencaoRepository:
             custo=data.custo,
             data=data.data,
             odometro_registro=data.odometro_registro,
+            data_hora_agendada=data.data_hora_agendada,
+            status=data.status,
         )
         self.session.add(manutencao)
         await self.session.commit()

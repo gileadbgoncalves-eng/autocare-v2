@@ -25,6 +25,8 @@ class Manutencao(Base):
     custo: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     data: Mapped[date] = mapped_column(Date, default=date.today, nullable=False)
     odometro_registro: Mapped[int] = mapped_column(Integer, nullable=False)
+    data_hora_agendada: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="concluido", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relacionamento N:1 com Veículo

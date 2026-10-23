@@ -12,6 +12,7 @@ from src.database import Base
 if TYPE_CHECKING:
     from src.models.proprietario import Proprietario
     from src.models.manutencao import Manutencao
+    from src.models.lembrete import Lembrete
 
 
 class Veiculo(Base):
@@ -39,6 +40,14 @@ class Veiculo(Base):
     # Relacionamento 1:N com Manutenções
     manutencoes: Mapped[List["Manutencao"]] = relationship(
         "Manutencao",
+        back_populates="veiculo",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    # Relacionamento 1:N com Lembretes
+    lembretes: Mapped[List["Lembrete"]] = relationship(
+        "Lembrete",
         back_populates="veiculo",
         cascade="all, delete-orphan",
         lazy="selectin",

@@ -5,7 +5,7 @@ Ponto de entrada assíncrono para eventos e mensagens de provedores de WhatsApp
 """
 
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, time
 from typing import Dict, Any, Optional, Tuple, List
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -398,13 +398,47 @@ async def receive_webhook(
             if committed_data.get("chained_reminder"):
                 c_rem = committed_data["chained_reminder"]
                 target_vehicle_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
+
+                # Resolução de data e hora agendada explícita
+                target_dt = None
+                exp_time_str = c_rem.get("explicit_time")
+                tgt_date_str = str(c_rem.get("target_date_str", "")).lower()
+                if exp_time_str:
+                    try:
+                        h, m = [int(p) for p in exp_time_str.split(":")]
+                        day_offset = 1 if "amanh" in tgt_date_str else 0
+                        target_day = date.today() + timedelta(days=day_offset)
+                        target_dt = datetime.combine(target_day, time(h, m))
+                    except Exception:
+                        target_dt = None
+
                 new_reminder = Reminder(
                     user_id=user_id,
                     vehicle_id=target_vehicle_id,
                     description=c_rem.get("task_description", "Revisão preventiva"),
+                    due_datetime=target_dt,
+                    data_hora_agendada=target_dt,
                 )
                 await reminder_repo.add_reminder(new_reminder)
-                logger.info(f"Lembrete encadeado salvo para o condutor [{user_id}]")
+
+                # Espelha na tabela relacional 'lembretes' se houver veículo relacional correspondente
+                if target_vehicle_id:
+                    try:
+                        from src.repositories.lembrete_repository import LembreteRepository
+                        from src.schemas.lembrete import LembreteCreate
+                        lembrete_repo = LembreteRepository(session)
+                        await lembrete_repo.create(
+                            LembreteCreate(
+                                veiculo_id=target_vehicle_id,
+                                descricao=c_rem.get("task_description", "Revisão preventiva"),
+                                data_hora_agendada=target_dt,
+                                status="agendado" if target_dt else "pendente",
+                            )
+                        )
+                    except Exception as e_lem:
+                        logger.warning(f"Não foi possível sincronizar na tabela relacional de lembretes: {e_lem}")
+
+                logger.info(f"Lembrete encadeado salvo para o condutor [{user_id}] agendado para: {target_dt}")
 
         except Exception as err:
             logger.error(f"Erro ao persistir ação confirmada no banco: {err}", exc_info=True)
