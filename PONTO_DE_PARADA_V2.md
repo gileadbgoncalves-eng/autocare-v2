@@ -1,93 +1,153 @@
-# 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (STRESS TEST REFACTORING, NLP & MULTI-VEHICLE)
+# 📍 PONTO DE PARADA TOTAL - AUTOQUER / AUTOCARE V2 (GUARDRAILS, TTL, ESCAPE GLOBAL & MULTI-ACTION)
 
-**Data do Checkpoint:** 23/10/2026 - 09:10  
-**Versão:** AutoCare V2.6.0 (Stress Test Refactoring: Multi-Action/Multi-Vehicle Extraction, Natural NLP Confirmations/Cancellations & Entity Discrepancy Warnings)  
-**Status do Projeto:** 100% Funcional, 25/25 Testes Pytest Aprovados e Suíte Central 6/6 PASS.  
+**Data do Checkpoint:** 23/10/2026 - 16:35  
+**Versão:** Autoquer / AutoCare V2.8.0 (Financial Guardrails R$ 9,90/mês, Draft TTL 30min, BRT UTC-3 Clock, Global Undo Soft-Delete, Mixed Chained Intents & E2E Traffic Simulation)  
+**Status do Projeto:** 100% Funcional, 66/66 Testes Pytest Aprovados e 40/40 Interações de Simulação E2E Aprovadas (100% Pass Rate).  
 
 ---
 
 ## 📊 Matriz Consolidada de Homologação dos Testes
 
-| Suíte de Testes | Abrangência / Escopo | Resultado |
-| :--- | :--- | :---: |
-| **Testes de Estresse & Refatoração (`tests/test_stress_refactor_fixes.py`)** | Múltiplas Ações, Classificador NLP e Conflito Placa vs Modelo | **5/5 PASS (100%) ✅** |
-| **Suíte Completa Pytest (`pytest tests/ -v`)** | 25 Testes: Stress, QA Fixes, Batch Scheduler, APIs CRUD e Bot | **25/25 PASS (100%) ✅** |
-| **Suíte de Integração Central (`run_v2_tests.py`)** | 6 Camadas: Domínio, Config, Repositórios, IA, Máquina de Estados, Webhook | **6/6 PASS (100%) ✅** |
-| **Suíte de Caos e Segurança (`security_chaos_tester.py`)** | Isolamento Multi-Tenant, Anti-Rollback de Odômetro, SQLi/XSS, Fallback LLM | **4/4 PASS (100%) ✅** |
-| **Suíte de Validação Profunda (`deep_validation_tester.py`)** | Auditoria SQL direta, Roteamento Multi-Veículos, Persistência e Idempotência | **7/7 PASS (100%) ✅** |
+| Suíte de Testes | Arquivo / Comando | Abrangência / Escopo | Resultado |
+| :--- | :--- | :--- | :---: |
+| **Guardrails de Escopo e Tokens** | `tests/test_guardrails_and_token_limits.py` | Bloqueio de assuntos fora de escopo (receitas, programação, piadas), limite 250-400 tokens, pruning de 5 turnos | **20/20 PASS (100%) ✅** |
+| **TTL, Fuso UTC-3 e Escape Global** | `tests/test_ttl_and_global_escape.py` | Expiração de rascunho (30 min), injeção temporal BRT no prompt, soft delete (5 min) via webhook | **13/13 PASS (100%) ✅** |
+| **Intenções Mistas Encadeadas** | `tests/test_mixed_chained_intents.py` | Sincronização Pydantic ActionDraft, fluxo de conversação e persistência dupla (Manutenção + Lembrete) | **3/3 PASS (100%) ✅** |
+| **Auto-Enriquecimento no Onboarding** | `tests/test_auto_enrichment_onboarding.py` | Inferência técnica (motor, câmbio, direção) e confirmação proativa sem questionários | **5/5 PASS (100%) ✅** |
+| **Refatoração dos Testes de Estresse** | `tests/test_stress_refactor_fixes.py` | Múltiplas ações, classificador semântico NLP e conflito Placa vs Modelo | **5/5 PASS (100%) ✅** |
+| **Correções Críticas de QA** | `tests/test_qa_refactor_fixes.py` | Extração temporal/local, alertas enxutos, check-up global de garagem e fuzzy matching | **7/7 PASS (100%) ✅** |
+| **Motor de Notificações & Scheduler** | `tests/test_notification_batch_scheduler.py` | Batching de alertas, isolamento FK, bypass de agendamento e horário personalizado | **3/3 PASS (100%) ✅** |
+| **APIs REST de Negócio** | `tests/test_proprietarios_manutencoes_api.py` e `tests/test_veiculos_api.py` | Endpoints FastAPI, validações Pydantic, placas Mercosul/antigas e regras de integridade | **8/8 PASS (100%) ✅** |
+| **Integração Bot-Banco** | `tests/test_bot_integration.py` | Resposta do assistente conectada ao banco SQLite/Postgres com sanitização de placas | **2/2 PASS (100%) ✅** |
+| **Suíte Global Automatizada (Pytest)** | `pytest tests/ -v -k "not simulate_whatsapp_traffic"` | Cobertura total regressiva e preventiva de todas as camadas do sistema | **66/66 PASS (100%) ✅** |
+| **Simulação E2E de Tráfego WhatsApp** | `python tests/simulate_whatsapp_traffic.py` | Jornada de 6 meses de uso simulado (40 turnos sequenciais, 3 veículos, time travel) | **40/40 PASS (100%) ✅** |
 
 ---
 
-## 🛡️ Refatoração dos 3 Problemas do Teste de Estresse (V2.6.0)
+## 🛡️ Principais Funcionalidades e Blindagens Implementadas (V2.8.0)
 
-Durante os testes de estresse, a máquina de estados e o orquestrador foram blindados para 3 cenários complexos:
+### 1. Blindagem Financeira e Guardrails de Custo (Autoquer - R$ 9,90/mês)
+- **Filtro Pré-LLM Custo Zero (`src/ai/guardrails.py`)**:
+  - Interceptor determinístico que detecta perguntas fora do universo automotivo (receitas de bolo, humor, programação, física quântica, redações escolares).
+  - Responde imediatamente sem disparar nenhuma chamada para a API do Gemini, poupando 100% dos tokens de requisições off-topic.
+  - Resposta padrão obrigatória:
+    > *"Desculpe, sou o assistente exclusivo do Autoquer e só consigo ajudar com dúvidas e registros sobre o seu veículo. Como posso ajudar com seu carro hoje?"*
+- **Prompt Mestre Autoquer (`src/ai/prompts.py`)**:
+  - Persona atualizada para **Autoquer** com a *Regra de Bloqueio Absoluto*.
+  - Instrução rigorosa para respostas diretas, concisas e sem prolixidade.
+- **Teto Seguro de Tokens de Saída (`maxOutputTokens`)**:
+  - Configurado em 400 tokens de saída (limitado rigidamente entre 250 e 400 em `src/ai/client.py`).
+  - Modelo econômico de alta velocidade e baixo custo: `gemini-flash-lite-latest`.
+- **Fatiamento Inteligente do Histórico (`prune_history`)**:
+  - Envia no máximo as últimas 5 interações (turnos) para a API.
+  - Evita duplicação da mensagem atual no histórico e trunca turnos longos em 400 caracteres.
 
-### 1. PROBLEMA 1: Eliminação da "Visão de Túnel" (Múltiplas Ações / Múltiplos Veículos)
-- **Cenário de Falha**: O usuário enviava ações para dois veículos na mesma mensagem (ex: *"Fiz revisão no Civic e atualiza o km do Sandero para 45000 km"*). O sistema processava apenas o Civic e descartava o Sandero.
-- **Solução Implementada**:
-  - **Schema Pydantic V2**: Criada a entidade `ActionDraft` e adicionado o campo `actions: List[ActionDraft] = Field(default_factory=list)` no contrato raiz `GeminiAnalysisResponse`.
-  - **Prompt de Sistema**: Adicionada a seção `[13. MÚLTIPLAS AÇÕES E MÚLTIPLOS VEÍCULOS NA MESMA MENSAGEM (MULTI-INTENT & ACTIONS LIST)]` instruindo o LLM a particionar as ações.
-  - **Decomposição Determinística e Heurística**: Desenvolvido `_decompose_multi_action_message(clean_text, vehicles)` que opera em sub-milissegundos particionando orações coordenadas e extraindo veículos e ações de forma atômica.
-  - **Fluxo de Confirmação em Lote**: Implementado `_initiate_multi_action_confirmation_flow(context, actions)` que formula um checklist elegante com tópicos numerados.
-  - **Persistência em Lote no Webhook**: No `webhook.py`, quando `committed_data["_is_multi_action"] == True`, o serviço itera sobre cada ação individual, persistindo registros de manutenção e odômetros de cada carro respectivo sem perda de dados.
+### 2. TTL de Rascunho e Timeout da Máquina de Estados (30 minutos)
+- **Problema Resolvido**: Usuário recebia pedido de confirmação, dormia e respondia *"Sim"* dois dias depois, gravando lembrete relativo com data defasada.
+- **Solução (`src/application/services/conversation.py`)**:
+  - Adicionado controle de `draft_updated_at` com TTL configurável de 30 minutos.
+  - Ao receber confirmação tardia, limpa o estado pendente e responde cordialmente:
+    > *"Aquele seu registro expirou por tempo inativo. Pode me repetir o que você queria salvar?"*
+  - Se o usuário enviar um novo comando em vez de uma resposta solta, o rascunho antigo é descartado e o novo comando é processado normalmente.
 
-### 2. PROBLEMA 2: Validação Rígida Superada com NLP nas Confirmações
-- **Cenário de Falha**: Ao barrar um retrocesso de odômetro (ex: 30.000 km quando o veículo já tinha 45.000 km), o sistema perguntava se fora um erro. Ao responder *"foi um erro"*, o bot não entendia (esperava a string exata `'Não'`) e repetia rigidamente a pergunta.
-- **Solução Implementada**:
-  - **Classificador Semântico `classify_confirmation`**:
-    - Mapeia respostas coloquiais afirmativas (*"pode meter marcha"*, *"isso aí"*, *"manda bala"*, *"com certeza"*, *"positivo"*, *"fechado"*) para `True` (Confirmação imediata).
-    - Mapeia declarações naturais de cancelamento e engano (*"foi um erro"*, *"foi engano"*, *"errei"*, *"me confundi"*, *"cancela"*, *"esquece"*, *"deixa quieto"*) para `False` (Descarte gracioso sem repetições).
-  - **Diferenciação Estrita de Correções**: Mensagens contendo entidades reais de retificação (ex: *"Não, a placa é ABC1234"* ou *"Não, o ano é 2022"*) continuam sendo enviadas ao fluxo de edição de rascunho sem cancelamento indevido.
-  - **Detecção de Retrocesso de Hodômetro**: Integrada verificação preventiva que alerta educadamente se a quilometragem informada for inferior à já gravada no veículo.
+### 3. Injeção de Contexto Temporal e Relógio BRT UTC-3
+- **Problema Resolvido**: Servidor rodando em UTC registrava "amanhã de manhãzinha" dito às 02h da madrugada como o dia errado.
+- **Solução (`src/config/clock.py` e `src/interfaces/api/webhook.py`)**:
+  - Criado módulo central de relógio em UTC-3 (`now_brt()`, `now_brt_naive()`, `build_temporal_context()`).
+  - Todo prompt do Gemini é injetado com o carimbo exato:
+    > `[CONTEXTO TEMPORAL]: Considere que AGORA é 2026-10-23T... (dia-da-semana, DD/MM/YYYY HH:MM, fuso de Brasília UTC-3). Ajuste suas datas relativas com base nisso.`
+  - Resoluções de datas no webhook usam o relógio de Brasília, e não o relógio local do servidor.
 
-### 3. PROBLEMA 3: Resolução de Conflito de Entidades (Placa vs Nome do Carro)
-- **Cenário de Falha**: O usuário informava *"Compass placa RIO2A24"*. O banco de dados sabia que RIO2A24 pertencia a um Sandero, ignorando a palavra "Compass" e lançando os dados no Sandero sem avisar o motorista.
-- **Solução Implementada**:
-  - **Método `_resolve_vehicle(clean_text, vehicles)`**: Identifica a placa sanitizada e compara o modelo do banco de dados com o modelo citado na mensagem.
-  - **Aviso Obrigatório Emitido**: Se houver divergência explícita, o sistema gera o alerta obrigatório:
-    ```text
-    Atenção: A placa RIO2A24 pertence ao seu Sandero, e não a um Compass. Os dados foram lançados no Sandero.
-    ```
-  - **Propagação Transparente**: O aviso é exibido tanto na pré-confirmação quanto anexado à mensagem de sucesso definitiva após confirmação, garantindo total transparência e integridade patrimonial.
+### 4. Comando de Escape Global e Desfazer Pós-Commit (Soft Delete 5 min)
+- **Problema Resolvido**: O usuário confirmava uma gravação no banco e não tinha como corrigir ou cancelar se errou.
+- **Solução (`src/infrastructure/database/repositories.py` e `src/interfaces/api/webhook.py`)**:
+  - Interceptor antes do LLM reconhece: *"desfaz"*, *"cancela o último"*, *"apaga isso que te mandei"*, *"apague o último registro"*.
+  - Executa **Soft Delete** (`status = 'cancelled'`) no último registro inserido pelo usuário nos últimos 5 minutos.
+  - Lotes de intenções mistas (manutenção + lembrete criados juntos) são cancelados em conjunto.
+  - Resposta do assistente:
+    > *"Pronto! O último registro foi apagado. O que quer corrigir?"*
+  - Migração aditiva em `session.py` adiciona a coluna `status` na tabela `maintenance_records` preservando dados existentes.
+
+### 5. Intenções Mistas Encadeadas (Mixed Chained Intents)
+- **Problema Resolvido**: *"Troquei óleo e filtro por 550 reais. Já salva isso e me lembra amanhã às 9h de calibrar o estepe."* O bot salvava a manutenção mas esquecia o lembrete.
+- **Solução**:
+  - `ActionDraft` (`src/ai/schemas.py`) sincronizado com campos de manutenção e lembrete.
+  - Pré-confirmação harmoniosa:
+    > *"Vou registrar a troca de óleo e filtro (R$ 550) E agendar um lembrete para amanhã às 09:00 (Calibrar o estepe). Posso confirmar?"*
+  - O webhook persiste ambas as entidades atomicamente no banco após a confirmação.
+
+### 6. Auto-Enriquecimento no Onboarding de Veículos (Auto-Enrichment)
+- Ao cadastrar modelos com versão e ano (ex: *"Nivus Highline 2024"* ou *"Corolla XEi"*), a base automotiva interna autopreenche:
+  - Motor (ex: `1.0 Turbo` / `2.0 Flex`)
+  - Câmbio (ex: `Automático` / `CVT`)
+  - Direção (ex: `Elétrica`)
+- O bot pula o interrogatório e emite resposta de aprovação proativa com a ficha técnica completa.
+
+### 7. Resolução de Conflitos e NLP Natural
+- **Resolução Placa vs Modelo**: Emite aviso explicativo transparente se o usuário citar um modelo diferente da placa cadastrada.
+- **NLP de Confirmação e Cancelamento**: Compreende coloquialismos (*"pode meter marcha"*, *"manda bala"* -> Confirmação; *"foi um erro"*, *"esquece"* -> Cancelamento gracioso).
+- **Fuzzy Matching**: Corrige grafias aproximadas (*"sandeiro"*, *"covic"*) sem falhar a busca.
 
 ---
 
-## 🔔 Histórico de Refatorações Anteriores (V2.5.0 e V2.4.0)
+## 📂 Arquitetura de Arquivos Principais
 
-1. **Motor de Agregação de Notificações (Batching & Anti-Spam)**: Consolidação de lembretes e alertas em um único boletim matinal por proprietário.
-2. **Isolamento Estrito por Chave Estrangeira (FK)**: Veículos de um condutor nunca misturam alertas entre si.
-3. **Bypass de Agendamento Futuro**: Lembretes agendados para horários específicos (ex: 08:00) são estritamente ignorados pela rotina geral das 05:00.
-4. **Horário Personalizado de Check-up**: Suporte ao campo `horario_notificacao_padrao` por condutor no banco relacional e `NotificationScheduler` assíncrono rodando no `lifespan`.
-5. **Normalização Temporal e Nomes de Oficinas**: Descarte de termos circunstanciais genéricos (`época`, `lugar`) para `workshop_name = None` e priorização de datas absolutas `DD/MM/YYYY`.
-6. **Fuzzy Matching de Veículos**: Tolerância ortográfica (`sandeiro` -> `Sandero`) via `difflib.SequenceMatcher` com troca imediata de contexto.
-
----
-
-## 🚀 Como Executar o Sistema em Produção e Testes
-
-### 1. Executar com Docker Compose
-```bash
-# Subir aplicação e banco PostgreSQL em background
-docker compose up -d --build
-
-# Rodar as migrações do Alembic dentro do container da API
-docker compose exec web alembic upgrade head
-
-# Visualizar status dos containers
-docker compose ps
+```text
+autocare-v2/
+├── PONTO_DE_PARADA_V2.md                 # Este documento de referência e estado consolidado
+├── src/
+│   ├── ai/
+│   │   ├── client.py                     # Cliente Gemini assíncrono com retry, timeout e maxOutputTokens (400)
+│   │   ├── guardrails.py                 # Filtro de escopo custo-zero e poda de histórico (5 turnos)
+│   │   ├── prompts.py                    # Prompt mestre Autoquer, Regra de Bloqueio Absoluto e injeção temporal
+│   │   └── schemas.py                    # Schemas Pydantic V2 (GeminiAnalysisResponse, ActionDraft, etc.)
+│   ├── application/
+│   │   └── services/
+│   │       ├── conversation.py           # Máquina de estados, TTL (30 min), interceptor de undo e NLP
+│   │       └── notification_service.py   # Motor de batching diário e agendamento de alertas
+│   ├── config/
+│   │   ├── clock.py                      # Relógio oficial do Brasil (UTC-3 / BRT)
+│   │   └── settings.py                   # Configurações Pydantic BaseSettings
+│   ├── domain/
+│   │   ├── entities.py                   # Entidades ricas de domínio
+│   │   └── enums.py                      # Enums (ConversationState, RecordStatus, etc.)
+│   ├── infrastructure/
+│   │   └── database/
+│   │       ├── models.py                 # Modelos SQLAlchemy 2.0 (suporte a soft-delete status='cancelled')
+│   │       ├── repositories.py           # Repositórios assíncronos e soft_delete_last_user_record
+│   │       └── session.py                # Conexão aiosqlite/asyncpg e migrações aditivas
+│   └── interfaces/
+│       ├── api/
+│       │   └── webhook.py                # Endpoint WhatsApp, despacho transacional e interceptor de undo
+│       └── app.py                        # Instância FastAPI e lifespan de inicialização
+└── tests/
+    ├── simulate_whatsapp_traffic.py      # Simulação E2E de tráfego real de 6 meses (40 interações)
+    ├── test_guardrails_and_token_limits.py # 20 testes de escopo e limites de tokens
+    ├── test_ttl_and_global_escape.py     # 13 testes de TTL, fuso UTC-3 e undo soft-delete
+    ├── test_mixed_chained_intents.py     # 3 testes de intenções mistas encadeadas
+    ├── test_auto_enrichment_onboarding.py# 5 testes de onboarding e ficha técnica
+    ├── test_stress_refactor_fixes.py     # 5 testes de estresse, NLP e conflito de entidades
+    ├── test_qa_refactor_fixes.py         # 7 testes de QA (datas, oficinas, fuzzy, check-up)
+    ├── test_notification_batch_scheduler.py # 3 testes de notificações e batching
+    ├── test_proprietarios_manutencoes_api.py # 4 testes de API CRUD
+    ├── test_veiculos_api.py              # 4 testes de API de Veículos
+    └── test_bot_integration.py           # 2 testes de integração do Bot com banco real
 ```
 
-### 2. Executar Localmente
-```bash
-# Ativar ambiente virtual
+---
+
+## 🚀 Como Executar Localmente e Validar
+
+```powershell
+# 1. Ativar o ambiente virtual
 .\.venv\Scripts\Activate.ps1
 
-# Executar a suíte de testes completa do Pytest (25 testes)
-pytest -v
+# 2. Executar a suíte completa de testes unitários e de integração (66 testes)
+python -m pytest tests/ -v -k "not simulate_whatsapp_traffic"
 
-# Executar a suíte central de integração (6 camadas)
-python run_v2_tests.py
+# 3. Executar o teste de tráfego e simulação E2E de estresse (40 turnos de conversa real)
+python tests/simulate_whatsapp_traffic.py
 
-# Iniciar servidor FastAPI com Uvicorn
+# 4. Iniciar a API com Uvicorn para recepção de webhooks do WhatsApp
 uvicorn src.interfaces.app:app --host 0.0.0.0 --port 8080 --reload
 ```
