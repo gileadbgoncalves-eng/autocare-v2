@@ -94,13 +94,12 @@ class ConversationService:
 
         # 1. Comando Universal de Escape / Cancelamento
         if text_lower in ("sair", "cancelar", "abortar", "voltar", "menu", "início", "inicio"):
-            if context.is_awaiting_confirmation():
-                context.state = ConversationState.NORMAL
-                context.draft_payload = None
-                self.update_context(context)
-                reply = "✅ Operação cancelada! Seus dados anteriores foram mantidos intactos. Como posso te ajudar agora?"
-                self._record_assistant_turn(context, reply)
-                return {"reply": reply, "action_type": "flow_escaped", "state": context.state.value}
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            self.update_context(context)
+            reply = "✅ Operação cancelada! Seus dados anteriores foram mantidos intactos. Como posso te ajudar agora?"
+            self._record_assistant_turn(context, reply)
+            return {"reply": reply, "action_type": "flow_escaped", "state": context.state.value}
 
         # 1.5 Comando Direto de Zerar/Resetar Sistema (Zero Latência para Testes)
         norm_text = "".join(c for c in unicodedata.normalize("NFKD", text_lower) if not unicodedata.combining(c)).strip()
@@ -152,8 +151,22 @@ class ConversationService:
 
         # 2.5 Fast-Path de Baixa Latência: Agradecimentos e Despedidas Rápidas ("OK", "Valeu")
         clean_no_punct = re.sub(r"[^\w\s]", "", text_lower).strip()
-        courtesies = {"ok", "valeu", "show", "beleza", "obrigado", "obrigada", "combinado", "perfeito", "tks", "show de bola", "valeu obrigado", "obrigado valeu"}
-        if clean_no_punct in courtesies:
+        courtesies = {
+            "ok", "valeu", "show", "beleza", "obrigado", "obrigada",
+            "combinado", "perfeito", "tks", "show de bola",
+            "valeu obrigado", "obrigado valeu", "muito obrigado",
+            "show de bola valeu", "show de bola muito obrigado",
+            "valeu show", "valeu demais", "muito obrigada"
+        }
+        is_courtesy = (
+            clean_no_punct in courtesies
+            or (
+                any(w in clean_no_punct for w in ("show de bola", "muito obrigado", "valeu", "obrigado", "show"))
+                and len(clean_no_punct.split()) <= 5
+                and not any(a in clean_no_punct for a in ("troquei", "fiz", "cadastr", "placa", "km", "reais", "multa", "lembra", "revisão"))
+            )
+        )
+        if is_courtesy:
             context.state = ConversationState.NORMAL
             context.draft_payload = None
             reply = "Show de bola! Qualquer novidade ou manutenção no seu veículo, estou por aqui. Um abraço! 👍"
@@ -221,7 +234,13 @@ class ConversationService:
         km_direct_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b", text_lower)
         odometer_keywords = ("hodometro", "hodômetro", "km", "quilometragem", "odometro", "odômetro", "estou com", "rodou", "bateu")
         maintenance_verbs = ("revisão", "revisao", "troquei", "troca", "óleo", "oleo", "filtro", "vela", "pastilha", "amortecedor")
-        if km_direct_match and any(k in text_lower for k in odometer_keywords) and not any(k in text_lower for k in maintenance_verbs):
+        registration_verbs = ("cadastr", "adicionar", "adiciona", "tenho um", "novo carro", "incluir")
+        if (
+            km_direct_match
+            and any(k in text_lower for k in odometer_keywords)
+            and not any(k in text_lower for k in maintenance_verbs)
+            and not any(k in text_lower for k in registration_verbs)
+        ):
             km_val = int(km_direct_match.group(1))
             if "mil" in text_lower and km_val < 1000:
                 km_val *= 1000
@@ -428,27 +447,28 @@ class ConversationService:
         context.draft_payload = payload
 
         # Alerta enxuto de hodômetro com revisão excedida (Problema 2)
-        km_val = payload.get("odometer_km") or payload.get("current_km") or payload.get("km")
-        if km_val is not None and not payload.get("total_cost"):
-            interval = 10000
-            sched_mark = (int(km_val) // interval) * interval
-            exceeded_km = (int(km_val) - sched_mark) if sched_mark > 0 else 0
-            if exceeded_km > 0:
-                payload["_exceeded_km"] = exceeded_km
-                payload["_scheduled_mark"] = sched_mark
-                payload["_is_odometer_update"] = True
-                confirmation_reply = (
-                    f"Entendi a atualização do hodômetro com {km_val} km. "
-                    f"🔴 ALERTA: Você passou da revisão em {exceeded_km} km! Posso confirmar?"
-                )
-                if discrepancy_warning:
-                    confirmation_reply = f"⚠️ {discrepancy_warning}\n\n" + confirmation_reply
-                return {
-                    "reply": confirmation_reply,
-                    "action_type": "awaiting_confirmation",
-                    "state": context.state.value,
-                    "draft": payload,
-                }
+        if intent == IntentType.UPDATE_ODOMETER or payload.get("_is_odometer_update"):
+            km_val = payload.get("odometer_km") or payload.get("current_km") or payload.get("km")
+            if km_val is not None and not payload.get("total_cost"):
+                interval = 10000
+                sched_mark = (int(km_val) // interval) * interval
+                exceeded_km = (int(km_val) - sched_mark) if sched_mark > 0 else 0
+                if exceeded_km > 0:
+                    payload["_exceeded_km"] = exceeded_km
+                    payload["_scheduled_mark"] = sched_mark
+                    payload["_is_odometer_update"] = True
+                    confirmation_reply = (
+                        f"Entendi a atualização do hodômetro com {km_val} km. "
+                        f"🔴 ALERTA: Você passou da revisão em {exceeded_km} km! Posso confirmar?"
+                    )
+                    if discrepancy_warning:
+                        confirmation_reply = f"⚠️ {discrepancy_warning}\n\n" + confirmation_reply
+                    return {
+                        "reply": confirmation_reply,
+                        "action_type": "awaiting_confirmation",
+                        "state": context.state.value,
+                        "draft": payload,
+                    }
 
         # Formata o pedido de confirmação
         confirmation_reply = (
@@ -537,10 +557,10 @@ class ConversationService:
             context.draft_payload = None
 
             km_saved = draft_data.get("odometer_km") or draft_data.get("km") or draft_data.get("current_km")
-            if km_saved:
+            if km_saved and draft_data.get("_is_odometer_update"):
                 base_msg = f"✅ *Atualização do hodômetro com {km_saved:,} km confirmada e salva!*".replace(",", ".")
             else:
-                base_msg = "✅ *Ação confirmada e registrada com sucesso!*"
+                base_msg = "✅ *Ação confirmada e salva com sucesso!*"
 
             reply = (
                 f"{base_msg}\n\n"
@@ -923,7 +943,15 @@ class ConversationService:
                 })
 
         if len(actions) >= 2:
-            return actions
+            target_refs = [a.get("target_vehicle_ref") for a in actions if a.get("target_vehicle_ref") and a.get("target_vehicle_ref") != "Veículo"]
+            distinct_refs = set(target_refs)
+            if len(distinct_refs) >= 2:
+                return actions
+            action_verbs = ("fiz", "troquei", "atualiza", "atualizar", "mudei", "cadastra", "registra")
+            clauses_with_verbs = [c for c in clauses if any(v in c.lower().split() for v in action_verbs)]
+            if len(clauses_with_verbs) >= 2:
+                return actions
+            return []
         return []
 
     def _resolve_vehicle(
@@ -1074,15 +1102,23 @@ class ConversationService:
         return None
 
     def _resolve_vehicle_fuzzy(
-        self, text: str, vehicles: Optional[List[Any]] = None, threshold: float = 0.70
+        self, text: str, vehicles: Optional[List[Any]] = None, threshold: float = 0.65
     ) -> Optional[Any]:
         """
         Busca aproximada de veículo no texto usando difflib.SequenceMatcher (Fuzzy Matching).
-        Permite tolerar erros de digitação como 'sandeiro' -> 'Sandero'.
+        Permite tolerar erros de digitação como 'sandeiro' -> 'Sandero' ou 'civique' -> 'Civic'.
         """
         if not vehicles:
             return None
         import difflib
+
+        phonetic_aliases = {
+            "civique": "civic",
+            "civi": "civic",
+            "sandeiro": "sandero",
+            "compas": "compass",
+            "conpass": "compass",
+        }
 
         words = re.findall(r"\b[a-zA-Z0-9À-ÿ]+\b", text.lower())
         best_match = None
@@ -1099,9 +1135,10 @@ class ConversationService:
 
             targets = [model, make] + model.split() + make.split()
 
-            for word in words:
-                if len(word) < 3:
+            for raw_word in words:
+                if len(raw_word) < 3:
                     continue
+                word = phonetic_aliases.get(raw_word, raw_word)
                 for target in targets:
                     if not target or len(target) < 3:
                         continue

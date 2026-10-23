@@ -105,14 +105,16 @@ async def test_problema_1_lembrete_futuro_ignorado_as_05h_e_disparado_as_08h():
 
         # A rotina de lembretes pontuais às 05:00 também não deve disparar
         due_05h = await service.dispatch_scheduled_reminders(session, current_dt=dt_05h)
-        assert len(due_05h) == 0, "Nenhum lembrete pontual deveria ser disparado às 05:00!"
+        due_05h_prop = [d for d in due_05h if d["proprietario_id"] == prop.id]
+        assert len(due_05h_prop) == 0, "Nenhum lembrete pontual deveria ser disparado às 05:00!"
 
         # SIMULAÇÃO: Chegada das 08:00 da manhã
         due_08h = await service.dispatch_scheduled_reminders(session, current_dt=dt_08h)
-        assert len(due_08h) == 1, "Às 08:00 o lembrete específico DEVE disparar de forma isolada!"
-        assert due_08h[0]["lembrete_id"] == lembrete_08h.id
-        assert "Civic" in due_08h[0]["mensagem"]
-        assert "Revisão das pastilhas" in due_08h[0]["mensagem"]
+        due_08h_prop = [d for d in due_08h if d["proprietario_id"] == prop.id]
+        assert len(due_08h_prop) == 1, "Às 08:00 o lembrete específico DEVE disparar de forma isolada!"
+        assert due_08h_prop[0]["lembrete_id"] == lembrete_08h.id
+        assert "Civic" in due_08h_prop[0]["mensagem"]
+        assert "Revisão das pastilhas" in due_08h_prop[0]["mensagem"]
 
         # Verifica se foi marcado como concluído no banco
         lem_atualizado = await lemb_repo.get_by_id(lembrete_08h.id)

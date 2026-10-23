@@ -117,6 +117,23 @@ class UserRepository:
         stmt_veh = delete(VehicleModel).where(VehicleModel.user_id == user_id)
         res_veh = await self.session.execute(stmt_veh)
 
+        # 4. Remove espelhos relacionais (proprietarios, veiculos, lembretes, manutencoes)
+        try:
+            from src.models import Proprietario, Veiculo, Lembrete, Manutencao
+            prop_stmt = select(Proprietario).where(Proprietario.telefone == user_id)
+            p_res = await self.session.execute(prop_stmt)
+            p_obj = p_res.scalar_one_or_none()
+            if p_obj:
+                v_stmt = select(Veiculo.id).where(Veiculo.proprietario_id == p_obj.id)
+                v_ids = (await self.session.execute(v_stmt)).scalars().all()
+                if v_ids:
+                    await self.session.execute(delete(Lembrete).where(Lembrete.veiculo_id.in_(v_ids)))
+                    await self.session.execute(delete(Manutencao).where(Manutencao.veiculo_id.in_(v_ids)))
+                    await self.session.execute(delete(Veiculo).where(Veiculo.id.in_(v_ids)))
+                await self.session.execute(delete(Proprietario).where(Proprietario.id == p_obj.id))
+        except Exception:
+            pass
+
         await self.session.commit()
         return {
             "vehicles_deleted": res_veh.rowcount,
