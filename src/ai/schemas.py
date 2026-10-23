@@ -5,7 +5,7 @@ Garante que a resposta da IA venha sempre formatada em JSON previsível e 100% v
 """
 
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.domain.enums import (
     IntentType,
@@ -17,15 +17,38 @@ from src.domain.enums import (
 
 
 class VehicleDraft(BaseModel):
-    """Entidades extraídas para rascunho de cadastro de veículo."""
-    make: Optional[str] = Field(default=None, description="Montadora (ex: Fiat, Honda, Toyota)")
-    model: Optional[str] = Field(default=None, description="Modelo (ex: Palio, CG 160 Titan, Corolla)")
-    year: Optional[int] = Field(default=None, description="Ano de fabricação / modelo (ex: 2018)")
+    """Entidades extraídas para rascunho de cadastro de veículo com suporte a autopreenchimento de ficha técnica."""
+    make: Optional[str] = Field(default=None, description="Montadora (ex: Fiat, Honda, Toyota, Volkswagen)")
+    model: Optional[str] = Field(default=None, description="Modelo (ex: Palio, CG 160 Titan, Corolla, Nivus)")
+    version: Optional[str] = Field(default=None, description="Versão de acabamento ou pacote (ex: Highline, XEI, Comfortline, Premier)")
+    year: Optional[int] = Field(default=None, description="Ano de fabricação / modelo (ex: 2018, 2022)")
     plate: Optional[str] = Field(default=None, description="Placa do veículo (ex: ABC1D23)")
     odometer_km: Optional[int] = Field(default=None, ge=0, description="Quilometragem inicial informada")
-    engine: Optional[str] = Field(default=None, description="Motorização (ex: 1.0, 160cc, 2.0)")
+    engine: Optional[str] = Field(default=None, description="Motorização oficial inferida ou informada (ex: 1.0 Turbo, 2.0 Dynamic Force, 160cc)")
+    transmission: Optional[str] = Field(default=None, description="Câmbio / transmissão oficial inferida ou informada (ex: Automático, Manual, CVT)")
+    steering: Optional[str] = Field(default=None, description="Tipo de direção oficial inferida ou informada (ex: Elétrica, Hidráulica, Mecânica)")
+    cambio: Optional[str] = Field(default=None, description="Alias para transmission (ex: Automático, Manual)")
+    direcao: Optional[str] = Field(default=None, description="Alias para steering (ex: Elétrica, Hidráulica)")
+    motor: Optional[str] = Field(default=None, description="Alias para engine (ex: 1.0 Turbo, 2.0)")
     vehicle_type: Optional[VehicleType] = Field(default=None, description="carro, moto ou caminhonete")
     fuel_type: Optional[FuelType] = Field(default=None, description="flex, gasolina, etanol, diesel, etc.")
+
+    @model_validator(mode="after")
+    def sync_technical_specs(self) -> "VehicleDraft":
+        """Garante sincronização bidirecional entre aliases em português e campos canônicos."""
+        if not self.engine and self.motor:
+            self.engine = self.motor
+        if not self.motor and self.engine:
+            self.motor = self.engine
+        if not self.transmission and self.cambio:
+            self.transmission = self.cambio
+        if not self.cambio and self.transmission:
+            self.cambio = self.transmission
+        if not self.steering and self.direcao:
+            self.steering = self.direcao
+        if not self.direcao and self.steering:
+            self.direcao = self.steering
+        return self
 
 
 class MaintenanceDraft(BaseModel):

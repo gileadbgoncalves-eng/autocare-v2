@@ -10,10 +10,327 @@ import unicodedata
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 
-from src.domain.enums import ConversationState, IntentType
+from src.domain.enums import ConversationState, IntentType, ConfidenceLevel
 from src.domain.entities import ConversationContext, ConversationTurn
 from src.ai.client import GeminiClient
-from src.ai.schemas import GeminiAnalysisResponse, ActionDraft
+from src.ai.schemas import GeminiAnalysisResponse, ActionDraft, VehicleDraft
+
+
+# Base de Conhecimento Automotivo Oficial (Mercado Brasileiro) para Inferência e Autopreenchimento de Ficha Técnica
+POPULAR_VEHICLE_SPECS: Dict[str, Dict[str, Any]] = {
+    # Volkswagen
+    "nivus highline": {
+        "make": "Volkswagen",
+        "model": "Nivus",
+        "version": "Highline",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "nivus comfortline": {
+        "make": "Volkswagen",
+        "model": "Nivus",
+        "version": "Comfortline",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "t-cross highline": {
+        "make": "Volkswagen",
+        "model": "T-Cross",
+        "version": "Highline",
+        "engine": "1.4 TSI",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "t-cross comfortline": {
+        "make": "Volkswagen",
+        "model": "T-Cross",
+        "version": "Comfortline",
+        "engine": "1.0 TSI",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "polo highline": {
+        "make": "Volkswagen",
+        "model": "Polo",
+        "version": "Highline",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "polo comfortline": {
+        "make": "Volkswagen",
+        "model": "Polo",
+        "version": "Comfortline",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "polo track": {
+        "make": "Volkswagen",
+        "model": "Polo",
+        "version": "Track",
+        "engine": "1.0 MPI",
+        "transmission": "Manual",
+        "steering": "Elétrica",
+    },
+
+    # Toyota
+    "corolla xei": {
+        "make": "Toyota",
+        "model": "Corolla",
+        "version": "XEI",
+        "engine": "2.0 Dynamic Force",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "corolla altis": {
+        "make": "Toyota",
+        "model": "Corolla",
+        "version": "Altis",
+        "engine": "2.0 Dynamic Force",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "corolla cross xre": {
+        "make": "Toyota",
+        "model": "Corolla Cross",
+        "version": "XRE",
+        "engine": "2.0 Dynamic Force",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "corolla cross xrv": {
+        "make": "Toyota",
+        "model": "Corolla Cross",
+        "version": "XRV Hybrid",
+        "engine": "1.8 Híbrido",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "yaris xls": {
+        "make": "Toyota",
+        "model": "Yaris",
+        "version": "XLS",
+        "engine": "1.5 16V",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+    "hilux srx": {
+        "make": "Toyota",
+        "model": "Hilux",
+        "version": "SRX",
+        "engine": "2.8 Turbo Diesel",
+        "transmission": "Automático",
+        "steering": "Hidráulica",
+    },
+
+    # Honda
+    "civic touring": {
+        "make": "Honda",
+        "model": "Civic",
+        "version": "Touring",
+        "engine": "1.5 Turbo",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+    "civic exl": {
+        "make": "Honda",
+        "model": "Civic",
+        "version": "EXL",
+        "engine": "2.0 i-VTEC",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+    "hr-v touring": {
+        "make": "Honda",
+        "model": "HR-V",
+        "version": "Touring",
+        "engine": "1.5 Turbo",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+    "hr-v exl": {
+        "make": "Honda",
+        "model": "HR-V",
+        "version": "EXL",
+        "engine": "1.5 i-VTEC",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+
+    # Jeep
+    "compass longitude": {
+        "make": "Jeep",
+        "model": "Compass",
+        "version": "Longitude",
+        "engine": "1.3 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "compass limited": {
+        "make": "Jeep",
+        "model": "Compass",
+        "version": "Limited",
+        "engine": "1.3 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "renegade longitude": {
+        "make": "Jeep",
+        "model": "Renegade",
+        "version": "Longitude",
+        "engine": "1.3 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "renegade sport": {
+        "make": "Jeep",
+        "model": "Renegade",
+        "version": "Sport",
+        "engine": "1.3 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+
+    # Chevrolet
+    "onix premier": {
+        "make": "Chevrolet",
+        "model": "Onix",
+        "version": "Premier",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "onix plus premier": {
+        "make": "Chevrolet",
+        "model": "Onix Plus",
+        "version": "Premier",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "tracker premier": {
+        "make": "Chevrolet",
+        "model": "Tracker",
+        "version": "Premier",
+        "engine": "1.2 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+
+    # Fiat
+    "pulse audace": {
+        "make": "Fiat",
+        "model": "Pulse",
+        "version": "Audace",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "pulse impetus": {
+        "make": "Fiat",
+        "model": "Pulse",
+        "version": "Impetus",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "fastback audace": {
+        "make": "Fiat",
+        "model": "Fastback",
+        "version": "Audace",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "fastback limited": {
+        "make": "Fiat",
+        "model": "Fastback",
+        "version": "Limited Edition",
+        "engine": "1.3 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "strada volcano": {
+        "make": "Fiat",
+        "model": "Strada",
+        "version": "Volcano",
+        "engine": "1.3 Firefly",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+
+    # Hyundai
+    "hb20 platinum": {
+        "make": "Hyundai",
+        "model": "HB20",
+        "version": "Platinum",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "creta ultimate": {
+        "make": "Hyundai",
+        "model": "Creta",
+        "version": "Ultimate",
+        "engine": "2.0",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+    "creta platinum": {
+        "make": "Hyundai",
+        "model": "Creta",
+        "version": "Platinum",
+        "engine": "1.0 Turbo",
+        "transmission": "Automático",
+        "steering": "Elétrica",
+    },
+
+    # Renault
+    "sandero stepway": {
+        "make": "Renault",
+        "model": "Sandero",
+        "version": "Stepway",
+        "engine": "1.6 16V",
+        "transmission": "Manual",
+        "steering": "Eletro-hidráulica",
+    },
+    "duster iconic": {
+        "make": "Renault",
+        "model": "Duster",
+        "version": "Iconic",
+        "engine": "1.3 Turbo",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+
+    # Nissan
+    "kicks exclusive": {
+        "make": "Nissan",
+        "model": "Kicks",
+        "version": "Exclusive",
+        "engine": "1.6",
+        "transmission": "CVT",
+        "steering": "Elétrica",
+    },
+}
+
+
+def find_popular_vehicle_spec(query_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Busca ficha técnica oficial na base de conhecimento automotivo pelo modelo/versão.
+    Combina termos de busca de forma insensível a maiúsculas/minúsculas e pontuação.
+    """
+    if not query_text:
+        return None
+    q = query_text.lower().replace("-", " ")
+    for key, spec in sorted(POPULAR_VEHICLE_SPECS.items(), key=lambda x: len(x[0]), reverse=True):
+        parts = key.split()
+        if all(p in q for p in parts):
+            return spec
+    return None
 
 
 class ConversationService:
@@ -329,6 +646,55 @@ class ConversationService:
             fines=fines,
         )
 
+        # Fallback inteligente para intenção de cadastro de veículo (apenas em falha/indisponibilidade do Gemini)
+        gemini_failed = (
+            not getattr(self.gemini, "is_available", lambda: True)()
+            or analysis.confidence == ConfidenceLevel.LOW
+            or "não está configurada" in (analysis.reply_message or "")
+            or "desculpe, estou processando muitas mensagens" in (analysis.reply_message or "").lower()
+        )
+        has_explicit_error = bool(analysis.extracted_entities and any(k in analysis.extracted_entities for k in ("error", "limit_reached", "invalid_plate")))
+        if analysis.intent == IntentType.UNKNOWN and gemini_failed and not has_explicit_error:
+            registration_verbs = ("cadastr", "adicion", "tenho um", "tenho uma", "comprei um", "comprei uma", "meu carro", "minha moto")
+            matched_spec = find_popular_vehicle_spec(clean_text)
+            if any(rv in text_lower for rv in registration_verbs) or matched_spec:
+                plate_match = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text)
+                plate = plate_match.group(1).replace("-", "").upper() if plate_match else None
+                year_match = re.search(r"\b(19\d{2}|20\d{2})\b", clean_text)
+                year = int(year_match.group(1)) if year_match else None
+                km_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b", text_lower)
+                km = int(km_match.group(1)) if km_match else None
+                if "mil" in text_lower and km and km < 1000:
+                    km *= 1000
+
+                make = matched_spec["make"] if matched_spec else "Veículo"
+                model = matched_spec["model"] if matched_spec else "Carro"
+                version = matched_spec.get("version") if matched_spec else None
+                engine = matched_spec.get("engine") if matched_spec else None
+                transmission = matched_spec.get("transmission") if matched_spec else None
+                steering = matched_spec.get("steering") if matched_spec else None
+
+                vehicle_draft = VehicleDraft(
+                    make=make,
+                    model=model,
+                    version=version,
+                    year=year,
+                    plate=plate,
+                    odometer_km=km,
+                    engine=engine,
+                    transmission=transmission,
+                    steering=steering,
+                )
+                analysis = GeminiAnalysisResponse(
+                    intent=IntentType.REGISTER_VEHICLE,
+                    confidence=ConfidenceLevel.HIGH,
+                    is_critical_action=True,
+                    reply_message=f"Cadastro do veículo {model} identificado.",
+                    vehicle=vehicle_draft,
+                    target_vehicle_ref=model,
+                    extracted_entities=vehicle_draft.model_dump(exclude_none=True),
+                )
+
         # 3.5 Múltiplas Ações Estruturadas retornadas pelo Gemini (Problema 1)
         if analysis.actions and len(analysis.actions) >= 2:
             conf_res = self._initiate_multi_action_confirmation_flow(
@@ -440,6 +806,28 @@ class ConversationService:
             if not payload.get("task_description") and not payload.get("description"):
                 payload["task_description"] = last_user_msg
 
+        elif context.state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM:
+            search_str = f"{payload.get('make', '')} {payload.get('model', '')} {payload.get('version', '')} {combined_text}"
+            matched_spec = find_popular_vehicle_spec(search_str)
+            if matched_spec:
+                if not (payload.get("engine") or payload.get("motor")):
+                    payload["engine"] = matched_spec["engine"]
+                    payload["motor"] = matched_spec["engine"]
+                if not (payload.get("transmission") or payload.get("cambio")):
+                    payload["transmission"] = matched_spec["transmission"]
+                    payload["cambio"] = matched_spec["transmission"]
+                if not (payload.get("steering") or payload.get("direcao")):
+                    payload["steering"] = matched_spec["steering"]
+                    payload["direcao"] = matched_spec["steering"]
+                if not payload.get("version"):
+                    payload["version"] = matched_spec["version"]
+                if not payload.get("make") or payload.get("make") in ("Veículo", "Carro", "Desconhecido"):
+                    payload["make"] = matched_spec["make"]
+                if payload.get("model") in (None, "", "Veículo", "Carro"):
+                    payload["model"] = matched_spec["model"]
+                elif payload.get("model") and matched_spec["model"] and payload.get("model").lower() == f"{matched_spec['model']} {matched_spec['version']}".lower():
+                    payload["model"] = matched_spec["model"]
+
         payload["_action_state"] = context.state.value
         payload["_target_vehicle_ref"] = analysis.target_vehicle_ref
         if discrepancy_warning:
@@ -469,6 +857,43 @@ class ConversationService:
                         "state": context.state.value,
                         "draft": payload,
                     }
+
+        # Confirmação Inteligente e Proativa de Ficha Técnica Veicular (Sem Interrogatório Burocrático)
+        if context.state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM:
+            engine_val = payload.get("engine") or payload.get("motor")
+            transmission_val = payload.get("transmission") or payload.get("cambio")
+            steering_val = payload.get("steering") or payload.get("direcao")
+
+            # Se o veículo possui ficha técnica preenchida ou inferida de primeira
+            if engine_val and (transmission_val or steering_val):
+                model_name = payload.get("model") or "Veículo"
+                version_name = payload.get("version") or ""
+                if version_name and version_name.lower() not in model_name.lower():
+                    full_model = f"{model_name} {version_name}".strip()
+                else:
+                    full_model = model_name.strip()
+
+                specs_parts = []
+                if engine_val:
+                    eng_str = engine_val if engine_val.lower().startswith("motor") else f"Motor {engine_val}"
+                    specs_parts.append(eng_str)
+                if transmission_val:
+                    specs_parts.append(transmission_val)
+                if steering_val:
+                    st_str = steering_val if (steering_val.lower().startswith("direção") or steering_val.lower().startswith("direcao")) else f"Direção {steering_val}"
+                    specs_parts.append(st_str)
+
+                specs_str = ", ".join(specs_parts)
+                confirmation_reply = f"Excelente escolha! Já puxei a ficha técnica do seu {full_model} ({specs_str}). Posso salvar na garagem?"
+                if discrepancy_warning:
+                    confirmation_reply = f"⚠️ {discrepancy_warning}\n\n" + confirmation_reply
+
+                return {
+                    "reply": confirmation_reply,
+                    "action_type": "awaiting_confirmation",
+                    "state": context.state.value,
+                    "draft": payload,
+                }
 
         # Formata o pedido de confirmação
         confirmation_reply = (
