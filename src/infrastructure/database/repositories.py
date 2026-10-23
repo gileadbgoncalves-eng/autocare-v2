@@ -5,7 +5,7 @@ fazendo a ponte bidirecional entre os modelos ORM e as entidades puras Pydantic.
 """
 
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import select, delete, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,7 @@ from src.domain.enums import (
     UsageProfile,
     ReminderRecurrence,
     ReminderStatus,
+    RecordStatus,
     FineStatus,
 )
 from .models import (
@@ -331,6 +332,7 @@ class MaintenanceRepository:
             parts_brand=model.parts_brand,
             warranty_months=model.warranty_months,
             invoice_photo_url=model.invoice_photo_url,
+            status=model.status or RecordStatus.ACTIVE.value,
             created_at=model.created_at,
         )
 
@@ -357,6 +359,7 @@ class MaintenanceRepository:
             parts_brand=record.parts_brand,
             warranty_months=record.warranty_months,
             invoice_photo_url=record.invoice_photo_url,
+            status=record.status or RecordStatus.ACTIVE.value,
             created_at=record.created_at,
         )
         self.session.add(new_model)
@@ -381,7 +384,7 @@ class MaintenanceRepository:
         """Retorna histórico cronológico decrescente de manutenções de um veículo."""
         stmt = (
             select(MaintenanceRecordModel)
-            .where(MaintenanceRecordModel.vehicle_id == vehicle_id)
+            .where(MaintenanceRecordModel.vehicle_id == vehicle_id, MaintenanceRecordModel.status != RecordStatus.CANCELLED.value)
             .order_by(desc(MaintenanceRecordModel.date), desc(MaintenanceRecordModel.id))
             .limit(limit)
         )
@@ -393,7 +396,7 @@ class MaintenanceRepository:
         """Obtém a manutenção mais recente registrada para o veículo."""
         stmt = (
             select(MaintenanceRecordModel)
-            .where(MaintenanceRecordModel.vehicle_id == vehicle_id)
+            .where(MaintenanceRecordModel.vehicle_id == vehicle_id, MaintenanceRecordModel.status != RecordStatus.CANCELLED.value)
             .order_by(desc(MaintenanceRecordModel.date), desc(MaintenanceRecordModel.id))
             .limit(1)
         )
@@ -404,7 +407,7 @@ class MaintenanceRepository:
     async def get_total_cost_by_vehicle_id(self, vehicle_id: int) -> float:
         """Calcula o valor total acumulado investido em manutenções do veículo."""
         stmt = select(func.sum(MaintenanceRecordModel.total_cost)).where(
-            MaintenanceRecordModel.vehicle_id == vehicle_id
+            MaintenanceRecordModel.vehicle_id == vehicle_id, MaintenanceRecordModel.status != RecordStatus.CANCELLED.value
         )
         result = await self.session.execute(stmt)
         total = result.scalar()
@@ -414,7 +417,7 @@ class MaintenanceRepository:
         """Retorna histórico cronológico de todas as manutenções dos veículos do usuário."""
         stmt = (
             select(MaintenanceRecordModel)
-            .where(MaintenanceRecordModel.user_id == user_id)
+            .where(MaintenanceRecordModel.user_id == user_id, MaintenanceRecordModel.status != RecordStatus.CANCELLED.value)
             .order_by(desc(MaintenanceRecordModel.date), desc(MaintenanceRecordModel.id))
             .limit(limit)
         )
@@ -472,7 +475,7 @@ class ReminderRepository:
     async def get_by_user_id(self, user_id: str) -> List[Reminder]:
         stmt = (
             select(ReminderModel)
-            .where(ReminderModel.user_id == user_id)
+            .where(ReminderModel.user_id == user_id, ReminderModel.status != ReminderStatus.CANCELLED.value)
             .order_by(desc(ReminderModel.created_at))
         )
         result = await self.session.execute(stmt)
@@ -483,7 +486,7 @@ class ReminderRepository:
         """Retorna todos os lembretes associados ao veículo."""
         stmt = (
             select(ReminderModel)
-            .where(ReminderModel.vehicle_id == vehicle_id)
+            .where(ReminderModel.vehicle_id == vehicle_id, ReminderModel.status != ReminderStatus.CANCELLED.value)
             .order_by(desc(ReminderModel.created_at))
         )
         result = await self.session.execute(stmt)
@@ -501,6 +504,69 @@ class ReminderRepository:
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount > 0
+
+
+UNDO_WINDOW_MINUTES = 5
+UNDO_BATCH_TOLERANCE_SECONDS = 10
+
+
+async def soft_delete_last_user_record(
+    session: AsyncSession,
+    user_id: str,
+    window_minutes: int = UNDO_WINDOW_MINUTES,
+    now: Optional[datetime] = None,
+) -> dict:
+    """
+    Escape global pós-commit: cancela (soft delete, status='cancelled') o último registro
+    inserido pelo usuário (manutenção ou lembrete) dentro da janela de `window_minutes`.
+
+    Registros criados no mesmo lote de confirmação (tolerância de alguns segundos em relação
+    ao mais recente, ex.: manutenção + lembrete encadeado) são cancelados juntos, para que o
+    desfazer não deixe metade de uma intenção mista persistida.
+    Os timestamps `created_at` são gravados em UTC, por isso `now` também é UTC.
+    """
+    ref_now = now or datetime.utcnow()
+    cutoff = ref_now - timedelta(minutes=window_minutes)
+
+    m_stmt = (
+        select(MaintenanceRecordModel)
+        .where(
+            MaintenanceRecordModel.user_id == user_id,
+            MaintenanceRecordModel.status != RecordStatus.CANCELLED.value,
+            MaintenanceRecordModel.created_at >= cutoff,
+        )
+        .order_by(desc(MaintenanceRecordModel.created_at), desc(MaintenanceRecordModel.id))
+    )
+    r_stmt = (
+        select(ReminderModel)
+        .where(
+            ReminderModel.user_id == user_id,
+            ReminderModel.status == ReminderStatus.PENDING.value,
+            ReminderModel.created_at >= cutoff,
+        )
+        .order_by(desc(ReminderModel.created_at), desc(ReminderModel.id))
+    )
+    maints = list((await session.execute(m_stmt)).scalars().all())
+    rems = list((await session.execute(r_stmt)).scalars().all())
+
+    result = {"maintenance_ids": [], "reminder_ids": []}
+    all_ts = [m.created_at for m in maints] + [r.created_at for r in rems]
+    if not all_ts:
+        return result
+
+    anchor = max(all_ts)
+    batch_floor = anchor - timedelta(seconds=UNDO_BATCH_TOLERANCE_SECONDS)
+    for m in maints:
+        if m.created_at >= batch_floor:
+            m.status = RecordStatus.CANCELLED.value
+            result["maintenance_ids"].append(m.id)
+    for r in rems:
+        if r.created_at >= batch_floor:
+            r.status = ReminderStatus.CANCELLED.value
+            result["reminder_ids"].append(r.id)
+
+    await session.commit()
+    return result
 
 
 class TrafficFineRepository:

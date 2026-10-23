@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.settings import settings
+from src.config.clock import now_brt_naive
 from src.infrastructure.database.session import get_async_session
 from src.infrastructure.database.repositories import (
     UserRepository,
@@ -18,8 +19,13 @@ from src.infrastructure.database.repositories import (
     MaintenanceRepository,
     ReminderRepository,
     TrafficFineRepository,
+    soft_delete_last_user_record,
 )
-from src.application.services.conversation import ConversationService
+from src.application.services.conversation import (
+    ConversationService,
+    UNDO_SUCCESS_REPLY,
+    UNDO_NOTHING_REPLY,
+)
 from src.domain.entities import Vehicle, MaintenanceRecord, Reminder, TrafficFine
 from src.domain.enums import VehicleType, FuelType, UsageProfile
 
@@ -333,7 +339,7 @@ async def receive_webhook(
                                         minute = int(tm_match.group(2))
                                     elif tm_match.group(3):
                                         hour = int(tm_match.group(3))
-                            now = datetime.now()
+                            now = now_brt_naive()  # relógio do usuário (UTC-3), não do servidor
                             base_d = now.date()
                             if "amanh" in target_date:
                                 base_d = base_d + timedelta(days=1)
@@ -487,7 +493,7 @@ async def receive_webhook(
                     try:
                         h, m = [int(p) for p in exp_time_str.split(":")]
                         day_offset = 1 if "amanh" in tgt_date_str else 0
-                        target_day = date.today() + timedelta(days=day_offset)
+                        target_day = now_brt_naive().date() + timedelta(days=day_offset)
                         target_dt = datetime.combine(target_day, time(h, m))
                     except Exception:
                         target_dt = None
@@ -534,6 +540,21 @@ async def receive_webhook(
                 logger.info(f"Odômetro do veículo [{target_vehicle_id}] atualizado para {new_km} km")
         except Exception as err:
             logger.error(f"Erro ao atualizar odômetro: {err}", exc_info=True)
+
+    # 5.5 Escape Global: soft delete (status='cancelled') do último registro dos últimos 5 minutos
+    elif action_type == "undo_last_record":
+        try:
+            cancelled = await soft_delete_last_user_record(session, user_id)
+            total = len(cancelled["maintenance_ids"]) + len(cancelled["reminder_ids"])
+            if total:
+                logger.info(f"Desfazer [{user_id}]: cancelados {cancelled}")
+                result["reply"] = UNDO_SUCCESS_REPLY
+            else:
+                result["reply"] = UNDO_NOTHING_REPLY
+        except Exception as err:
+            logger.error(f"Erro ao desfazer último registro: {err}", exc_info=True)
+            result["reply"] = "Não consegui apagar o último registro agora. Pode tentar de novo em instantes?"
+        conversation_service.replace_last_assistant_turn(user_id, result["reply"])
 
     # 6. Disparo outbound transparente via WhatsApp Gateway
     reply_text = result.get("reply")

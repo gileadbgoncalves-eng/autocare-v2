@@ -26,6 +26,7 @@ from src.domain.enums import (
     UsageProfile,
     ReminderRecurrence,
     ReminderStatus,
+    RecordStatus,
     FineStatus,
 )
 
@@ -125,6 +126,7 @@ class MaintenanceRecordModel(Base):
     parts_brand: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     warranty_months: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     invoice_photo_url: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default=RecordStatus.ACTIVE.value, server_default=RecordStatus.ACTIVE.value, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # Relacionamentos

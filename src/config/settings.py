@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     GEMINI_FALLBACK_MODEL: str = Field(default="gemini-3.5-flash-lite", description="Modelo alternativo para contingência de timeout")
     GEMINI_TIMEOUT_SECONDS: float = Field(default=15.0, description="Timeout estrito para requisições de IA")
     GEMINI_MAX_RETRIES: int = Field(default=3, description="Tentativas com backoff exponencial em 429/5xx")
+    GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=400, description="Teto de tokens de saída por chamada (guardrail de custo: 250-400)")
+    GEMINI_HISTORY_MAX_TURNS: int = Field(default=5, description="Quantidade máxima de turnos do histórico enviados à API")
 
     # 3. Banco de Dados Relacional (SQLAlchemy 2.0 Async)
     DATABASE_URL: str = Field(

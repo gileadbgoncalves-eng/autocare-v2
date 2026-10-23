@@ -95,11 +95,27 @@ async def init_db() -> None:
     """Cria tabelas no banco de dados se não existirem (ideal para bootstrap e migrações iniciais)."""
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_soft_delete_columns)
         try:
             from src.models import Base as NewBase
             await conn.run_sync(NewBase.metadata.create_all)
         except Exception:
             pass
+
+
+def _ensure_soft_delete_columns(sync_conn) -> None:
+    """Migração aditiva: adiciona `maintenance_records.status` em bancos pré-existentes."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(sync_conn)
+    if "maintenance_records" not in inspector.get_table_names():
+        return
+    columns = {c["name"] for c in inspector.get_columns("maintenance_records")}
+    if "status" not in columns:
+        sync_conn.execute(
+            text("ALTER TABLE maintenance_records ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'active'")
+        )
+
 
 
 async def close_db() -> None:

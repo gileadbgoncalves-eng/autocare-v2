@@ -8,7 +8,7 @@ import re
 import asyncio
 import unicodedata
 from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.domain.enums import ConversationState, IntentType, ConfidenceLevel
 from src.domain.entities import ConversationContext, ConversationTurn
@@ -333,14 +333,72 @@ def find_popular_vehicle_spec(query_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+DRAFT_TTL_MINUTES = 30
+
+DRAFT_EXPIRED_REPLY = (
+    "Aquele seu registro expirou por tempo inativo. "
+    "Pode me repetir o que você queria salvar?"
+)
+UNDO_SUCCESS_REPLY = "Pronto! O último registro foi apagado. O que quer corrigir?"
+UNDO_NOTHING_REPLY = (
+    "Não encontrei nenhum registro seu dos últimos 5 minutos para apagar. "
+    "Se quiser corrigir algo mais antigo, me diga o que precisa mudar."
+)
+# Mantém a mesma frase do cancelamento natural de rascunho (consistência de tom de voz)
+UNDO_DRAFT_DISCARDED_REPLY = (
+    "Tranquilo, cancelei a operação! Nada foi alterado no seu veículo. Como posso te ajudar agora?"
+)
+
+# Comandos de escape global pós-commit ("desfaz", "cancela o último", "apaga isso que te mandei").
+# Ancorados para não capturar frases como "cancela o lembrete de amanhã".
+_UNDO_PATTERNS = (
+    re.compile(r"^(?:por favor\s+)?(?:desfaz|desfazer|desfaca|desfazendo)(?:\s+(?:isso|tudo|o ultimo|a ultima))?$"),
+    re.compile(r"^(?:por favor\s+)?(?:volta|voltar)\s+atras(?:\s+(?:isso|disso))?$"),
+    re.compile(r"^(?:por favor\s+)?(?:cancela|cancele|cancelar|apaga|apague|apagar|remove|remova|exclui|exclua|deleta|delete)\s+(?:o\s+|a\s+)?(?:ultimo|ultima)(?:\s+(?:registro|lancamento|coisa|que (?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei)))?$"),
+    re.compile(r"^(?:por favor\s+)?(?:cancela|cancele|apaga|apague|desfaz|remove|exclui|deleta)\s+isso(?:\s+(?:que|q)\s+(?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei))?$"),
+    re.compile(r"^(?:por favor\s+)?(?:apaga|apague|cancela|desfaz)\s+(?:o\s+)?(?:que|q)\s+(?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei)$"),
+)
+
+# Respostas "soltas" típicas de quem está respondendo a um pedido de confirmação.
+_BARE_REPLY_RE = re.compile(
+    r"\b(sim|nao|n|s|ok|okay|isso|certo|correto|confirmo|confirma|confirmado|cancela|cancelar|esquece|"
+    r"pode|bora|beleza|claro|manda|mande|fechado|fecho|positivo|salva|salvar|registra|registrar|errado|errei)\b"
+)
+
+
+def normalize_text(text: str) -> str:
+    """Minúsculas, sem acentos e sem pontuação final, para casar comandos de escape."""
+    base = "".join(
+        c for c in unicodedata.normalize("NFKD", (text or "").lower()) if not unicodedata.combining(c)
+    )
+    return re.sub(r"[\s\.!,;:?]+$", "", base).strip()
+
+
+def is_undo_command(text: str) -> bool:
+    """Detecta pedidos de desfazer o último registro salvo."""
+    norm = normalize_text(text)
+    return bool(norm) and any(p.match(norm) for p in _UNDO_PATTERNS)
+
+
+def looks_like_confirmation_reply(text: str) -> bool:
+    """True para respostas curtas de aprovação/recusa (candidatas a responder um rascunho vencido)."""
+    norm = normalize_text(text)
+    return bool(norm) and len(norm.split()) <= 6 and bool(_BARE_REPLY_RE.search(norm))
+
+
 class ConversationService:
     """
     Serviço de aplicação responsável por orquestrar a interação do usuário.
     Garante que ações críticas nunca sejam persistidas sem aprovação explícita.
     """
 
-    def __init__(self, gemini_client: Optional[GeminiClient] = None):
+    def __init__(
+        self,
+        gemini_client: Optional[GeminiClient] = None,
+        draft_ttl_minutes: int = DRAFT_TTL_MINUTES,
+    ):
         self.gemini = gemini_client or GeminiClient()
+        self.draft_ttl = timedelta(minutes=draft_ttl_minutes)
         # Repositório de contexto em memória com persistência por sessão de usuário
         self._contexts: Dict[str, ConversationContext] = {}
         self._user_locks: Dict[str, asyncio.Lock] = {}
@@ -358,8 +416,32 @@ class ConversationService:
 
     def update_context(self, context: ConversationContext):
         """Atualiza o contexto do usuário na memória de aplicação."""
-        context.updated_at = datetime.utcnow()
+        now = self._utcnow()
+        context.updated_at = now
+        # TTL do rascunho conta a partir da última interação que o manteve vivo
+        context.draft_updated_at = now if context.draft_payload is not None else None
         self._contexts[context.user_id] = context
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        """Relógio interno (UTC) — isolado em um método para facilitar testes de expiração."""
+        return datetime.utcnow()
+
+    def _is_draft_expired(self, context: ConversationContext) -> bool:
+        """True se há rascunho aguardando confirmação inativo há mais que o TTL."""
+        if not context.is_awaiting_confirmation():
+            return False
+        last_activity = context.draft_updated_at or context.updated_at
+        return (self._utcnow() - last_activity) > self.draft_ttl
+
+    def replace_last_assistant_turn(self, user_id: str, reply_text: str) -> None:
+        """Substitui a última resposta do assistente no histórico (ex.: resultado real do desfazer)."""
+        context = self._contexts.get(user_id)
+        if context:
+            for turn in reversed(context.recent_turns):
+                if turn.role == "assistant":
+                    turn.content = reply_text
+                    break
 
     def clear_context(self, user_id: str):
         """Limpa o contexto em memória do usuário."""
@@ -417,6 +499,35 @@ class ConversationService:
             reply = "✅ Operação cancelada! Seus dados anteriores foram mantidos intactos. Como posso te ajudar agora?"
             self._record_assistant_turn(context, reply)
             return {"reply": reply, "action_type": "flow_escaped", "state": context.state.value}
+
+        # 1.2 Escape Global Pós-Commit (interceptor ANTES de qualquer extração Pydantic/LLM)
+        if is_undo_command(clean_text):
+            if context.is_awaiting_confirmation():
+                # Nada foi persistido ainda: desfazer = descartar o rascunho pendente.
+                context.state = ConversationState.NORMAL
+                context.draft_payload = None
+                self.update_context(context)
+                reply = UNDO_DRAFT_DISCARDED_REPLY
+                self._record_assistant_turn(context, reply)
+                return {"reply": reply, "action_type": "action_cancelled", "state": context.state.value, "details": {}}
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            self.update_context(context)
+            reply = UNDO_SUCCESS_REPLY
+            self._record_assistant_turn(context, reply)
+            # O soft delete em si é executado pelo webhook (camada com acesso à sessão do banco).
+            return {"reply": reply, "action_type": "undo_last_record", "state": context.state.value, "details": {}}
+
+        # 1.3 TTL do Rascunho: um "sim" tardio nunca pode gravar dados defasados
+        if self._is_draft_expired(context):
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            if looks_like_confirmation_reply(clean_text):
+                self.update_context(context)
+                reply = DRAFT_EXPIRED_REPLY
+                self._record_assistant_turn(context, reply)
+                return {"reply": reply, "action_type": "draft_expired", "state": context.state.value, "details": {}}
+            # Mensagem nova e independente: descarta o rascunho vencido e processa normalmente.
 
         # 1.5 Comando Direto de Zerar/Resetar Sistema (Zero Latência para Testes)
         norm_text = "".join(c for c in unicodedata.normalize("NFKD", text_lower) if not unicodedata.combining(c)).strip()

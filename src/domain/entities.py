@@ -15,6 +15,7 @@ from .enums import (
     UsageProfile,
     ReminderRecurrence,
     ReminderStatus,
+    RecordStatus,
     FineStatus,
 )
 
@@ -87,6 +88,7 @@ class MaintenanceRecord(BaseModel):
     parts_brand: Optional[str] = Field(default=None, description="Marca dos componentes utilizados")
     warranty_months: Optional[int] = Field(default=None, ge=0, description="Tempo de garantia em meses")
     invoice_photo_url: Optional[str] = Field(default=None, description="Foto da nota fiscal ou recibo")
+    status: str = Field(default=RecordStatus.ACTIVE.value, description="active | cancelled (soft delete)")
     created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
 
     @property
@@ -142,6 +144,7 @@ class ConversationContext(BaseModel):
     draft_payload: Optional[Dict[str, Any]] = Field(default=None, description="Dados temporários aguardando confirmação do usuário")
     recent_turns: List[ConversationTurn] = Field(default_factory=list, description="Últimos turnos de diálogo para injeção de contexto no Gemini")
     updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    draft_updated_at: Optional[dt.datetime] = Field(default=None, description="Última atividade do rascunho pendente (base do TTL, UTC)")
 
     def is_awaiting_confirmation(self) -> bool:
         """Verifica se o usuário está em um estado que aguarda resposta afirmativa/negativa explícita."""

@@ -92,6 +92,12 @@ class ReminderStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class RecordStatus(str, Enum):
+    """Ciclo de vida de registros persistidos (soft delete via cancelamento)."""
+    ACTIVE = "active"
+    CANCELLED = "cancelled"
+
+
 class FineStatus(str, Enum):
     """Situação de uma autuação / infração de trânsito."""
     NOTIFICADA = "notificada"

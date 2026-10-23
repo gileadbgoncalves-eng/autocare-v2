@@ -15,6 +15,11 @@ from src.config.settings import settings
 from src.domain.enums import IntentType, ConfidenceLevel
 from src.ai.schemas import GeminiAnalysisResponse
 from src.ai.prompts import SYSTEM_INSTRUCTION, build_analysis_prompt
+from src.ai.guardrails import OUT_OF_SCOPE_REPLY, is_out_of_scope, prune_history
+
+# Limites do guardrail de custo para tokens de saída
+MIN_OUTPUT_TOKENS = 250
+MAX_OUTPUT_TOKENS = 400
 
 try:
     import httpx
@@ -47,6 +52,9 @@ class GeminiClient:
         self.fallback_model = fallback_model or settings.GEMINI_FALLBACK_MODEL
         self.timeout = timeout_seconds or settings.GEMINI_TIMEOUT_SECONDS
         self.max_retries = max_retries or settings.GEMINI_MAX_RETRIES
+        # Sempre dentro da faixa segura 250-400, mesmo que a configuração externa fuja dela
+        self.max_output_tokens = max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS, settings.GEMINI_MAX_OUTPUT_TOKENS))
+        self.history_max_turns = settings.GEMINI_HISTORY_MAX_TURNS
 
     def is_available(self) -> bool:
         """Verifica se a chave de API está configurada."""
@@ -67,8 +75,15 @@ class GeminiClient:
         Analisa a mensagem do usuário com contexto conversacional e Structured Output.
         Garante retorno de instância válida de GeminiAnalysisResponse mesmo sob falhas de rede.
         """
+        # Guardrail 1: assunto fora do universo automotivo é barrado ANTES de qualquer custo de API
+        if is_out_of_scope(current_message):
+            return self._build_out_of_scope_response()
+
         if not self.is_available():
             return self._build_offline_fallback(current_message)
+
+        # Guardrail 2: somente as últimas N interações do histórico seguem para a API
+        history = prune_history(history, max_turns=self.history_max_turns, current_message=current_message)
 
         # Montagem do prompt com injeção do histórico de diálogo
         prompt = self._format_prompt(current_message, history, context, vehicles, maintenances, reminders, fines)
@@ -139,6 +154,23 @@ class GeminiClient:
 
         return resolve(schema)
 
+    def _build_payload(self, prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Monta o corpo da requisição, incluindo o teto de tokens de saída (guardrail de custo)."""
+        return {
+            "system_instruction": {
+                "parts": [{"text": SYSTEM_INSTRUCTION}]
+            },
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": self.max_output_tokens,
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+            }
+        }
+
     async def _call_gemini_with_retry(
         self,
         model: str,
@@ -153,19 +185,7 @@ class GeminiClient:
             "Content-Type": "application/json",
             "x-goog-api-key": self.api_key,
         }
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": SYSTEM_INSTRUCTION}]
-            },
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "temperature": 0.1,
-                "response_mime_type": "application/json",
-                "response_schema": schema,
-            }
-        }
+        payload = self._build_payload(prompt, schema)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -224,6 +244,17 @@ class GeminiClient:
                 if parts:
                     return parts[0].get("text", "").strip()
         raise GeminiClientException("Resposta inválida do Gemini via urllib.")
+
+    @staticmethod
+    def _build_out_of_scope_response() -> GeminiAnalysisResponse:
+        """Recusa padronizada (sem chamada de API) para assuntos fora do escopo automotivo."""
+        return GeminiAnalysisResponse(
+            intent=IntentType.UNKNOWN,
+            confidence=ConfidenceLevel.HIGH,
+            is_critical_action=False,
+            reply_message=OUT_OF_SCOPE_REPLY,
+            reasoning="Fora do escopo automotivo (bloqueado pelo guardrail, sem chamada ao LLM)",
+        )
 
     def _build_contingency_fallback(self, message: str, error_detail: str) -> GeminiAnalysisResponse:
         """Fallback seguro em caso de indisponibilidade ou timeout excedido."""
