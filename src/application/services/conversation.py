@@ -7,13 +7,13 @@ de estados conversacionais, invoca o Gemini e assegura o fluxo de confirmação 
 import re
 import asyncio
 import unicodedata
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 
 from src.domain.enums import ConversationState, IntentType
 from src.domain.entities import ConversationContext, ConversationTurn
 from src.ai.client import GeminiClient
-from src.ai.schemas import GeminiAnalysisResponse
+from src.ai.schemas import GeminiAnalysisResponse, ActionDraft
 
 
 class ConversationService:
@@ -127,8 +127,8 @@ class ConversationService:
                 "details": {"reset_all": True}
             }
 
-        # 1.8 Detecção de Veículo via Fuzzy Matching & Troca Imediata de Contexto (Problema 4)
-        matched_veh = self._resolve_vehicle_fuzzy(clean_text, vehicles)
+        # 1.8 Detecção de Veículo via Resolução Estrita & Fuzzy (Problemas 3 e 4)
+        matched_veh, discrepancy_warning = self._resolve_vehicle(clean_text, vehicles)
         if matched_veh:
             v_id = getattr(matched_veh, "id", None)
             if v_id is not None and context.active_vehicle_id != v_id:
@@ -166,6 +166,16 @@ class ConversationService:
                 "details": {}
             }
 
+        # 2.55 Decomposição de Múltiplas Ações / Múltiplos Veículos na mesma mensagem (Problema 1)
+        multi_actions = self._decompose_multi_action_message(clean_text, vehicles)
+        if len(multi_actions) >= 2:
+            conf_res = self._initiate_multi_action_confirmation_flow(
+                context, multi_actions, discrepancy_warning=discrepancy_warning
+            )
+            self._record_assistant_turn(context, conf_res["reply"])
+            self.update_context(context)
+            return conf_res
+
         # 2.6 Consulta Global / Check-up Geral da Garagem (Problema 3)
         if self._is_garage_checkup_query(text_lower):
             garage_res = await self._handle_garage_checkup(
@@ -181,11 +191,13 @@ class ConversationService:
             return garage_res
 
         # 2.7 Consulta Direta de Status Veicular por Modelo / Fuzzy Matching (Problema 4)
+        action_verbs = ("fiz", "troquei", "realizei", "gastei", "paguei", "atualiza", "mudei", "cadastra", "adicione")
+        has_action_verb = any(v in text_lower for v in action_verbs)
         status_keywords = (
             "status", "situa", "dados", "como ta", "como está", "informa",
             "revisao", "revisão", "manuten", "em dia", "está em dia", "ta em dia"
         )
-        if matched_veh and any(k in text_lower for k in status_keywords):
+        if matched_veh and not has_action_verb and any(k in text_lower for k in status_keywords):
             status_res = self._format_single_vehicle_status(matched_veh, maintenances)
             context.state = ConversationState.NORMAL
             context.draft_payload = None
@@ -195,7 +207,7 @@ class ConversationService:
 
         # 2.8 Consulta Direta de Status Veicular por Placa (Regex Sanitizado & Banco Real)
         plate_search = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text)
-        if plate_search and any(k in text_lower for k in status_keywords):
+        if plate_search and not has_action_verb and any(k in text_lower for k in status_keywords):
             clean_plate = re.sub(r"[\s\-]", "", plate_search.group(1)).upper()
             status_result = await self._query_vehicle_status_by_plate(clean_plate, vehicles)
             if status_result:
@@ -214,12 +226,43 @@ class ConversationService:
             if "mil" in text_lower and km_val < 1000:
                 km_val *= 1000
 
+            target_veh = matched_veh or (vehicles[0] if vehicles else None)
+            target_ref = getattr(target_veh, "model", None) or getattr(target_veh, "modelo", "veículo")
+            current_veh_km = getattr(target_veh, "current_km", None) or getattr(target_veh, "quilometragem", None)
+
+            # Detecção de Retrocesso de Hodômetro (Problema 2)
+            if current_veh_km and km_val < current_veh_km:
+                context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+                context.draft_payload = {
+                    "_is_odometer_rollback": True,
+                    "_is_odometer_update": True,
+                    "_action_state": context.state.value,
+                    "odometer_km": km_val,
+                    "km": km_val,
+                    "current_km": current_veh_km,
+                    "_target_vehicle_ref": target_ref,
+                }
+                if discrepancy_warning:
+                    context.draft_payload["_discrepancy_warning"] = discrepancy_warning
+
+                reply = (
+                    f"⚠️ Identifiquei que a quilometragem informada ({km_val:,} km) é menor que a registrada anteriormente ({current_veh_km:,} km). "
+                    f"Foi um erro de digitação? (Responda se deseja cancelar ou confirmar)"
+                ).replace(",", ".")
+                if discrepancy_warning:
+                    reply = f"⚠️ {discrepancy_warning}\n\n" + reply
+                self._record_assistant_turn(context, reply)
+                self.update_context(context)
+                return {
+                    "reply": reply,
+                    "action_type": "awaiting_confirmation",
+                    "state": context.state.value,
+                    "draft": context.draft_payload,
+                }
+
             interval = 10000
             sched_mark = (km_val // interval) * interval
             exceeded_km = (km_val - sched_mark) if sched_mark > 0 else 0
-
-            target_veh = matched_veh or (vehicles[0] if vehicles else None)
-            target_ref = getattr(target_veh, "model", None) or getattr(target_veh, "modelo", "veículo")
 
             context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
             context.draft_payload = {
@@ -230,6 +273,9 @@ class ConversationService:
                 "_target_vehicle_ref": target_ref,
                 "_exceeded_km": exceeded_km,
             }
+            if discrepancy_warning:
+                context.draft_payload["_discrepancy_warning"] = discrepancy_warning
+
             if exceeded_km > 0:
                 reply = (
                     f"Entendi a atualização do hodômetro com {km_val} km. "
@@ -239,6 +285,9 @@ class ConversationService:
                 reply = (
                     f"Entendi a atualização do hodômetro com {km_val} km. Posso confirmar?"
                 )
+            if discrepancy_warning:
+                reply = f"⚠️ {discrepancy_warning}\n\n" + reply
+
             self._record_assistant_turn(context, reply)
             self.update_context(context)
             return {
@@ -261,9 +310,18 @@ class ConversationService:
             fines=fines,
         )
 
+        # 3.5 Múltiplas Ações Estruturadas retornadas pelo Gemini (Problema 1)
+        if analysis.actions and len(analysis.actions) >= 2:
+            conf_res = self._initiate_multi_action_confirmation_flow(
+                context, analysis.actions, discrepancy_warning=discrepancy_warning
+            )
+            self._record_assistant_turn(context, conf_res["reply"])
+            self.update_context(context)
+            return conf_res
+
         # 4. Tratamento de Ações Críticas (Human-in-the-Loop)
         if analysis.is_critical_action:
-            result = self._initiate_confirmation_flow(context, analysis)
+            result = self._initiate_confirmation_flow(context, analysis, discrepancy_warning=discrepancy_warning)
             self._record_assistant_turn(context, result["reply"])
             self.update_context(context)
             return result
@@ -296,6 +354,7 @@ class ConversationService:
         self,
         context: ConversationContext,
         analysis: GeminiAnalysisResponse,
+        discrepancy_warning: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Retém a ação em estado de rascunho e formula a mensagem de confirmação para o motorista.
@@ -364,6 +423,8 @@ class ConversationService:
 
         payload["_action_state"] = context.state.value
         payload["_target_vehicle_ref"] = analysis.target_vehicle_ref
+        if discrepancy_warning:
+            payload["_discrepancy_warning"] = discrepancy_warning
         context.draft_payload = payload
 
         # Alerta enxuto de hodômetro com revisão excedida (Problema 2)
@@ -380,6 +441,8 @@ class ConversationService:
                     f"Entendi a atualização do hodômetro com {km_val} km. "
                     f"🔴 ALERTA: Você passou da revisão em {exceeded_km} km! Posso confirmar?"
                 )
+                if discrepancy_warning:
+                    confirmation_reply = f"⚠️ {discrepancy_warning}\n\n" + confirmation_reply
                 return {
                     "reply": confirmation_reply,
                     "action_type": "awaiting_confirmation",
@@ -393,6 +456,8 @@ class ConversationService:
             f"📌 *Deseja confirmar e registrar essas informações?*\n"
             f"👉 Responda *'Sim'* para salvar ou *'Não'* para cancelar."
         )
+        if discrepancy_warning:
+            confirmation_reply = f"⚠️ {discrepancy_warning}\n\n" + confirmation_reply
 
         return {
             "reply": confirmation_reply,
@@ -414,16 +479,19 @@ class ConversationService:
     ) -> Dict[str, Any]:
         """
         Processa respostas quando há um rascunho pendente de confirmação.
-        Garante que apenas respostas curtas diretas de afirmação/negação sejam tratadas
-        via Fast-Path, enviando comandos complexos, correções e novas ações para o Gemini.
+        Aplica classificação semântica NLP (Problema 2) para aceitar respostas naturais
+        como 'foi um erro', 'cancela', 'esquece' (False) e 'pode meter marcha', 'isso aí' (True).
         """
         words = clean_text.strip().split()
         is_affirmative = bool(re.search(r"\b(sim|confirmo|confirma|pode\s+salvar|salvar|salva|isso|correto|pode\s+registrar|com\s+certeza|positivo|fecho|fechado)\b", text_lower))
         is_negative = bool(re.search(r"\b(n[ãa]o|cancela|cancelar|n[ãa]o\s+salva|abortar|errado|errei|esquece|parar)\b", text_lower))
 
-        # Detecta se o usuário está corrigindo dados do rascunho (ex: "Não, a placa é...", "Não, o ano é 2023")
+        # Classificação semântica rica (NLP)
+        nlp_classification = await self.classify_confirmation(clean_text, context)
+
+        # Detecta se o usuário está corrigindo dados do rascunho
         is_correction = bool(re.search(
-            r"(\b(placa|ano|km|quilometragem|valor|custo|pre[çc]o|reais|oficina|pe[çc]a|marca|modelo|troc|troquei|troca|era|foi|seria|[ée])\b|"
+            r"(\b(placa|ano|km|quilometragem|valor|custo|pre[çc]o|reais|oficina|pe[çc]a|marca|modelo)\b|"
             r"\b[a-zA-Z]{3}\d[a-zA-Z0-9]\d{2}\b|\b(19\d\d|20\d\d)\b|\b\d+\s*(km|reais|r\$))",
             text_lower
         ))
@@ -433,12 +501,11 @@ class ConversationService:
             r"\b(lembr|avis|agend|notific|lembrete|amanh[ãa]|às\s+\d+|as\s+\d+|\d{1,2}h)\b",
             text_lower
         ))
-        if is_affirmative and has_chained_command and not is_negative:
+        if (is_affirmative or nlp_classification is True) and has_chained_command and not is_negative and nlp_classification is not False:
             executed_action = context.state.value
             draft_data = context.draft_payload or {}
             draft_data["_action_state"] = executed_action
 
-            # Extração dos parâmetros de data/hora do lembrete
             time_match = re.search(r"(?:às|as)\s*(\d{1,2})(?::(\d{2})|h)?|\b(\d{1,2})h\b", text_lower)
             hour = 8
             minute = 0
@@ -479,6 +546,8 @@ class ConversationService:
                 f"{base_msg}\n\n"
                 f"⏰ *Lembrete agendado:* Vou te avisar {date_str} às {time_str} sobre *'{task_desc}'*! 🔔"
             )
+            if draft_data.get("_discrepancy_warning"):
+                reply = f"⚠️ {draft_data['_discrepancy_warning']}\n\n" + reply
             return {
                 "reply": reply,
                 "action_type": "action_confirmed_with_chained_reminder",
@@ -486,26 +555,60 @@ class ConversationService:
                 "committed_data": draft_data,
             }
 
-        # A.2) Confirmação Positiva Direta: Apenas mensagens curtas (<= 4 palavras) e sem entidades complexas novas
-        is_short_affirmative = is_affirmative and not is_negative and not is_correction and len(words) <= 4
+        # B) Recusa / Cancelamento Puro / Erro Natural (NLP ou Direct) (Problema 2)
+        if not is_correction and (nlp_classification is False or (is_negative and len(words) <= 4)):
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            return {
+                "reply": "Tranquilo, cancelei a operação! Nada foi alterado no seu veículo. Como posso te ajudar agora?",
+                "action_type": "action_cancelled",
+                "state": context.state.value,
+                "details": {}
+            }
 
-        if is_short_affirmative:
+        # A.2) Confirmação Positiva Direta (NLP ou Direct)
+        if nlp_classification is True or (is_affirmative and not is_negative and not is_correction and len(words) <= 5):
             executed_action = context.state.value
             draft_data = context.draft_payload or {}
             draft_data["_action_state"] = executed_action
             if executed_action == ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value:
                 draft_data["_reset_system"] = True
                 draft_data["_reset_garage"] = True
-            
+
             # Limpa estado pendente
             context.state = ConversationState.NORMAL
             context.draft_payload = None
+
+            # Multi-Ação em Lote (Problema 1)
+            if draft_data.get("_is_multi_action"):
+                summary_lines = ["✅ *Todas as ações foram confirmadas e salvas com sucesso!*"]
+                for act in draft_data.get("actions", []):
+                    ref = act.get("target_vehicle_ref") or "Veículo"
+                    intent = act.get("intent")
+                    if intent in (IntentType.RECORD_MAINTENANCE.value, "record_maintenance"):
+                        summary_lines.append(f"• 🚗 *{ref}*: Manutenção registrada no histórico.")
+                    elif intent in (IntentType.UPDATE_ODOMETER.value, "update_odometer"):
+                        km = act.get("odometer_km") or act.get("km")
+                        km_str = f"{km:,} km".replace(",", ".") if km else ""
+                        summary_lines.append(f"• 🚗 *{ref}*: Odômetro atualizado para {km_str}." if km_str else f"• 🚗 *{ref}*: Odômetro atualizado.")
+                    else:
+                        summary_lines.append(f"• 🚗 *{ref}*: Registro concluído com sucesso.")
+
+                summary_lines.append("\nSeus veículos estão atualizados! Posso te ajudar com algo mais?")
+                reply = "\n".join(summary_lines)
+                if draft_data.get("_discrepancy_warning"):
+                    reply = f"⚠️ {draft_data['_discrepancy_warning']}\n\n" + reply
+                return {
+                    "reply": reply,
+                    "action_type": "action_confirmed",
+                    "state": context.state.value,
+                    "committed_data": draft_data,
+                }
 
             km_saved = draft_data.get("odometer_km") or draft_data.get("km")
             if draft_data.get("_is_odometer_update") and km_saved:
                 msg = f"✅ *Atualização do hodômetro com {km_saved:,} km confirmada e salva com sucesso!*".replace(",", ".")
             else:
-                # Monta confirmação de sucesso de acordo com o tipo
                 success_messages = {
                     ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value: "🚗 *Veículo cadastrado com sucesso na sua garagem!*",
                     ConversationState.AWAITING_MAINTENANCE_CONFIRM.value: "✅ *Manutenção salva com sucesso no histórico oficial do seu veículo!*",
@@ -514,22 +617,16 @@ class ConversationService:
                     ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value: "🗑️ *Garagem zerada com sucesso! Todos os registros foram limpos.*",
                 }
                 msg = success_messages.get(executed_action, "✅ *Ação confirmada e registrada com sucesso!*")
+
+            reply = f"{msg}\n\nSe precisar de algo mais, é só me chamar!"
+            if draft_data.get("_discrepancy_warning"):
+                reply = f"⚠️ {draft_data['_discrepancy_warning']}\n\n" + reply
+
             return {
-                "reply": f"{msg}\n\nSe precisar de algo mais, é só me chamar!",
+                "reply": reply,
                 "action_type": "action_confirmed",
                 "state": context.state.value,
                 "committed_data": draft_data,
-            }
-
-        # B) Recusa / Cancelamento Puro Curto
-        if is_negative and not is_correction and len(words) <= 4:
-            context.state = ConversationState.NORMAL
-            context.draft_payload = None
-            return {
-                "reply": "Tranquilo, cancelei a operação! Nada foi alterado no seu veículo.",
-                "action_type": "action_cancelled",
-                "state": context.state.value,
-                "details": {}
             }
 
         # C) Mensagens complexas, correções de dados, novas instruções ou dúvidas: consulta o Gemini
@@ -573,8 +670,11 @@ class ConversationService:
                 ConversationState.AWAITING_GARAGE_RESET_CONFIRM.value: "🗑️ *Garagem zerada com sucesso! Todos os registros foram limpos.*",
             }
             msg = success_messages.get(executed_action, "✅ *Perfeito! Informações salvas com sucesso no seu histórico oficial!*")
+            reply = f"{msg}\n\nSe precisar de algo mais, é só me chamar!"
+            if draft_data.get("_discrepancy_warning"):
+                reply = f"⚠️ {draft_data['_discrepancy_warning']}\n\n" + reply
             return {
-                "reply": f"{msg}\n\nSe precisar de algo mais, é só me chamar!",
+                "reply": reply,
                 "action_type": "action_confirmed",
                 "state": context.state.value,
                 "committed_data": draft_data,
@@ -583,7 +683,8 @@ class ConversationService:
         # Se for nova ação crítica OU correção de dados do rascunho (is_critical_action = True):
         # Substitui/atualiza o rascunho e solicita confirmação para o novo dado
         if analysis.is_critical_action:
-            return self._initiate_confirmation_flow(context, analysis)
+            discrepancy_warning = context.draft_payload.get("_discrepancy_warning") if context.draft_payload else None
+            return self._initiate_confirmation_flow(context, analysis, discrepancy_warning=discrepancy_warning)
 
         # Se for UNKNOWN (ex: incompatibilidade mecânica, serviço recusado, prompt injection ou fora de escopo):
         # Retorna a resposta explicativa do Gemini e limpa o rascunho pendente incompatível
@@ -618,6 +719,276 @@ class ConversationService:
             "state": context.state.value,
             "draft": context.draft_payload,
         }
+
+    async def classify_confirmation(
+        self, text: str, context: Optional[ConversationContext] = None
+    ) -> Optional[bool]:
+        """
+        Classifica semanticamente respostas de confirmação, rejeição ou cancelamento (Problema 2).
+        Traduz respostas naturais:
+        - ('foi um erro', 'cancela', 'esquece', 'errei', 'não') -> False
+        - ('pode meter marcha', 'isso aí', 'manda bala', 'com certeza', 'sim') -> True
+        Retorna None se for uma dúvida ou correção de dados.
+        """
+        clean = text.strip()
+        clean_lower = clean.lower()
+        norm = "".join(c for c in unicodedata.normalize("NFKD", clean_lower) if not unicodedata.combining(c))
+
+        # Se contiver entidades claras de correção (placa, ano, valor, custo, etc.), não é confirmação nem cancelamento puro
+        has_correction_entity = bool(re.search(
+            r"(\b(placa|ano|valor|custo|pre[çc]o|reais|oficina|pe[çc]a|marca|modelo)\b|"
+            r"\b[a-zA-Z]{3}\d[a-zA-Z0-9]\d{2}\b|\b(19\d\d|20\d\d)\b)",
+            clean_lower
+        ))
+        if has_correction_entity:
+            return None
+
+        # 1. Padrões de Cancelamento / Rejeição / Erro (False)
+        negative_patterns = [
+            r"\bfoi\s+(?:um\s+)?(?:erro|engano)\b",
+            r"\berr(?:o|ei|ado)\s*(?:meu)?\b",
+            r"\bme\s+(?:confundi|enganei)\b",
+            r"\bdigitei\s+errado\b",
+            r"\bt[aá]\s+errado\b",
+            r"\best[aá]\s+errado\b",
+            r"\b(?:cancela|cancelar|aborta|abortar|esquece|esquece\s+isso)\b",
+            r"\bdeixa\s+(?:quieto|pra\s+l[aá])\b",
+            r"\bn[aã]o\s*(?:salv[ae]|registr[ae]|faz\s+isso)?\b",
+            r"\b(?:nop|nem\s+pensar|desiste|parar|nada\s+disso|recusar)\b",
+        ]
+        for p in negative_patterns:
+            if re.search(p, norm):
+                return False
+
+        # 2. Padrões de Confirmação / Aprovação (True)
+        affirmative_patterns = [
+            r"\bpode\s+meter\s+marcha\b",
+            r"\bmanda\s+(?:bala|ver|brasa)\b",
+            r"\bisso\s*(?:a[ií]|mesmo)\b",
+            r"\bcom\s+certeza\b",
+            r"\bsem\s+d[uú]vida\b",
+            r"\bpositivo\b",
+            r"\b(?:bora|dale|toca\s+o\s+barco|vai\s+fundo|demorou)\b",
+            r"\bpode\s+(?:ir|salvar|registrar|gravar|mandar)\b",
+            r"\b(?:fecho|fechado|beleza\s+pode\s+ir|t[aá]\s+certo|correto|exato)\b",
+            r"\b(?:sim|s|yes|confirmo|confirma|confirmar|salvar|salva|gravar)\b",
+        ]
+        for p in affirmative_patterns:
+            if re.search(p, norm):
+                return True
+
+        # 3. Fallback: Se for texto curto não identificado, consulta classificação rápida com Gemini
+        if len(clean.split()) <= 6 and self.gemini and hasattr(self.gemini, "client") and self.gemini.client:
+            try:
+                prompt = (
+                    f"Analise a seguinte resposta do usuário em um diálogo de confirmação: '{clean}'\n"
+                    "Classifique em apenas UMA palavra:\n"
+                    "- TRUE se o usuário estiver confirmando/aprovando a ação.\n"
+                    "- FALSE se estiver cancelando, recusando ou dizendo que foi um erro/engano.\n"
+                    "- UNKNOWN se for uma correção de dados, dúvida ou outro assunto."
+                )
+                resp = await self.gemini.client.aio.models.generate_content(
+                    model=self.gemini.model_name,
+                    contents=prompt,
+                )
+                resp_txt = (resp.text or "").strip().upper()
+                if "TRUE" in resp_txt:
+                    return True
+                if "FALSE" in resp_txt:
+                    return False
+            except Exception:
+                pass
+
+        return None
+
+    def _initiate_multi_action_confirmation_flow(
+        self,
+        context: ConversationContext,
+        actions: List[Any],
+        discrepancy_warning: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Inicia fluxo de confirmação agrupada para múltiplas ações ou múltiplos veículos (Problema 1)."""
+        context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+        action_dicts = []
+        for a in actions:
+            if hasattr(a, "model_dump"):
+                action_dicts.append(a.model_dump(exclude_none=True))
+            elif isinstance(a, dict):
+                action_dicts.append(a)
+            else:
+                action_dicts.append({"description": str(a)})
+
+        payload = {
+            "_is_multi_action": True,
+            "_action_state": "awaiting_multi_action_confirm",
+            "actions": action_dicts,
+        }
+        if discrepancy_warning:
+            payload["_discrepancy_warning"] = discrepancy_warning
+
+        context.draft_payload = payload
+
+        lines = ["Identifiquei múltiplas ações para a sua garagem:"]
+        for idx, act in enumerate(action_dicts, 1):
+            ref = act.get("target_vehicle_ref") or "Veículo"
+            intent = act.get("intent")
+            if intent in (IntentType.RECORD_MAINTENANCE.value, "record_maintenance"):
+                desc = act.get("description") or "Revisão"
+                lines.append(f"{idx}. 🚗 *{ref}*: Registro de manutenção (*{desc}*)")
+            elif intent in (IntentType.UPDATE_ODOMETER.value, "update_odometer"):
+                km = act.get("odometer_km") or act.get("km")
+                km_str = f"{km:,} km".replace(",", ".") if km else "novo hodômetro"
+                lines.append(f"{idx}. 🚗 *{ref}*: Atualização de hodômetro para *{km_str}*")
+            else:
+                lines.append(f"{idx}. 🚗 *{ref}*: {act.get('description', 'Ação solicitada')}")
+
+        lines.append("")
+        if discrepancy_warning:
+            lines.insert(0, f"⚠️ {discrepancy_warning}\n")
+        lines.append("📌 *Deseja confirmar e registrar essas operações?*")
+        lines.append("👉 Responda *'Sim'* (ou *'pode meter marcha'*) para salvar ou *'Não'* (ou *'foi um erro'*) para descartar.")
+
+        reply = "\n".join(lines)
+        return {
+            "reply": reply,
+            "action_type": "awaiting_confirmation",
+            "state": context.state.value,
+            "draft": payload,
+        }
+
+    def _decompose_multi_action_message(
+        self, text: str, vehicles: Optional[List[Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Decompõe mensagens com múltiplos veículos ou intenções na mesma frase (Problema 1).
+        Ex: 'Fiz revisão no Civic e atualiza o km do Sandero para 45000 km'
+        """
+        if not text:
+            return []
+
+        clauses = re.split(r"\s+(?:e\s+tamb[eé]m|e\s+al[eé]m\s+disso|e)\s+|[;\n]+", text.strip(), flags=re.I)
+        if len(clauses) < 2:
+            return []
+
+        actions: List[Dict[str, Any]] = []
+
+        for clause in clauses:
+            c_clean = clause.strip()
+            if not c_clean:
+                continue
+            c_lower = c_clean.lower()
+
+            c_veh, _ = self._resolve_vehicle(c_clean, vehicles)
+            c_ref = None
+            if c_veh:
+                c_ref = getattr(c_veh, "model", None) or getattr(c_veh, "modelo", None) or getattr(c_veh, "plate", None)
+            else:
+                for v in (vehicles or []):
+                    v_model = (getattr(v, "model", None) or getattr(v, "modelo", "")).lower()
+                    if v_model and v_model in c_lower:
+                        c_ref = getattr(v, "model", None) or getattr(v, "modelo", "")
+                        c_veh = v
+                        break
+
+            km_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b|\b(?:para|em|com)\s*(\d+)\b", c_lower)
+            km_val = None
+            if km_match:
+                val_s = km_match.group(1) or km_match.group(2)
+                if val_s:
+                    km_val = int(val_s)
+                    if "mil" in c_lower and km_val < 1000:
+                        km_val *= 1000
+
+            is_maint = any(k in c_lower for k in ("revis", "troc", "manuten", "oleo", "óleo", "filtro", "vela", "pastilha", "freio"))
+            is_odo = any(k in c_lower for k in ("km", "hodometro", "hodômetro", "quilometragem", "odometro", "odômetro", "atualiza", "bateu"))
+
+            if is_maint:
+                actions.append({
+                    "intent": IntentType.RECORD_MAINTENANCE.value,
+                    "target_vehicle_ref": c_ref or "Veículo",
+                    "is_critical_action": True,
+                    "description": c_clean,
+                    "components": [c_clean],
+                    "odometer_km": km_val,
+                    "km": km_val,
+                })
+            elif is_odo or km_val:
+                actions.append({
+                    "intent": IntentType.UPDATE_ODOMETER.value,
+                    "target_vehicle_ref": c_ref or "Veículo",
+                    "is_critical_action": True,
+                    "description": f"Atualização de hodômetro ({c_clean})",
+                    "odometer_km": km_val,
+                    "km": km_val,
+                })
+
+        if len(actions) >= 2:
+            return actions
+        return []
+
+    def _resolve_vehicle(
+        self, text: str, vehicles: Optional[List[Any]] = None
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """
+        Resolve o veículo a partir do texto e detecta conflitos entre modelo mencionado e placa real (Problema 3).
+        Se o usuário disser 'Compass placa RIO2A24' e no banco a placa pertencer a um Sandero, emite:
+        'Atenção: A placa {placa} pertence ao seu {db_model}, e não a um {mentioned_model}. Os dados foram lançados no {db_model}.'
+        """
+        if not vehicles:
+            return None, None
+
+        text_clean = text.strip()
+        text_lower = text_clean.lower()
+
+        # 1. Busca por placa antiga ou Mercosul
+        plate_search = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", text_clean)
+        if plate_search:
+            clean_plate = re.sub(r"[\s\-]", "", plate_search.group(1)).upper()
+            db_veh = next(
+                (v for v in vehicles if (getattr(v, "plate", None) or getattr(v, "placa", "")).replace("-", "").upper() == clean_plate),
+                None,
+            )
+            if db_veh:
+                db_model = getattr(db_veh, "model", None) or getattr(db_veh, "modelo", "Veículo")
+                db_make = getattr(db_veh, "make", None) or getattr(db_veh, "marca", "")
+
+                mentioned_model = None
+
+                # Padrão contextual: "<modelo> [com a / de] placa"
+                pos_match = re.search(r"(?:do|da|no|na|o|a)?\s*([a-zA-Z0-9\-]+)\s+(?:com\s+a\s+|com\s+|de\s+)?placa\b", text_clean, re.I)
+                if pos_match:
+                    cand = pos_match.group(1).strip()
+                    if cand.lower() not in ("carro", "veiculo", "veículo", "moto", "com", "a", "o", "da", "do"):
+                        if cand.lower() != db_model.lower() and cand.lower() != db_make.lower():
+                            mentioned_model = cand.capitalize()
+
+                # Lista de modelos e marcas conhecidos para detecção ampla
+                if not mentioned_model:
+                    known_models = [
+                        "compass", "renegade", "civic", "corolla", "sandero", "logan", "duster",
+                        "gol", "polo", "virtus", "t-cross", "tcross", "nivus", "taos", "onix", "cruze",
+                        "tracker", "hilux", "yaris", "etios", "sw4", "hb20", "creta", "argo",
+                        "cronos", "pulse", "fastback", "toro", "strada", "mobi", "kwid", "kicks",
+                        "versa", "sentra", "fit", "city", "hr-v", "hrv", "wr-v", "titan", "fan", "biz",
+                        "twister", "fazer", "lander", "crosser", "xj6", "bmw", "audi", "mercedes"
+                    ]
+                    for km in known_models:
+                        if re.search(rf"\b{km}\b", text_lower):
+                            if km != db_model.lower() and km != db_make.lower():
+                                mentioned_model = km.capitalize()
+                                break
+
+                warning = None
+                if mentioned_model:
+                    warning = (
+                        f"Atenção: A placa {clean_plate} pertence ao seu {db_model}, "
+                        f"e não a um {mentioned_model}. Os dados foram lançados no {db_model}."
+                    )
+                return db_veh, warning
+
+        # 2. Se não houver placa, busca por fuzzy matching
+        fuzzy_veh = self._resolve_vehicle_fuzzy(text_clean, vehicles)
+        return fuzzy_veh, None
 
     def _record_assistant_turn(self, context: ConversationContext, reply_text: str):
         """Registra a resposta do assistente no histórico do contexto."""

@@ -144,6 +144,26 @@ class FineDraft(BaseModel):
     due_date_str: Optional[str] = Field(default=None, description="Data de vencimento")
 
 
+class ActionDraft(BaseModel):
+    """
+    Entidade representativa de uma ação estruturada individual (suporte a múltiplas ações/veículos).
+    """
+    intent: IntentType = Field(..., description="Intenção individual identificada")
+    target_vehicle_ref: Optional[str] = Field(default=None, description="Veículo alvo (ex: 'Civic', 'Sandero', placa)")
+    is_critical_action: bool = Field(default=True, description="Se exige confirmação antes de persistir")
+    description: Optional[str] = Field(default=None, description="Descrição da ação ou peças")
+    odometer_km: Optional[int] = Field(default=None, ge=0, description="Hodômetro informado se aplicável")
+    total_cost: Optional[float] = Field(default=None, ge=0.0, description="Valor financeiro total se aplicável")
+    components: List[str] = Field(default_factory=list, description="Peças ou serviços revisados")
+    workshop_name: Optional[str] = Field(default=None, description="Oficina mecânica")
+    date_str: Optional[str] = Field(default=None, description="Data da realização")
+    vehicle: Optional[VehicleDraft] = Field(default=None)
+    maintenance: Optional[MaintenanceDraft] = Field(default=None)
+    reminder: Optional[ReminderDraft] = Field(default=None)
+    fine: Optional[FineDraft] = Field(default=None)
+    extracted_entities: Dict[str, Any] = Field(default_factory=dict)
+
+
 class GeminiAnalysisResponse(BaseModel):
     """
     Contrato Raiz de Structured Output do Google Gemini.
@@ -177,6 +197,10 @@ class GeminiAnalysisResponse(BaseModel):
     maintenance: Optional[MaintenanceDraft] = Field(default=None, description="Detalhes se intent for RECORD_MAINTENANCE")
     reminder: Optional[ReminderDraft] = Field(default=None, description="Detalhes se intent for SET_REMINDER")
     fine: Optional[FineDraft] = Field(default=None, description="Detalhes se intent for REGISTER_FINE")
+    actions: List[ActionDraft] = Field(
+        default_factory=list,
+        description="Lista de ações estruturadas quando a mensagem contiver múltiplas intenções ou múltiplos veículos"
+    )
 
 
 # Alias para retrocompatibilidade

@@ -113,7 +113,7 @@ def resolve_target_vehicle(
 
     # 1. Correspondência exata ou substring por placa
     for v in vehicles:
-        v_plate = (v.plate or "").upper().replace("-", "").strip()
+        v_plate = (getattr(v, "plate", None) or getattr(v, "placa", "") or "").upper().replace("-", "").strip()
         if v_plate:
             if plate_hint and plate_hint == v_plate:
                 return v.id
@@ -122,7 +122,7 @@ def resolve_target_vehicle(
 
     # 2. Correspondência específica por MODELO (ex: 'CG 160', 'Civic', 'Golf', 'Corolla')
     for v in vehicles:
-        model_str = (v.model or "").lower()
+        model_str = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
         if model_str:
             if model_str in ref_clean:
                 return v.id
@@ -138,20 +138,22 @@ def resolve_target_vehicle(
 
     if is_moto_ref:
         for v in vehicles:
-            v_type = v.vehicle_type.value if hasattr(v.vehicle_type, "value") else str(v.vehicle_type).lower()
-            if "moto" in v_type:
+            v_type = getattr(v, "vehicle_type", None) or getattr(v, "tipo", "")
+            v_type_str = v_type.value if hasattr(v_type, "value") else str(v_type).lower()
+            if "moto" in v_type_str:
                 return v.id
 
     if is_carro_ref:
         for v in vehicles:
-            v_type = v.vehicle_type.value if hasattr(v.vehicle_type, "value") else str(v.vehicle_type).lower()
-            if "carro" in v_type or "caminhonete" in v_type:
+            v_type = getattr(v, "vehicle_type", None) or getattr(v, "tipo", "")
+            v_type_str = v_type.value if hasattr(v_type, "value") else str(v_type).lower()
+            if "carro" in v_type_str or "caminhonete" in v_type_str:
                 return v.id
 
     # 4. Correspondência combinada make + model
     for v in vehicles:
-        make_str = (v.make or "").lower()
-        model_str = (v.model or "").lower()
+        make_str = (getattr(v, "make", None) or getattr(v, "marca", "") or "").lower()
+        model_str = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
         if f"{make_str} {model_str}" in ref_clean:
             return v.id
 
@@ -161,8 +163,8 @@ def resolve_target_vehicle(
     best_id = None
     best_score = 0.0
     for v in vehicles:
-        model_str = (v.model or "").lower()
-        make_str = (v.make or "").lower()
+        model_str = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
+        make_str = (getattr(v, "make", None) or getattr(v, "marca", "") or "").lower()
         targets = [model_str, make_str] + model_str.split() + make_str.split()
         for rw in ref_words:
             if len(rw) < 3:
@@ -272,8 +274,42 @@ async def receive_webhook(
         try:
             action_state = committed_data.get("_action_state", "")
 
+            # Caso Multi-Ação em Lote (Problema 1)
+            if committed_data.get("_is_multi_action"):
+                for act in committed_data.get("actions", []):
+                    act_intent = act.get("intent")
+                    act_ref = act.get("target_vehicle_ref")
+                    target_vehicle_id = resolve_target_vehicle(vehicles, act_ref, act)
+                    if not target_vehicle_id and vehicles:
+                        target_vehicle_id = vehicles[0].id
+
+                    if act_intent in ("record_maintenance", "RECORD_MAINTENANCE") and target_vehicle_id:
+                        km_val = act.get("km") or act.get("odometer_km")
+                        desc_val = act.get("description") or "Manutenção realizada"
+                        comp_val = act.get("components") or [desc_val]
+                        cost_val = act.get("total_cost", 0.0)
+                        new_maint = MaintenanceRecord(
+                            vehicle_id=target_vehicle_id,
+                            user_id=user_id,
+                            components=comp_val if isinstance(comp_val, list) else [str(comp_val)],
+                            description=desc_val,
+                            km=int(km_val) if km_val is not None else None,
+                            total_cost=float(cost_val or 0.0),
+                            workshop_name=act.get("workshop_name"),
+                        )
+                        saved_maint = await maintenance_repo.add_record(new_maint)
+                        logger.info(f"Multi-ação: Manutenção [{saved_maint.id}] salva para veículo [{target_vehicle_id}]")
+                        if km_val:
+                            await vehicle_repo.update_km(target_vehicle_id, int(km_val))
+
+                    elif act_intent in ("update_odometer", "UPDATE_ODOMETER") and target_vehicle_id:
+                        km_val = act.get("odometer_km") or act.get("km")
+                        if km_val:
+                            await vehicle_repo.update_km(target_vehicle_id, int(km_val))
+                            logger.info(f"Multi-ação: Odômetro do veículo [{target_vehicle_id}] atualizado para {km_val} km")
+
             # Caso C: Confirmação ou Comando Direto de Reset de Garagem / Sistema
-            if (
+            elif (
                 action_type == "system_reset"
                 or committed_data.get("_reset_system") is True
                 or committed_data.get("_reset_garage") is True

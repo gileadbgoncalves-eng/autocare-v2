@@ -1,8 +1,8 @@
-# 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (API REST, PERSISTÊNCIA REAL, NOTIFICAÇÕES & BATCH SCHEDULER)
+# 📍 PONTO DE PARADA TOTAL - AUTOCARE V2 (STRESS TEST REFACTORING, NLP & MULTI-VEHICLE)
 
-**Data do Checkpoint:** 23/10/2026 - 07:30  
-**Versão:** AutoCare V2.5.0 (Motor de Notificações: Batching Aggregator, Isolamento por FK, Bypass de Agendamento Futuro & Scheduler em Segundo Plano)  
-**Status do Projeto:** 100% Funcional, 20/20 Testes Pytest Aprovados e Suíte Central 6/6 PASS.  
+**Data do Checkpoint:** 23/10/2026 - 09:10  
+**Versão:** AutoCare V2.6.0 (Stress Test Refactoring: Multi-Action/Multi-Vehicle Extraction, Natural NLP Confirmations/Cancellations & Entity Discrepancy Warnings)  
+**Status do Projeto:** 100% Funcional, 25/25 Testes Pytest Aprovados e Suíte Central 6/6 PASS.  
 
 ---
 
@@ -10,81 +10,56 @@
 
 | Suíte de Testes | Abrangência / Escopo | Resultado |
 | :--- | :--- | :---: |
-| **Nova API & Notificações (`pytest tests/ -v`)** | Batching, Anti-Spam, Isolamento FK, Horário Customizado, Endpoints e Bot | **20/20 PASS (100%) ✅** |
+| **Testes de Estresse & Refatoração (`tests/test_stress_refactor_fixes.py`)** | Múltiplas Ações, Classificador NLP e Conflito Placa vs Modelo | **5/5 PASS (100%) ✅** |
+| **Suíte Completa Pytest (`pytest tests/ -v`)** | 25 Testes: Stress, QA Fixes, Batch Scheduler, APIs CRUD e Bot | **25/25 PASS (100%) ✅** |
 | **Suíte de Integração Central (`run_v2_tests.py`)** | 6 Camadas: Domínio, Config, Repositórios, IA, Máquina de Estados, Webhook | **6/6 PASS (100%) ✅** |
 | **Suíte de Caos e Segurança (`security_chaos_tester.py`)** | Isolamento Multi-Tenant, Anti-Rollback de Odômetro, SQLi/XSS, Fallback LLM | **4/4 PASS (100%) ✅** |
 | **Suíte de Validação Profunda (`deep_validation_tester.py`)** | Auditoria SQL direta, Roteamento Multi-Veículos, Persistência e Idempotência | **7/7 PASS (100%) ✅** |
 
 ---
 
-## 🔔 Refatoração do Motor de Notificações e Lembretes (V2.5.0)
+## 🛡️ Refatoração dos 3 Problemas do Teste de Estresse (V2.6.0)
 
-Com base nos testes matinais de UX, foram solucionadas 3 falhas críticas nas notificações e agendamentos:
+Durante os testes de estresse, a máquina de estados e o orquestrador foram blindados para 3 cenários complexos:
 
-### 1. Resolução do Disparo Antecipado (Problema 1: 05:00 vs 08:00)
-- **Causa Raiz**: Lembretes agendados pelo usuário (ex: *"sim, me lembra amanhã às 8h"*) eram salvos sem hora explícita resolvida ou eram capturados por consultas genéricas de lembretes pendentes disparadas no início da manhã.
+### 1. PROBLEMA 1: Eliminação da "Visão de Túnel" (Múltiplas Ações / Múltiplos Veículos)
+- **Cenário de Falha**: O usuário enviava ações para dois veículos na mesma mensagem (ex: *"Fiz revisão no Civic e atualiza o km do Sandero para 45000 km"*). O sistema processava apenas o Civic e descartava o Sandero.
 - **Solução Implementada**:
-  - Adicionado o campo `data_hora_agendada` (`DateTime`) e `status` (`pendente`, `agendado`, `concluido`) nas tabelas e modelos `Lembrete`, `Reminder` e `Manutencao`.
-  - No `webhook.py`, os lembretes encadeados (`chained_reminder`) agora calculam com precisão o timestamp de disparo (`datetime.combine(data_alvo, horario_explicito)`).
-  - **Regra de Bypass Estrita**: O repositório `LembreteRepository.get_general_pending_for_vehicle` e o `NotificationService.build_garage_bulletin` estritamente **ignoram** qualquer lembrete onde `data_hora_agendada > now`.
-  - Disparos específicos rodam no minuto exato através de `dispatch_scheduled_reminders`, marcando o lembrete como `concluido` logo após o envio.
+  - **Schema Pydantic V2**: Criada a entidade `ActionDraft` e adicionado o campo `actions: List[ActionDraft] = Field(default_factory=list)` no contrato raiz `GeminiAnalysisResponse`.
+  - **Prompt de Sistema**: Adicionada a seção `[13. MÚLTIPLAS AÇÕES E MÚLTIPLOS VEÍCULOS NA MESMA MENSAGEM (MULTI-INTENT & ACTIONS LIST)]` instruindo o LLM a particionar as ações.
+  - **Decomposição Determinística e Heurística**: Desenvolvido `_decompose_multi_action_message(clean_text, vehicles)` que opera em sub-milissegundos particionando orações coordenadas e extraindo veículos e ações de forma atômica.
+  - **Fluxo de Confirmação em Lote**: Implementado `_initiate_multi_action_confirmation_flow(context, actions)` que formula um checklist elegante com tópicos numerados.
+  - **Persistência em Lote no Webhook**: No `webhook.py`, quando `committed_data["_is_multi_action"] == True`, o serviço itera sobre cada ação individual, persistindo registros de manutenção e odômetros de cada carro respectivo sem perda de dados.
 
-### 2. Motor de Agregação em Lote (Batching) e Isolamento Estrito por FK (Problema 2: Anti-Spam)
-- **Causa Raiz**: O sistema disparava uma mensagem isolada para cada alerta, gerando spam de notificações fragmentadas para condutores com múltiplos carros.
+### 2. PROBLEMA 2: Validação Rígida Superada com NLP nas Confirmações
+- **Cenário de Falha**: Ao barrar um retrocesso de odômetro (ex: 30.000 km quando o veículo já tinha 45.000 km), o sistema perguntava se fora um erro. Ao responder *"foi um erro"*, o bot não entendia (esperava a string exata `'Não'`) e repetia rigidamente a pergunta.
 - **Solução Implementada**:
-  - Desenvolvido o motor `NotificationService.build_garage_bulletin(proprietario_id)` que consolida todas as pendências da garagem em **uma única mensagem elegante**.
-  - **Isolamento por Chave Estrangeira (FK)**: A consulta itera pelos veículos do condutor e filtra estritamente `lembrete.veiculo_id == veiculo.id`. Alertas do Civic jamais vazam para o bloco do Sandero.
-  - Formato elegante padronizado:
+  - **Classificador Semântico `classify_confirmation`**:
+    - Mapeia respostas coloquiais afirmativas (*"pode meter marcha"*, *"isso aí"*, *"manda bala"*, *"com certeza"*, *"positivo"*, *"fechado"*) para `True` (Confirmação imediata).
+    - Mapeia declarações naturais de cancelamento e engano (*"foi um erro"*, *"foi engano"*, *"errei"*, *"me confundi"*, *"cancela"*, *"esquece"*, *"deixa quieto"*) para `False` (Descarte gracioso sem repetições).
+  - **Diferenciação Estrita de Correções**: Mensagens contendo entidades reais de retificação (ex: *"Não, a placa é ABC1234"* ou *"Não, o ano é 2022"*) continuam sendo enviadas ao fluxo de edição de rascunho sem cancelamento indevido.
+  - **Detecção de Retrocesso de Hodômetro**: Integrada verificação preventiva que alerta educadamente se a quilometragem informada for inferior à já gravada no veículo.
+
+### 3. PROBLEMA 3: Resolução de Conflito de Entidades (Placa vs Nome do Carro)
+- **Cenário de Falha**: O usuário informava *"Compass placa RIO2A24"*. O banco de dados sabia que RIO2A24 pertencia a um Sandero, ignorando a palavra "Compass" e lançando os dados no Sandero sem avisar o motorista.
+- **Solução Implementada**:
+  - **Método `_resolve_vehicle(clean_text, vehicles)`**: Identifica a placa sanitizada e compara o modelo do banco de dados com o modelo citado na mensagem.
+  - **Aviso Obrigatório Emitido**: Se houver divergência explícita, o sistema gera o alerta obrigatório:
     ```text
-    Bom dia, Mariana! Que tal verificar sua garagem hoje?
-    🚗 Civic: Óleo atrasado.
-    🚙 Sandero: Calibrar pneus.
+    Atenção: A placa RIO2A24 pertence ao seu Sandero, e não a um Compass. Os dados foram lançados no Sandero.
     ```
-  - Supressão de mensagens vazias: Caso todos os veículos estejam em dia e sem lembretes vencidos, nenhuma notificação desnecessária é enviada.
-
-### 3. Horário Personalizado do Check-up Diário e Scheduler Assíncrono (Problema 3)
-- **Causa Raiz**: Todos os usuários recebiam mensagens no horário fixo do sistema, sem respeitar preferências individuais.
-- **Solução Implementada**:
-  - Adicionado `horario_notificacao_padrao` (`Time`, padrão `09:00:00`) nos modelos `Proprietario`, `UserModel` e nos schemas Pydantic.
-  - Implementado `ProprietarioRepository.get_by_horario_notificacao(target_time)` para disparar o boletim diário apenas quando a hora e minuto do servidor coincidem com o horário preferido do condutor.
-  - Criado o controlador `NotificationScheduler` operando em segundo plano (`asyncio.Task`) com loop a cada 60 segundos, perfeitamente acoplado ao ciclo de vida `lifespan` do FastAPI em `src/interfaces/app.py`.
-  - Criada a migração do Alembic `0002_add_notification_time_and_lembretes.py` garantindo evolução segura do esquema do banco de dados relacional.
+  - **Propagação Transparente**: O aviso é exibido tanto na pré-confirmação quanto anexado à mensagem de sucesso definitiva após confirmação, garantindo total transparência e integridade patrimonial.
 
 ---
 
-## 🛠️ Correções Anteriores de QA (V2.4.0)
+## 🔔 Histórico de Refatorações Anteriores (V2.5.0 e V2.4.0)
 
-### 1. Extração de Entidades Temporais e Locais
-- **Normalização Estrita de `workshop_name`**: Blacklist rigorosa descartando termos circunstanciais (`época`, `lugar`, `tempo`, etc.).
-- **Priorização Absoluta de Datas (`DD/MM/YYYY`)**: Conversão direta de datas relativas para formato canônico.
-
-### 2. UX Enxuta e Suporte a Multi-Intenção
-- Pré-confirmação limpa para odômetro com revisão ultrapassada.
-- Processamento unificado de confirmação com nova instrução em lote sem menus burocráticos.
-
-### 3. Check-up Geral da Garagem
-- Interceptor `_handle_garage_checkup` listando status de revisão de todos os veículos cadastrados do motorista.
-
-### 4. Fuzzy Matching e Troca Imediata de Contexto
-- Tolerância a digitações com erros ortográficos (`sandeiro` -> `Sandero`) via `difflib.SequenceMatcher` e atualização atômica de `active_vehicle_id`.
-
----
-
-## 🎯 Conquistas Arquiteturais e Entregas Técnicas
-
-### 1. Modelagem Relacional & SQLAlchemy 2.0 Async
-- Camada de modelos declarativos em `src/models/` (`Proprietario`, `Veiculo`, `Manutencao`, `Lembrete`).
-- Repositórios com sintaxe moderna `select()` em `src/repositories/`.
-- Migrações Alembic versionadas: `0001_initial.py` e `0002_add_notification_time_and_lembretes.py`.
-
-### 2. Validação Rigorosa via Pydantic v2
-- Sanitização e validação de placas Antigas (`ABC-1234`) e Mercosul (`ABC1D23`) via Regex.
-- Sanitização de telefones internacionais E.164.
-- Validação de custos, datas e integridade referencial.
-
-### 3. API REST FastAPI e Ciclo de Vida Lifespan
-- Endpoints CRUD para `/proprietarios`, `/veiculos`, `/manutencoes` e `/webhook`.
-- Inicialização de banco (`init_db`) e inicialização do scheduler de notificações (`notification_scheduler.start()`) no startup; encerramento gracioso no shutdown.
+1. **Motor de Agregação de Notificações (Batching & Anti-Spam)**: Consolidação de lembretes e alertas em um único boletim matinal por proprietário.
+2. **Isolamento Estrito por Chave Estrangeira (FK)**: Veículos de um condutor nunca misturam alertas entre si.
+3. **Bypass de Agendamento Futuro**: Lembretes agendados para horários específicos (ex: 08:00) são estritamente ignorados pela rotina geral das 05:00.
+4. **Horário Personalizado de Check-up**: Suporte ao campo `horario_notificacao_padrao` por condutor no banco relacional e `NotificationScheduler` assíncrono rodando no `lifespan`.
+5. **Normalização Temporal e Nomes de Oficinas**: Descarte de termos circunstanciais genéricos (`época`, `lugar`) para `workshop_name = None` e priorização de datas absolutas `DD/MM/YYYY`.
+6. **Fuzzy Matching de Veículos**: Tolerância ortográfica (`sandeiro` -> `Sandero`) via `difflib.SequenceMatcher` com troca imediata de contexto.
 
 ---
 
@@ -107,7 +82,7 @@ docker compose ps
 # Ativar ambiente virtual
 .\.venv\Scripts\Activate.ps1
 
-# Executar a suíte de testes completa do Pytest (20 testes)
+# Executar a suíte de testes completa do Pytest (25 testes)
 pytest -v
 
 # Executar a suíte central de integração (6 camadas)
