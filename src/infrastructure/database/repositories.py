@@ -479,6 +479,17 @@ class ReminderRepository:
         models = result.scalars().all()
         return [self._to_entity(m) for m in models]
 
+    async def get_by_vehicle_id(self, vehicle_id: int) -> List[Reminder]:
+        """Retorna todos os lembretes associados ao veículo."""
+        stmt = (
+            select(ReminderModel)
+            .where(ReminderModel.vehicle_id == vehicle_id)
+            .order_by(desc(ReminderModel.created_at))
+        )
+        result = await self.session.execute(stmt)
+        models = result.scalars().all()
+        return [self._to_entity(m) for m in models]
+
     async def get_by_id(self, reminder_id: int) -> Optional[Reminder]:
         stmt = select(ReminderModel).where(ReminderModel.id == reminder_id)
         result = await self.session.execute(stmt)

@@ -169,22 +169,63 @@ class FineDraft(BaseModel):
 
 class ActionDraft(BaseModel):
     """
-    Entidade representativa de uma ação estruturada individual (suporte a múltiplas ações/veículos).
+    Entidade representativa de uma ação estruturada individual (suporte a múltiplas ações/veículos e intenções mistas).
     """
-    intent: IntentType = Field(..., description="Intenção individual identificada")
+    intent: IntentType = Field(..., description="Intenção individual identificada (ex: RECORD_MAINTENANCE, SET_REMINDER, UPDATE_ODOMETER)")
     target_vehicle_ref: Optional[str] = Field(default=None, description="Veículo alvo (ex: 'Civic', 'Sandero', placa)")
     is_critical_action: bool = Field(default=True, description="Se exige confirmação antes de persistir")
-    description: Optional[str] = Field(default=None, description="Descrição da ação ou peças")
+    description: Optional[str] = Field(default=None, description="Descrição da ação, peças ou lembrete")
     odometer_km: Optional[int] = Field(default=None, ge=0, description="Hodômetro informado se aplicável")
     total_cost: Optional[float] = Field(default=None, ge=0.0, description="Valor financeiro total se aplicável")
     components: List[str] = Field(default_factory=list, description="Peças ou serviços revisados")
     workshop_name: Optional[str] = Field(default=None, description="Oficina mecânica")
     date_str: Optional[str] = Field(default=None, description="Data da realização")
+    task_description: Optional[str] = Field(default=None, description="Descrição da tarefa para agendamento de lembrete")
+    explicit_time: Optional[str] = Field(default=None, description="Horário explícito HH:MM (ex: '09:00', '14:30')")
+    target_date_str: Optional[str] = Field(default=None, description="Data alvo (ex: 'amanhã', 'hoje')")
+    due_datetime: Optional[str] = Field(default=None, description="Data/hora do lembrete")
     vehicle: Optional[VehicleDraft] = Field(default=None)
     maintenance: Optional[MaintenanceDraft] = Field(default=None)
     reminder: Optional[ReminderDraft] = Field(default=None)
     fine: Optional[FineDraft] = Field(default=None)
     extracted_entities: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def sync_nested_drafts(self) -> "ActionDraft":
+        """Sincroniza atributos diretos com rascunhos aninhados (MaintenanceDraft e ReminderDraft)."""
+        if self.reminder:
+            if not self.task_description:
+                self.task_description = self.reminder.task_description
+            if not self.explicit_time:
+                self.explicit_time = self.reminder.explicit_time
+            if not self.target_date_str:
+                self.target_date_str = self.reminder.target_date_str
+            if not self.description:
+                self.description = self.reminder.task_description
+        elif self.intent == IntentType.SET_REMINDER and (self.task_description or self.description):
+            self.reminder = ReminderDraft(
+                task_description=self.task_description or self.description or "Lembrete automotivo",
+                explicit_time=self.explicit_time,
+                target_date_str=self.target_date_str,
+            )
+
+        if self.maintenance:
+            if not self.total_cost and self.maintenance.total_cost:
+                self.total_cost = self.maintenance.total_cost
+            if not self.components and self.maintenance.components:
+                self.components = self.maintenance.components
+            if not self.description and self.maintenance.service_summary:
+                self.description = self.maintenance.service_summary
+        elif self.intent == IntentType.RECORD_MAINTENANCE and (self.components or self.total_cost or self.description):
+            self.maintenance = MaintenanceDraft(
+                service_summary=self.description,
+                components=self.components,
+                total_cost=self.total_cost,
+                odometer_km=self.odometer_km,
+                workshop_name=self.workshop_name,
+                date_str=self.date_str,
+            )
+        return self
 
 
 class GeminiAnalysisResponse(BaseModel):

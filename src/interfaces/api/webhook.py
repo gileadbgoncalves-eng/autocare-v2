@@ -308,6 +308,47 @@ async def receive_webhook(
                             await vehicle_repo.update_km(target_vehicle_id, int(km_val))
                             logger.info(f"Multi-ação: Odômetro do veículo [{target_vehicle_id}] atualizado para {km_val} km")
 
+                    elif act_intent in ("set_reminder", "SET_REMINDER"):
+                        target_veh_id = target_vehicle_id or resolve_target_vehicle(vehicles, act.get("target_vehicle_ref"), act)
+                        task_desc = act.get("task_description") or act.get("description", "Lembrete automotivo")
+                        due_dt = None
+                        raw_dt = act.get("due_datetime") or act.get("due_date")
+                        if isinstance(raw_dt, datetime):
+                            due_dt = raw_dt
+                        elif isinstance(raw_dt, str):
+                            try:
+                                due_dt = datetime.fromisoformat(raw_dt)
+                            except Exception:
+                                pass
+
+                        if not due_dt:
+                            target_date = (act.get("target_date_str") or "").lower()
+                            time_str = act.get("explicit_time") or ""
+                            hour, minute = 9, 0
+                            if time_str:
+                                tm_match = re.search(r"(\d{1,2}):(\d{2})|(\d{1,2})h", time_str)
+                                if tm_match:
+                                    if tm_match.group(1):
+                                        hour = int(tm_match.group(1))
+                                        minute = int(tm_match.group(2))
+                                    elif tm_match.group(3):
+                                        hour = int(tm_match.group(3))
+                            now = datetime.now()
+                            base_d = now.date()
+                            if "amanh" in target_date:
+                                base_d = base_d + timedelta(days=1)
+                            due_dt = datetime.combine(base_d, time(hour, minute))
+
+                        new_reminder = Reminder(
+                            user_id=user_id,
+                            vehicle_id=target_veh_id,
+                            description=task_desc,
+                            due_datetime=due_dt,
+                            due_km=act.get("due_km") or act.get("target_km"),
+                        )
+                        saved_reminder = await reminder_repo.add_reminder(new_reminder)
+                        logger.info(f"Multi-ação: Lembrete [{saved_reminder.id}] cadastrado para veículo [{target_veh_id}]")
+
             # Caso C: Confirmação ou Comando Direto de Reset de Garagem / Sistema
             elif (
                 action_type == "system_reset"

@@ -1024,22 +1024,27 @@ class ConversationService:
             context.state = ConversationState.NORMAL
             context.draft_payload = None
 
-            # Multi-Ação em Lote (Problema 1)
+            # Multi-Ação em Lote (Problema 1 e Intenções Mistas)
             if draft_data.get("_is_multi_action"):
                 summary_lines = ["✅ *Todas as ações foram confirmadas e salvas com sucesso!*"]
                 for act in draft_data.get("actions", []):
                     ref = act.get("target_vehicle_ref") or "Veículo"
                     intent = act.get("intent")
                     if intent in (IntentType.RECORD_MAINTENANCE.value, "record_maintenance"):
-                        summary_lines.append(f"• 🚗 *{ref}*: Manutenção registrada no histórico.")
+                        desc = act.get("description") or "Manutenção"
+                        summary_lines.append(f"• 🚗 *{ref}*: Manutenção registrada no histórico ({desc}).")
                     elif intent in (IntentType.UPDATE_ODOMETER.value, "update_odometer"):
                         km = act.get("odometer_km") or act.get("km")
                         km_str = f"{km:,} km".replace(",", ".") if km else ""
                         summary_lines.append(f"• 🚗 *{ref}*: Odômetro atualizado para {km_str}." if km_str else f"• 🚗 *{ref}*: Odômetro atualizado.")
+                    elif intent in (IntentType.SET_REMINDER.value, "set_reminder"):
+                        task = act.get("task_description") or act.get("description", "Lembrete automotivo")
+                        when = f"{act.get('target_date_str', 'em breve')} às {act.get('explicit_time', '09:00')}"
+                        summary_lines.append(f"• ⏰ *{ref}*: Lembrete agendado para {when} (*{task}*).")
                     else:
                         summary_lines.append(f"• 🚗 *{ref}*: Registro concluído com sucesso.")
 
-                summary_lines.append("\nSeus veículos estão atualizados! Posso te ajudar com algo mais?")
+                summary_lines.append("\nSeus veículos e lembretes estão atualizados! Posso te ajudar com algo mais?")
                 reply = "\n".join(summary_lines)
                 if draft_data.get("_discrepancy_warning"):
                     reply = f"⚠️ {draft_data['_discrepancy_warning']}\n\n" + reply
@@ -1274,24 +1279,56 @@ class ConversationService:
         context.draft_payload = payload
 
         lines = ["Identifiquei múltiplas ações para a sua garagem:"]
+        has_maint = False
+        has_rem = False
+        maint_summary = ""
+        maint_cost = 0.0
+        rem_summary = ""
+        rem_time = "09:00"
+        rem_date = "amanhã"
+
         for idx, act in enumerate(action_dicts, 1):
             ref = act.get("target_vehicle_ref") or "Veículo"
             intent = act.get("intent")
             if intent in (IntentType.RECORD_MAINTENANCE.value, "record_maintenance"):
+                has_maint = True
                 desc = act.get("description") or "Revisão"
-                lines.append(f"{idx}. 🚗 *{ref}*: Registro de manutenção (*{desc}*)")
+                maint_summary = desc
+                cost = act.get("total_cost", 0.0)
+                maint_cost = cost
+                cost_str = f" - R$ {cost:.2f}".replace(".", ",") if cost else ""
+                lines.append(f"{idx}. 🚗 *{ref}*: Registro de manutenção (*{desc}*{cost_str})")
             elif intent in (IntentType.UPDATE_ODOMETER.value, "update_odometer"):
                 km = act.get("odometer_km") or act.get("km")
                 km_str = f"{km:,} km".replace(",", ".") if km else "novo hodômetro"
                 lines.append(f"{idx}. 🚗 *{ref}*: Atualização de hodômetro para *{km_str}*")
+            elif intent in (IntentType.SET_REMINDER.value, "set_reminder"):
+                has_rem = True
+                task = act.get("task_description") or act.get("description", "Lembrete automotivo")
+                rem_summary = task
+                t_str = act.get("explicit_time") or "09:00"
+                d_str = act.get("target_date_str") or "amanhã"
+                rem_time = t_str
+                rem_date = d_str
+                lines.append(f"{idx}. ⏰ *{ref}*: Agendamento de lembrete (*{task}* para {d_str} às {t_str})")
             else:
                 lines.append(f"{idx}. 🚗 *{ref}*: {act.get('description', 'Ação solicitada')}")
 
         lines.append("")
         if discrepancy_warning:
             lines.insert(0, f"⚠️ {discrepancy_warning}\n")
-        lines.append("📌 *Deseja confirmar e registrar essas operações?*")
-        lines.append("👉 Responda *'Sim'* (ou *'pode meter marcha'*) para salvar ou *'Não'* (ou *'foi um erro'*) para descartar.")
+
+        # Se for intenção mista encadeada clássica (Manutenção + Lembrete)
+        if has_maint and has_rem:
+            cost_formatted = f" (R$ {maint_cost:,.0f})" if maint_cost else ""
+            summary_concl = (
+                f"Vou registrar a {maint_summary.lower()}{cost_formatted} E "
+                f"agendar um lembrete para {rem_date} às {rem_time} ({rem_summary}). Posso confirmar?"
+            )
+            lines.append(f"📌 {summary_concl}")
+        else:
+            lines.append("📌 *Deseja confirmar e registrar essas operações?*")
+            lines.append("👉 Responda *'Sim'* (ou *'pode meter marcha'*) para salvar ou *'Não'* (ou *'foi um erro'*) para descartar.")
 
         reply = "\n".join(lines)
         return {
@@ -1305,17 +1342,29 @@ class ConversationService:
         self, text: str, vehicles: Optional[List[Any]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Decompõe mensagens com múltiplos veículos ou intenções na mesma frase (Problema 1).
+        Decompõe mensagens com múltiplos veículos ou intenções na mesma frase (Problema 1 e Intenções Mistas).
         Ex: 'Fiz revisão no Civic e atualiza o km do Sandero para 45000 km'
+        Ex: 'Troquei óleo e filtro por 550 reais. Já salva isso e me lembra amanhã às 9h de calibrar o estepe.'
         """
         if not text:
             return []
 
-        clauses = re.split(r"\s+(?:e\s+tamb[eé]m|e\s+al[eé]m\s+disso|e)\s+|[;\n]+", text.strip(), flags=re.I)
+        # 1. Conectores estruturados de múltiplas intenções / orações
+        split_pattern = r"(?:\.\s+|\n+|;\s*|\s+(?:e\s+tamb[eé]m|e\s+al[eé]m\s+disso|j[áa]\s+salva\s+isso\s+e|j[áa]\s+aproveita\s+e|e\s+me\s+lembra|me\s+lembra|lembra-me)\s+)"
+        clauses = [c.strip() for c in re.split(split_pattern, text.strip(), flags=re.I) if c.strip()]
+        if len(clauses) < 2:
+            clauses = [c.strip() for c in re.split(r"\s+(?:e\s+tamb[eé]m|e\s+al[eé]m\s+disso|e)\s+|[;\n]+", text.strip(), flags=re.I) if c.strip()]
+
         if len(clauses) < 2:
             return []
 
         actions: List[Dict[str, Any]] = []
+
+        # Determina veículo padrão caso a mensagem não mencione explicitamente em todas as cláusulas
+        first_veh, _ = self._resolve_vehicle(text, vehicles)
+        if not first_veh and vehicles:
+            first_veh = vehicles[0]
+        default_ref = getattr(first_veh, "model", None) or getattr(first_veh, "modelo", "Veículo") if first_veh else "Veículo"
 
         for clause in clauses:
             c_clean = clause.strip()
@@ -1335,6 +1384,9 @@ class ConversationService:
                         c_veh = v
                         break
 
+            clause_veh_ref = c_ref or default_ref
+
+            # Extração de hodômetro se houver
             km_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b|\b(?:para|em|com)\s*(\d+)\b", c_lower)
             km_val = None
             if km_match:
@@ -1344,23 +1396,78 @@ class ConversationService:
                     if "mil" in c_lower and km_val < 1000:
                         km_val *= 1000
 
-            is_maint = any(k in c_lower for k in ("revis", "troc", "manuten", "oleo", "óleo", "filtro", "vela", "pastilha", "freio"))
+            # Extração de valor financeiro
+            cost_m = re.search(r"(?:r\$|reais|por)\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*(?:reais|r\$)", c_clean, re.I)
+            cost_val = 0.0
+            if cost_m:
+                val_s = cost_m.group(1) or cost_m.group(2)
+                if val_s:
+                    cost_val = float(val_s.replace(",", "."))
+
+            # Classificação de intenção da cláusula
+            is_rem = any(k in c_lower for k in ("lembr", "avis", "agend", "notific", "calibrar", "estepe", "rodízio", "rodizio")) and any(
+                t in c_lower for t in ("amanh", "hoje", "às", "as", "hora", "h", "dia", "semana", "mês", "mes", "calibr", "estepe", "lembr")
+            )
+            is_maint = any(k in c_lower for k in ("revis", "troc", "manuten", "oleo", "óleo", "filtro", "vela", "pastilha", "freio", "pneu", "alinhamento", "balanceamento"))
             is_odo = any(k in c_lower for k in ("km", "hodometro", "hodômetro", "quilometragem", "odometro", "odômetro", "atualiza", "bateu"))
 
-            if is_maint:
+            if is_rem:
+                time_m = re.search(r"(?:às|as)\s*(\d{1,2})(?::(\d{2})|h)?|\b(\d{1,2})h\b|\b(\d{1,2}):(\d{2})\b", c_lower)
+                hour, minute = 9, 0
+                if time_m:
+                    if time_m.group(1):
+                        hour = int(time_m.group(1))
+                        minute = int(time_m.group(2)) if time_m.group(2) else 0
+                    elif time_m.group(3):
+                        hour = int(time_m.group(3))
+                    elif time_m.group(4):
+                        hour = int(time_m.group(4))
+                        minute = int(time_m.group(5))
+                time_str = f"{hour:02d}:{minute:02d}"
+
+                date_str = "amanhã" if "amanh" in c_lower else "hoje"
+                task_t = c_clean
+                task_t = re.sub(r"^(?:j[áa]\s+salva\s+isso\s+e\s+|j[áa]\s+aproveita\s+e\s+|e\s+)?(?:me\s+)?lembr\w*\s+(?:de\s+)?", "", task_t, flags=re.I).strip()
+                task_t = re.sub(r"(?:amanh[ãa]|hoje|(?:às|as)\s*\d+(?::\d{2}|h)?|\b\d+h\b)\s*(?:de\s+)?", "", task_t, flags=re.I).strip()
+                if not task_t or len(task_t) < 3:
+                    task_t = "Calibrar o estepe" if "estepe" in c_lower else "Lembrete preventivo"
+
+                actions.append({
+                    "intent": IntentType.SET_REMINDER.value,
+                    "target_vehicle_ref": clause_veh_ref,
+                    "is_critical_action": True,
+                    "task_description": task_t,
+                    "description": task_t,
+                    "explicit_time": time_str,
+                    "target_date_str": date_str,
+                })
+
+            elif is_maint:
+                comps = []
+                for term in ["óleo", "filtro", "pastilha", "vela", "correia", "pneu", "amortecedor", "bateria"]:
+                    if term in c_lower:
+                        comps.append(term)
+                desc_val = c_clean
+                if "óleo" in c_lower and "filtro" in c_lower:
+                    desc_val = "Troca de óleo e filtro"
+                elif "óleo" in c_lower:
+                    desc_val = "Troca de óleo"
+
                 actions.append({
                     "intent": IntentType.RECORD_MAINTENANCE.value,
-                    "target_vehicle_ref": c_ref or "Veículo",
+                    "target_vehicle_ref": clause_veh_ref,
                     "is_critical_action": True,
-                    "description": c_clean,
-                    "components": [c_clean],
+                    "description": desc_val,
+                    "components": comps or [c_clean],
+                    "total_cost": cost_val,
                     "odometer_km": km_val,
                     "km": km_val,
                 })
+
             elif is_odo or km_val:
                 actions.append({
                     "intent": IntentType.UPDATE_ODOMETER.value,
-                    "target_vehicle_ref": c_ref or "Veículo",
+                    "target_vehicle_ref": clause_veh_ref,
                     "is_critical_action": True,
                     "description": f"Atualização de hodômetro ({c_clean})",
                     "odometer_km": km_val,
@@ -1368,14 +1475,24 @@ class ConversationService:
                 })
 
         if len(actions) >= 2:
+            intents = [a.get("intent") for a in actions]
+            distinct_intents = set(intents)
+            # 1. Intenções mistas distintas (ex: Manutenção + Lembrete ou Manutenção + Odômetro)
+            if len(distinct_intents) >= 2:
+                return actions
+
+            # 2. Ações para veículos distintos (ex: Civic e Sandero)
             target_refs = [a.get("target_vehicle_ref") for a in actions if a.get("target_vehicle_ref") and a.get("target_vehicle_ref") != "Veículo"]
             distinct_refs = set(target_refs)
             if len(distinct_refs) >= 2:
                 return actions
-            action_verbs = ("fiz", "troquei", "atualiza", "atualizar", "mudei", "cadastra", "registra")
+
+            # 3. Ações distintas com verbos de ação explícitos em cada oração
+            action_verbs = ("fiz", "troquei", "atualiza", "atualizar", "mudei", "cadastra", "registra", "salva", "salvar", "anota")
             clauses_with_verbs = [c for c in clauses if any(v in c.lower().split() for v in action_verbs)]
             if len(clauses_with_verbs) >= 2:
                 return actions
+
             return []
         return []
 
