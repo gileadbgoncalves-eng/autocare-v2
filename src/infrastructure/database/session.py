@@ -104,18 +104,29 @@ async def init_db() -> None:
 
 
 def _ensure_soft_delete_columns(sync_conn) -> None:
-    """Migração aditiva: adiciona `maintenance_records.status` em bancos pré-existentes."""
+    """Migração aditiva: adiciona colunas em bancos pré-existentes."""
     from sqlalchemy import inspect, text
 
     inspector = inspect(sync_conn)
-    if "maintenance_records" not in inspector.get_table_names():
-        return
-    columns = {c["name"] for c in inspector.get_columns("maintenance_records")}
-    if "status" not in columns:
-        sync_conn.execute(
-            text("ALTER TABLE maintenance_records ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'active'")
-        )
-
+    tables = inspector.get_table_names()
+    if "maintenance_records" in tables:
+        columns = {c["name"] for c in inspector.get_columns("maintenance_records")}
+        if "status" not in columns:
+            sync_conn.execute(
+                text("ALTER TABLE maintenance_records ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'active'")
+            )
+    if "users" in tables:
+        columns = {c["name"] for c in inspector.get_columns("users")}
+        if "horario_notificacao_padrao" not in columns:
+            sync_conn.execute(
+                text("ALTER TABLE users ADD COLUMN horario_notificacao_padrao TIME NOT NULL DEFAULT '09:00:00'")
+            )
+    if "reminders" in tables:
+        columns = {c["name"] for c in inspector.get_columns("reminders")}
+        if "data_hora_agendada" not in columns:
+            sync_conn.execute(
+                text("ALTER TABLE reminders ADD COLUMN data_hora_agendada DATETIME NULL")
+            )
 
 
 async def close_db() -> None:

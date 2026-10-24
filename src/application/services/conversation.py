@@ -939,6 +939,24 @@ class ConversationService:
                 elif payload.get("model") and matched_spec["model"] and payload.get("model").lower() == f"{matched_spec['model']} {matched_spec['version']}".lower():
                     payload["model"] = matched_spec["model"]
 
+            # Heurística de complementação para placa, km e ano
+            if not payload.get("plate"):
+                plate_match = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", combined_text)
+                if plate_match:
+                    payload["plate"] = plate_match.group(1).replace("-", "").upper()
+            if not payload.get("odometer_km") and not payload.get("km"):
+                km_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b", combined_text.lower())
+                if km_match:
+                    km_val = int(km_match.group(1))
+                    if "mil" in combined_text.lower() and km_val < 1000:
+                        km_val *= 1000
+                    payload["odometer_km"] = km_val
+                    payload["km"] = km_val
+            if not payload.get("year"):
+                year_match = re.search(r"\b(19\d{2}|20\d{2})\b", combined_text)
+                if year_match:
+                    payload["year"] = int(year_match.group(1))
+
         payload["_action_state"] = context.state.value
         payload["_target_vehicle_ref"] = analysis.target_vehicle_ref
         if discrepancy_warning:
