@@ -7,6 +7,9 @@ de estados conversacionais, invoca o Gemini e assegura o fluxo de confirmação 
 import re
 import asyncio
 import unicodedata
+import logging
+
+logger = logging.getLogger("autocare.conversation")
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 
@@ -530,12 +533,11 @@ class ConversationService:
         fines: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         clean_text = (message_text or "").strip()
+        lock = self._get_user_lock(user_id)
         context = self.get_context(user_id)
 
-        # 0. Registro da mensagem do usuário no histórico recente
-        context.recent_turns.append(ConversationTurn(role="user", content=clean_text))
-        if len(context.recent_turns) > 10:
-            context.recent_turns = context.recent_turns[-10:]
+        # 0. Registro atômico da mensagem e avanço do sequenciador de turnos
+        turn_id = context.advance_turn(clean_text)
 
         text_lower = clean_text.lower()
 
@@ -940,16 +942,39 @@ class ConversationService:
 
         # 3. Estado NORMAL: Envia para o Gemini analisar com contexto completo
         history_dicts = [{"role": t.role, "content": t.content} for t in context.recent_turns]
-        analysis: GeminiAnalysisResponse = await self.gemini.analyze_message(
-            user_id=user_id,
-            current_message=clean_text,
-            history=history_dicts,
-            context=context,
-            vehicles=vehicles,
-            maintenances=maintenances,
-            reminders=reminders,
-            fines=fines,
-        )
+        context_snapshot = context.model_copy(deep=True)
+        if lock.locked():
+            lock.release()
+            need_reacquire = True
+        else:
+            need_reacquire = False
+        try:
+            analysis: GeminiAnalysisResponse = await self.gemini.analyze_message(
+                user_id=user_id,
+                current_message=clean_text,
+                history=history_dicts,
+                context=context_snapshot,
+                vehicles=vehicles,
+                maintenances=maintenances,
+                reminders=reminders,
+                fines=fines,
+            )
+        finally:
+            if need_reacquire:
+                await lock.acquire()
+
+        # Detecção de superação de turno por concorrência (anti-session-corruption)
+        if context.turn_seq > turn_id:
+            logger.info(f"Turno [{turn_id}] de [{user_id}] finalizou atrasado (turno atual: [{context.turn_seq}]). Preservando contexto ativo.")
+            reply = analysis.reply_message
+            if analysis.vehicle:
+                reply = f"Desculpe a demora, a base de placas estava lenta, mas finalizei o cadastro da sua moto {analysis.vehicle.plate or ''}!"
+            return {
+                "reply": reply,
+                "action_type": "async_superseded_completed",
+                "state": context.state.value,
+                "details": {"superseded": True, "turn_id": turn_id, "current_turn": context.turn_seq}
+            }
 
         # Fallback inteligente para intenção de cadastro de veículo (apenas em falha/indisponibilidade do Gemini)
         gemini_failed = (
@@ -1404,16 +1429,27 @@ class ConversationService:
 
         # C) Mensagens complexas, correções de dados, novas instruções ou dúvidas: consulta o Gemini
         history_dicts = [{"role": t.role, "content": t.content} for t in context.recent_turns]
-        analysis = await self.gemini.analyze_message(
-            user_id=user_id,
-            current_message=clean_text,
-            history=history_dicts,
-            context=context,
-            vehicles=vehicles,
-            maintenances=maintenances,
-            reminders=reminders,
-            fines=fines,
-        )
+        context_snapshot = context.model_copy(deep=True)
+        lock = self._get_user_lock(user_id)
+        if lock.locked():
+            lock.release()
+            need_reacquire = True
+        else:
+            need_reacquire = False
+        try:
+            analysis = await self.gemini.analyze_message(
+                user_id=user_id,
+                current_message=clean_text,
+                history=history_dicts,
+                context=context_snapshot,
+                vehicles=vehicles,
+                maintenances=maintenances,
+                reminders=reminders,
+                fines=fines,
+            )
+        finally:
+            if need_reacquire:
+                await lock.acquire()
 
         # Se o Gemini identificar cancelamento explícito
         if analysis.intent == IntentType.CANCEL_ACTION:

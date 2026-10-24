@@ -59,6 +59,18 @@ if not is_sqlite:
 
 engine: AsyncEngine = create_async_engine(DATABASE_ASYNC_URL, **engine_kwargs)
 
+if is_sqlite:
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 # Sessionmaker assíncrono padrão
 async_session_factory = async_sessionmaker(
     bind=engine,

@@ -52,10 +52,11 @@ def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Opti
     if not payload:
         return None, None
 
-    # 1. Payload de teste direto
-    if "user_id" in payload and "message" in payload:
+    # 1. Payload de teste direto ({user_id, message} ou {user_id, text})
+    if "user_id" in payload and ("message" in payload or "text" in payload):
         user_id = "".join(filter(str.isdigit, str(payload["user_id"])))
-        return user_id, str(payload["message"]).strip()
+        raw_msg = payload.get("message") if "message" in payload else payload.get("text")
+        return user_id, str(raw_msg).strip()
 
     # 2. Formato Evolution API
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
@@ -232,6 +233,7 @@ async def send_whatsapp_reply(user_id: str, message: str) -> bool:
 
 
 @router.post("/webhook", status_code=status.HTTP_200_OK)
+@router.post("/webhook/whatsapp", status_code=status.HTTP_200_OK)
 async def receive_webhook(
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_async_session),

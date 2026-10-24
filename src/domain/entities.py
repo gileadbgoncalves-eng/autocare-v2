@@ -145,6 +145,14 @@ class ConversationContext(BaseModel):
     recent_turns: List[ConversationTurn] = Field(default_factory=list, description="Últimos turnos de diálogo para injeção de contexto no Gemini")
     updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
     draft_updated_at: Optional[dt.datetime] = Field(default=None, description="Última atividade do rascunho pendente (base do TTL, UTC)")
+    turn_seq: int = Field(default=0, description="Contador sequencial monótono de turnos para controle de concorrência")
+
+    def advance_turn(self, content: str) -> int:
+        self.turn_seq += 1
+        self.recent_turns.append(ConversationTurn(role="user", content=content))
+        if len(self.recent_turns) > 10:
+            self.recent_turns = self.recent_turns[-10:]
+        return self.turn_seq
 
     def is_awaiting_confirmation(self) -> bool:
         """Verifica se o usuário está em um estado que aguarda resposta afirmativa/negativa explícita."""

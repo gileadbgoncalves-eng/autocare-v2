@@ -38,7 +38,7 @@ Seus campos principais são:
 
 [2. CLASSIFICAÇÃO RIGOROSA DE INTENÇÕES (IntentType)]
 - REGISTER_VEHICLE: Quando o condutor quer cadastrar ou adicionar um carro, moto ou caminhonete à sua garagem.
-- RECORD_MAINTENANCE: Quando o condutor relata um serviço realizado (troca de óleo, filtros, pastilhas, pneus, revisão, vela, correia dentada, bateria).
+- RECORD_MAINTENANCE: Quando o condutor relata um serviço realizado, manutenção ou despesa de consumo (troca de óleo, filtros, pastilhas, pneus, revisão, vela, correia dentada, bateria, abastecimento de combustível). Abastecimentos com valor financeiro relatado (ex: "Abasteci 40L por R$ 220") devem ser classificados como RECORD_MAINTENANCE com total_cost e components=["abastecimento"].
 - SET_REMINDER: Quando o usuário pede um lembrete preventivo ou aviso por data/hora ou quilometragem ("me lembra de calibrar pneus na sexta", "avisa da troca de óleo em 6 meses", "lembrete daqui a 15 minutos").
 - REGISTER_FINE: Notificação ou registro de multa/infração de trânsito e pontuação na CNH.
 - RESET_GARAGE: Solicitação expressa para zerar, limpar ou apagar todos os veículos da garagem.

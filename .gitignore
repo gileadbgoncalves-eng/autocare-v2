@@ -8,6 +8,8 @@ venv/
 
 # Bancos de dados locais
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
 
 # Arquivos temporários, binários e executáveis
