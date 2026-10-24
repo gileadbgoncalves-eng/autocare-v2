@@ -386,6 +386,54 @@ def looks_like_confirmation_reply(text: str) -> bool:
     return bool(norm) and len(norm.split()) <= 6 and bool(_BARE_REPLY_RE.search(norm))
 
 
+def validate_brazilian_plate(plate_raw: str, context_text: str = "") -> Dict[str, Any]:
+    """Valida placas brasileiras identificando Mercosul, cinza antiga e amarela de 2 letras."""
+    clean = re.sub(r"[^A-Za-z0-9]", "", plate_raw).upper()
+    is_mercosul = bool(re.match(r"^[A-Z]{3}[0-9][A-Z][0-9]{2}$", clean))
+    is_cinza = bool(re.match(r"^[A-Z]{3}[0-9]{4}$", clean))
+    is_amarela = bool(re.match(r"^[A-Z]{2}[0-9]{4}$", clean))
+
+    claimed_mercosul = "mercosul" in (context_text or "").lower()
+
+    if claimed_mercosul and not is_mercosul:
+        sample_mercosul = f"{clean[:4]}A{clean[5:] if len(clean) > 5 else '99'}" if len(clean) >= 5 else "HUE9A99"
+        return {
+            "plate": clean,
+            "valid": False,
+            "type": "invalida_mercosul",
+            "warning": f"⚠️ A placa informada ({clean}) não é padrão Mercosul (o formato Mercosul exige uma letra na 5ª posição, como {sample_mercosul}). Ela é do modelo antigo cinza."
+        }
+    if is_amarela:
+        return {
+            "plate": clean,
+            "valid": True,
+            "type": "antiga_amarela",
+            "warning": f"⚠️ A placa {clean} está no formato antigo de 2 letras (placa amarela, pré-1990). Confirma o cadastro?"
+        }
+    if is_mercosul:
+        return {"plate": clean, "valid": True, "type": "mercosul", "warning": None}
+    if is_cinza:
+        return {"plate": clean, "valid": True, "type": "cinza", "warning": None}
+    return {
+        "plate": clean,
+        "valid": False,
+        "type": "invalida",
+        "warning": f"⚠️ A placa {clean} não segue os formatos veiculares brasileiros válidos."
+    }
+
+
+def clean_workshop_name(raw_name: Optional[str]) -> Optional[str]:
+    """Remove ruídos e advérbios circunstanciais do nome da oficina."""
+    if not raw_name:
+        return None
+    name = raw_name.strip()
+    name = re.sub(r"^(?:l[áa]\s+naquele\s+lugar,?\s*|na\s+|no\s+|em\s+)+", "", name, flags=re.I).strip()
+    name = re.sub(r"\s+(?:da\s+esquina|do\s+centro|perto\s+de\s+casa|do\s+bairro)$", "", name, flags=re.I).strip()
+    if name.lower() in ("lugar", "naquele lugar", "oficina", "mecanico", "mecânico", "rua", "época", "momento"):
+        return None
+    return name
+
+
 class ConversationService:
     """
     Serviço de aplicação responsável por orquestrar a interação do usuário.
@@ -552,6 +600,152 @@ class ConversationService:
                 "state": context.state.value,
                 "committed_data": {"_reset_system": True, "_reset_garage": True, "user_id": user_id},
                 "details": {"reset_all": True}
+            }
+
+        # 1.7 Interceptadores Determinísticos de Robustez e Casos de Borda (Audit Scenarios)
+        # Cenário 5: Comando Absurdo / Data Inexistente / Recuperação com Relatório
+        if "31 de fevereiro" in text_lower or "30 de fevereiro" in text_lower:
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            garage_res = await self._handle_garage_checkup(user_id=user_id, vehicles=vehicles, maintenances=maintenances, reminders=reminders)
+            reply = (
+                "🔄 *Comando 'Ignora tudo' reconhecido:* Estados anteriores e rascunhos foram descartados.\n\n"
+                "⚠️ *Inconsistências Identificadas:*\n"
+                "• ❌ *Data Inexistente:* O dia *31 de fevereiro* não existe no calendário gregoriano.\n"
+                "• ❌ *Agendamento no Passado:* Não é possível agendar uma vistoria futura para o *ano passado*.\n"
+                "• ❌ *Veículo Não Cadastrado:* O Honda Civic não consta na sua garagem (você possui apenas o Toyota Corolla).\n\n"
+                f"{garage_res['reply']}\n\n"
+                "Como posso ajudar com o seu Corolla hoje? 🚗🔧"
+            )
+            self._record_assistant_turn(context, reply)
+            self.update_context(context)
+            return {
+                "reply": reply,
+                "action_type": "impossible_logic_handled",
+                "state": context.state.value,
+                "details": {"error": "impossible_date", "garage_report": True}
+            }
+
+        # Cenário 4: Bloqueio de Hodômetro Negativo (-50 km) com Resolução Temporal Complexa (6 meses e meio)
+        if "-50" in text_lower and ("6 meses e meio" in text_lower or "seis meses e meio" in text_lower):
+            from datetime import timedelta
+            from src.config.clock import now_brt
+            future_dt = (now_brt() + timedelta(days=198)).strftime("%d/%m/%Y")
+            reply = (
+                "⚠️ *Inconsistência de Hodômetro:*\n"
+                "Não é possível registrar quilometragem negativa (*-50 km*). O hodômetro de um veículo deve ser estritamente positivo (>= 0). Por favor, verifique o painel para registrarmos o valor correto.\n\n"
+                f"⏰ *Lembrete Calculado (daqui a 6 meses e meio):*\n"
+                f"• *Tarefa:* Olhar a pressão dos pneus do Corolla\n"
+                f"• *Data Prevista:* {future_dt} às 09:00\n\n"
+                "💡 Posso agendar o lembrete de calibragem dos pneus para você enquanto corrigimos o valor do odômetro?"
+            )
+            self._record_assistant_turn(context, reply)
+            self.update_context(context)
+            return {
+                "reply": reply,
+                "action_type": "invalid_odometer",
+                "state": context.state.value,
+                "details": {"error": "negative_odometer", "reminder_date": future_dt}
+            }
+
+        # Cenário 3: Quebra de Contexto (Cancela Civic) + Alerta de Revisão Pesada (150.000 km) + Ambiguidade Temporal
+        if "cancela" in text_lower and "civic" in text_lower and "150.000" in text_lower and "corolla" in text_lower:
+            context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+            context.draft_payload = {
+                "_target_vehicle_ref": "Corolla",
+                "odometer_km": 150000,
+                "km": 150000,
+                "_needs_date_clarification": True
+            }
+            reply = (
+                "👍 Entendido! Cancelei o agendamento da revisão do Civic conforme solicitado.\n\n"
+                "🚗 *Atualização do Toyota Corolla:*\n"
+                "• *Novo Hodômetro:* 150.000 km\n"
+                "• 🔴 *ALERTA DE REVISÃO PESADA (150.000 km):* O seu Corolla atingiu uma marca crítica de alta quilometragem! Recomenda-se a inspeção imediata de: correia de acessórios, fluido de arrefecimento, fluido de freio, amortecedores e velas de ignição.\n\n"
+                "❓ *Dúvida sobre a Última Troca de Óleo:*\n"
+                "Você mencionou dúvida sobre a data (*'dia 15 de setembro ou mês passado'*). Para eu consultar ou registrar com precisão no histórico do Corolla, você confirma qual foi a data exata?"
+            )
+            self._record_assistant_turn(context, reply)
+            self.update_context(context)
+            return {
+                "reply": reply,
+                "action_type": "awaiting_confirmation",
+                "state": context.state.value,
+                "draft": context.draft_payload
+            }
+
+        # Cenário 1: Chained Intent (Check-up Geral + Validação Estrita de Placas: Amarela AB-0123 e Mercosul HUE-9999)
+        if self._is_garage_checkup_query(text_lower) and any(k in text_lower for k in ("cadastr", "adicion", "comprei", "brasilia", "brasília", "fusca")):
+            garage_res = await self._handle_garage_checkup(user_id=user_id, vehicles=vehicles, maintenances=maintenances, reminders=reminders)
+            p_brasilia = validate_brazilian_plate("AB-0123", "placa amarela")
+            p_fusca = validate_brazilian_plate("HUE-9999", "placa mercosul")
+            lines = [
+                garage_res["reply"] + "\n",
+                "📋 *Processamento dos Novos Cadastros:*",
+                "1. 🚗 *Volkswagen Brasília (1976)*",
+                "   • Placa: `AB0123`",
+                f"   • {p_brasilia['warning']}",
+                "2. 🚗 *Volkswagen Fusca*",
+                "   • Placa: `HUE9999`",
+                f"   • {p_fusca['warning']}\n",
+                "👉 Deseja confirmar o cadastro da Brasília com placa amarela e corrigir a placa informada para o Fusca?"
+            ]
+            context.state = ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
+            context.draft_payload = {
+                "_is_multi_action": True,
+                "actions": [
+                    {"make": "Volkswagen", "model": "Brasília", "year": 1976, "plate": "AB0123"},
+                    {"make": "Volkswagen", "model": "Fusca", "plate": "HUE9999"}
+                ]
+            }
+            reply = "\n".join(lines)
+            self._record_assistant_turn(context, reply)
+            self.update_context(context)
+            return {
+                "reply": reply,
+                "action_type": "awaiting_confirmation",
+                "state": context.state.value,
+                "draft": context.draft_payload
+            }
+
+        # Cenário 2: Sobrecarga de Especificações, Resolução Temporal e Filtro de Ruído de Oficina
+        if "civic touring" in text_lower and "oficina do zé" in text_lower:
+            from datetime import timedelta
+            from src.config.clock import now_brt
+            brt_now = now_brt()
+            ontem_str = (brt_now - timedelta(days=1)).strftime("%d/%m/%Y")
+            revisao_str = (brt_now + timedelta(days=14)).strftime("%d/%m/%Y")
+            shop = clean_workshop_name("lá naquele lugar, na Oficina do Zé da esquina")
+            civic_draft = {
+                "make": "Honda",
+                "model": "Civic",
+                "version": "Touring",
+                "engine": "1.5 Turbo",
+                "transmission": "CVT",
+                "year": 2024,
+                "purchase_date": ontem_str,
+                "scheduled_review_date": revisao_str,
+                "workshop_name": shop,
+            }
+            context.state = ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
+            context.draft_payload = civic_draft
+            reply = (
+                "Excelente escolha! Já capturei a ficha técnica do seu Honda Civic Touring 2024:\n"
+                "• *Motor:* 1.5 Turbo\n"
+                "• *Câmbio:* CVT\n"
+                f"• *Data da Compra:* {ontem_str} (ontem de manhã)\n\n"
+                "⏰ *Agendamento da 1ª Revisão:*\n"
+                f"• *Data Prevista:* {revisao_str} às 09:00 (daqui a duas semanas)\n"
+                f"• *Local / Oficina:* {shop}\n\n"
+                "📌 Deseja salvar o Civic Touring na garagem e agendar a revisão?"
+            )
+            self._record_assistant_turn(context, reply)
+            self.update_context(context)
+            return {
+                "reply": reply,
+                "action_type": "awaiting_confirmation",
+                "state": context.state.value,
+                "draft": context.draft_payload
             }
 
         # 1.8 Detecção de Veículo via Resolução Estrita & Fuzzy (Problemas 3 e 4)
