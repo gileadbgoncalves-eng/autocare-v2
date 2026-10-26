@@ -5,6 +5,7 @@ Ponto de entrada assíncrono para eventos e mensagens de provedores de WhatsApp
 """
 
 import logging
+import re
 from datetime import datetime, date, timedelta, time
 from typing import Dict, Any, Optional, Tuple, List
 from fastapi import APIRouter, Depends, status
@@ -280,6 +281,7 @@ async def receive_webhook(
     # 4. Se o usuário confirmou uma ação crítica pendente ou acionou o reset do sistema
     if action_type in ("action_confirmed", "system_reset", "action_confirmed_with_chained_reminder") and committed_data:
         try:
+            now_ts = conversation_service._utcnow()
             action_state = committed_data.get("_action_state", "")
 
             # Caso Multi-Ação em Lote (Problema 1)
@@ -304,6 +306,7 @@ async def receive_webhook(
                             km=int(km_val) if km_val is not None else None,
                             total_cost=float(cost_val or 0.0),
                             workshop_name=act.get("workshop_name"),
+                            created_at=now_ts,
                         )
                         saved_maint = await maintenance_repo.add_record(new_maint)
                         logger.info(f"Multi-ação: Manutenção [{saved_maint.id}] salva para veículo [{target_vehicle_id}]")
@@ -353,6 +356,7 @@ async def receive_webhook(
                             description=task_desc,
                             due_datetime=due_dt,
                             due_km=act.get("due_km") or act.get("target_km"),
+                            created_at=now_ts,
                         )
                         saved_reminder = await reminder_repo.add_reminder(new_reminder)
                         logger.info(f"Multi-ação: Lembrete [{saved_reminder.id}] cadastrado para veículo [{target_veh_id}]")
@@ -387,6 +391,7 @@ async def receive_webhook(
                     vehicle_type=VehicleType(committed_data.get("vehicle_type", "carro")) if committed_data.get("vehicle_type") in [e.value for e in VehicleType] else VehicleType.CARRO,
                     fuel_type=FuelType(committed_data.get("fuel_type", "flex")) if committed_data.get("fuel_type") in [e.value for e in FuelType] else FuelType.FLEX,
                     usage_profile=UsageProfile(committed_data.get("usage_profile", "convencional")) if committed_data.get("usage_profile") in [e.value for e in UsageProfile] else UsageProfile.CONVENCIONAL,
+                    created_at=now_ts,
                 )
                 saved_vehicle = await vehicle_repo.add_vehicle(new_vehicle)
                 logger.info(f"Veículo [{saved_vehicle.id}] cadastrado para o condutor [{user_id}]")
@@ -414,6 +419,7 @@ async def receive_webhook(
                     description=task_desc,
                     due_datetime=due_dt,
                     due_km=committed_data.get("due_km"),
+                    created_at=now_ts,
                 )
                 saved_reminder = await reminder_repo.add_reminder(new_reminder)
                 logger.info(f"Lembrete [{saved_reminder.id}] cadastrado para o condutor [{user_id}]")
@@ -435,6 +441,7 @@ async def receive_webhook(
                         points=int(committed_data.get("points", 0) or 0),
                         amount=float(amt or 0.0),
                         discounted_amount=float(committed_data.get("discounted_amount", 0.0) or 0.0),
+                        created_at=now_ts,
                     )
                     saved_fine = await fine_repo.add_fine(new_fine)
                     logger.info(f"Multa [{saved_fine.id}] cadastrada para o veículo [{target_vehicle_id}]")
@@ -465,6 +472,7 @@ async def receive_webhook(
                         labor_cost=float(committed_data.get("labor_cost", 0.0) or 0.0),
                         workshop_name=committed_data.get("workshop_name"),
                         parts_brand=committed_data.get("parts_brand"),
+                        created_at=now_ts,
                     )
                     saved_maint = await maintenance_repo.add_record(new_maintenance)
                     logger.info(f"Manutenção [{saved_maint.id}] salva para o veículo [{target_vehicle_id}]")
@@ -506,6 +514,7 @@ async def receive_webhook(
                     description=c_rem.get("task_description", "Revisão preventiva"),
                     due_datetime=target_dt,
                     data_hora_agendada=target_dt,
+                    created_at=now_ts,
                 )
                 await reminder_repo.add_reminder(new_reminder)
 
@@ -546,7 +555,8 @@ async def receive_webhook(
     # 5.5 Escape Global: soft delete (status='cancelled') do último registro dos últimos 5 minutos
     elif action_type == "undo_last_record":
         try:
-            cancelled = await soft_delete_last_user_record(session, user_id)
+            now_ts = conversation_service._utcnow()
+            cancelled = await soft_delete_last_user_record(session, user_id, now=now_ts)
             total = len(cancelled["maintenance_ids"]) + len(cancelled["reminder_ids"])
             if total:
                 logger.info(f"Desfazer [{user_id}]: cancelados {cancelled}")

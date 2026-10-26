@@ -413,14 +413,12 @@ class MaintenanceRepository:
         total = result.scalar()
         return float(total) if total is not None else 0.0
 
-    async def get_by_user_id(self, user_id: str, limit: int = 50) -> List[MaintenanceRecord]:
+    async def get_by_user_id(self, user_id: str, limit: int = 50, include_cancelled: bool = False) -> List[MaintenanceRecord]:
         """Retorna histórico cronológico de todas as manutenções dos veículos do usuário."""
-        stmt = (
-            select(MaintenanceRecordModel)
-            .where(MaintenanceRecordModel.user_id == user_id, MaintenanceRecordModel.status != RecordStatus.CANCELLED.value)
-            .order_by(desc(MaintenanceRecordModel.date), desc(MaintenanceRecordModel.id))
-            .limit(limit)
-        )
+        stmt = select(MaintenanceRecordModel).where(MaintenanceRecordModel.user_id == user_id)
+        if not include_cancelled:
+            stmt = stmt.where(MaintenanceRecordModel.status != RecordStatus.CANCELLED.value)
+        stmt = stmt.order_by(desc(MaintenanceRecordModel.date), desc(MaintenanceRecordModel.id)).limit(limit)
         result = await self.session.execute(stmt)
         models = result.scalars().all()
         return [self._to_entity(m) for m in models]
@@ -472,12 +470,11 @@ class ReminderRepository:
         await self.session.refresh(new_model)
         return self._to_entity(new_model)
 
-    async def get_by_user_id(self, user_id: str) -> List[Reminder]:
-        stmt = (
-            select(ReminderModel)
-            .where(ReminderModel.user_id == user_id, ReminderModel.status != ReminderStatus.CANCELLED.value)
-            .order_by(desc(ReminderModel.created_at))
-        )
+    async def get_by_user_id(self, user_id: str, include_cancelled: bool = False) -> List[Reminder]:
+        stmt = select(ReminderModel).where(ReminderModel.user_id == user_id)
+        if not include_cancelled:
+            stmt = stmt.where(ReminderModel.status != ReminderStatus.CANCELLED.value)
+        stmt = stmt.order_by(desc(ReminderModel.created_at))
         result = await self.session.execute(stmt)
         models = result.scalars().all()
         return [self._to_entity(m) for m in models]

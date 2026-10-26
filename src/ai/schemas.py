@@ -84,9 +84,16 @@ class MaintenanceDraft(BaseModel):
             "ano passado", "semana passada", "auto center", "centro automotivo",
             "período", "periodo", "na época", "na epoca", "naquele dia", "naquele momento",
             "ali", "lá", "la", "aqui", "posto", "posto de gasolina", "posto de combustível",
-            "concessionária autorizada", "oficina mecânica"
+            "concessionária autorizada", "oficina mecânica", "na rua", "na rua mesmo", "rua mesmo"
         }
-        if v_lower in blacklist or v_lower.startswith("na época") or v_lower.startswith("na epoca"):
+        if (
+            v_lower in blacklist
+            or v_lower.startswith("na época")
+            or v_lower.startswith("na epoca")
+            or v_lower.startswith("na rua")
+            or "na rua" in v_lower
+            or "rua mesmo" in v_lower
+        ):
             return None
         return v_clean
 
@@ -189,6 +196,11 @@ class ActionDraft(BaseModel):
     reminder: Optional[ReminderDraft] = Field(default=None)
     fine: Optional[FineDraft] = Field(default=None)
     extracted_entities: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("workshop_name", mode="before")
+    @classmethod
+    def validate_action_workshop_name(cls, v: Optional[str]) -> Optional[str]:
+        return MaintenanceDraft.validate_workshop_name(v)
 
     @model_validator(mode="after")
     def sync_nested_drafts(self) -> "ActionDraft":

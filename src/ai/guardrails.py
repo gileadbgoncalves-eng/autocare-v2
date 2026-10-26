@@ -72,7 +72,8 @@ _AUTOMOTIVE_RE = re.compile(
     r"motor|km|quilometragem|odometro|hodometro|placa|revisao|manutencao|oficina|mecanico|mecanica|"
     r"bateria|embreagem|suspensao|correia|vela|velas|filtro|alinhamento|balanceamento|abasteci|"
     r"abastecimento|gasolina|etanol|diesel|combustivel|multa|multas|infracao|cnh|ipva|licenciamento|"
-    r"seguro|garagem|lembrete|lembra|civic|corolla|sandero|compass|gol|onix|hb20|strada|nivus|"
+    r"seguro|garagem|lembrete|lembra|civic|corolla|sandero|compass|gol|onix|hb20|strada|nivus|fiorino|"
+    r"farol|lampada|troquei|troca|pastilha|pastilhas|amortecedor|aditivo|higienizacao|"
     r"fiat|honda|toyota|chevrolet|volkswagen|hyundai|jeep|renault|ford|nissan|yamaha|fazer|titan)\b"
 )
 

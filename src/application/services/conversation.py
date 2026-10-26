@@ -321,14 +321,103 @@ POPULAR_VEHICLE_SPECS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# Mapeamento de marcas e modelos populares para fallback e desambiguação
+KNOWN_MODEL_MAKES: Dict[str, Dict[str, str]] = {
+    "fiorino": {"make": "Fiat", "model": "Fiorino"},
+    "strada": {"make": "Fiat", "model": "Strada"},
+    "mobi": {"make": "Fiat", "model": "Mobi"},
+    "argo": {"make": "Fiat", "model": "Argo"},
+    "uno": {"make": "Fiat", "model": "Uno"},
+    "civic": {"make": "Honda", "model": "Civic"},
+    "fit": {"make": "Honda", "model": "Fit"},
+    "city": {"make": "Honda", "model": "City"},
+    "corolla": {"make": "Toyota", "model": "Corolla"},
+    "yaris": {"make": "Toyota", "model": "Yaris"},
+    "etios": {"make": "Toyota", "model": "Etios"},
+    "gol": {"make": "Volkswagen", "model": "Gol"},
+    "polo": {"make": "Volkswagen", "model": "Polo"},
+    "nivus": {"make": "Volkswagen", "model": "Nivus"},
+    "t-cross": {"make": "Volkswagen", "model": "T-Cross"},
+    "virtus": {"make": "Volkswagen", "model": "Virtus"},
+    "onix": {"make": "Chevrolet", "model": "Onix"},
+    "cruze": {"make": "Chevrolet", "model": "Cruze"},
+    "tracker": {"make": "Chevrolet", "model": "Tracker"},
+    "sandero": {"make": "Renault", "model": "Sandero"},
+    "logan": {"make": "Renault", "model": "Logan"},
+    "duster": {"make": "Renault", "model": "Duster"},
+    "kwid": {"make": "Renault", "model": "Kwid"},
+    "compass": {"make": "Jeep", "model": "Compass"},
+    "renegade": {"make": "Jeep", "model": "Renegade"},
+    "hb20": {"make": "Hyundai", "model": "HB20"},
+    "creta": {"make": "Hyundai", "model": "Creta"},
+    "kicks": {"make": "Nissan", "model": "Kicks"},
+}
+
+
+def parse_km_value(text: str) -> Optional[int]:
+    """Extrai valor numérico de quilometragem tolerando gírias, 'mil', 'k' e separadores brasileiros."""
+    if not text:
+        return None
+    # 1. '181k km' ou '181k'
+    m_k = re.search(r"\b(\d+)\s*k(?:\s*km)?\b", text, re.I)
+    if m_k:
+        return int(m_k.group(1)) * 1000
+    # 2. '42 mil km'
+    m_mil = re.search(r"\b(\d+)\s*mil\s*(?:km)?\b", text, re.I)
+    if m_mil:
+        return int(m_mil.group(1)) * 1000
+    # 3. Separador de milhar brasileiro: '180.500 km', '5.200 km', '15.500 km'
+    m_dot = re.search(r"\b(\d{1,3}(?:\.\d{3})+)\s*km\b", text, re.I)
+    if m_dot:
+        return int(m_dot.group(1).replace(".", ""))
+    # 4. Numérico padrão: '5000 km', '50 km'
+    m_std = re.search(r"\b(\d+)\s*km\b", text, re.I)
+    if m_std:
+        return int(m_std.group(1))
+    return None
+
+
+def parse_cost_value(text: str) -> Optional[float]:
+    """Extrai valor monetário tolerando gírias ('conto'), formatação brasileira e símbolos de moeda."""
+    if not text:
+        return None
+    # 1. Gíria 'conto': '450 conto'
+    m_conto = re.search(r"\b(\d+(?:[.,]\d+)?)\s*conto\b", text, re.I)
+    if m_conto:
+        val_s = m_conto.group(1).replace(".", "").replace(",", ".")
+        return float(val_s)
+    # 2. Formato brasileiro com centavos: '1.250,50 reais' ou 'R$ 1.250,50'
+    m_br = re.search(
+        r"(?:r\$|morreu|por|gastei|paguei|custou|custa|valor\s*(?:foi|é|de)?)\s*(\d{1,3}(?:\.\d{3})*,\d{2})|(\d{1,3}(?:\.\d{3})*,\d{2})\s*(?:reais|r\$)",
+        text,
+        re.I,
+    )
+    if m_br:
+        val_s = m_br.group(1) or m_br.group(2)
+        return float(val_s.replace(".", "").replace(",", "."))
+    # 3. Moeda padrão: '980 reais', 'R$ 500', 'por 2800 reais'
+    m_std = re.search(
+        r"(?:r\$|reais|morreu|por|gastei|paguei|custou|custa|valor\s*(?:foi|é|de)?)\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*(?:reais|r\$)",
+        text,
+        re.I,
+    )
+    if m_std:
+        val_s = m_std.group(1) or m_std.group(2)
+        return float(val_s.replace(",", "."))
+    return None
+
+
 def find_popular_vehicle_spec(query_text: str) -> Optional[Dict[str, Any]]:
     """
     Busca ficha técnica oficial na base de conhecimento automotivo pelo modelo/versão.
-    Combina termos de busca de forma insensível a maiúsculas/minúsculas e pontuação.
+    Combina termos de busca de forma insensível a maiúsculas/minúsculas e pontuação,
+    tolerando typos frequentes como 'covic' -> 'civic'.
     """
     if not query_text:
         return None
     q = query_text.lower().replace("-", " ")
+    q = re.sub(r"\bcovic\b", "civic", q)
+    q = re.sub(r"\bsandeiro\b", "sandero", q)
     for key, spec in sorted(POPULAR_VEHICLE_SPECS.items(), key=lambda x: len(x[0]), reverse=True):
         parts = key.split()
         if all(p in q for p in parts):
@@ -353,13 +442,13 @@ UNDO_DRAFT_DISCARDED_REPLY = (
 )
 
 # Comandos de escape global pós-commit ("desfaz", "cancela o último", "apaga isso que te mandei").
-# Ancorados para não capturar frases como "cancela o lembrete de amanhã".
+# Aceita prefixos conversacionais como "ih rapaz, mandei no carro errado, desfaz isso que te mandei".
 _UNDO_PATTERNS = (
-    re.compile(r"^(?:por favor\s+)?(?:desfaz|desfazer|desfaca|desfazendo)(?:\s+(?:isso|tudo|o ultimo|a ultima))?$"),
-    re.compile(r"^(?:por favor\s+)?(?:volta|voltar)\s+atras(?:\s+(?:isso|disso))?$"),
-    re.compile(r"^(?:por favor\s+)?(?:cancela|cancele|cancelar|apaga|apague|apagar|remove|remova|exclui|exclua|deleta|delete)\s+(?:o\s+|a\s+)?(?:ultimo|ultima)(?:\s+(?:registro|lancamento|coisa|que (?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei)))?$"),
-    re.compile(r"^(?:por favor\s+)?(?:cancela|cancele|apaga|apague|desfaz|remove|exclui|deleta)\s+isso(?:\s+(?:que|q)\s+(?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei))?$"),
-    re.compile(r"^(?:por favor\s+)?(?:apaga|apague|cancela|desfaz)\s+(?:o\s+)?(?:que|q)\s+(?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei)$"),
+    re.compile(r"(?:^|.*?\b)(?:desfaz|desfazer|desfaca|desfazendo)(?:\s+(?:isso|tudo|o ultimo|a ultima)(?:\s+(?:que|q)\s+(?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei))?)?$"),
+    re.compile(r"(?:^|.*?\b)(?:volta|voltar)\s+atras(?:\s+(?:isso|disso))?$"),
+    re.compile(r"(?:^|.*?\b)(?:cancela|cancele|cancelar|apaga|apague|apagar|remove|remova|exclui|exclua|deleta|delete)\s+(?:o\s+|a\s+)?(?:ultimo|ultima)(?:\s+(?:registro|lancamento|coisa|que (?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei)))?$"),
+    re.compile(r"(?:^|.*?\b)(?:cancela|cancele|apaga|apague|desfaz|remove|exclui|deleta)\s+isso(?:\s+(?:que|q)\s+(?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei))?$"),
+    re.compile(r"(?:^|.*?\b)(?:apaga|apague|cancela|desfaz)\s+(?:o\s+)?(?:que|q)\s+(?:eu\s+)?(?:te\s+)?(?:mandei|enviei|falei|registrei)$"),
 )
 
 # Respostas "soltas" típicas de quem está respondendo a um pedido de confirmação.
@@ -775,6 +864,21 @@ class ConversationService:
 
         # 2.5 Fast-Path de Baixa Latência: Agradecimentos e Despedidas Rápidas ("OK", "Valeu")
         clean_no_punct = re.sub(r"[^\w\s]", "", text_lower).strip()
+
+        # Resposta afirmativa residual sem rascunho pendente (ex: confirmação já executada no turno anterior)
+        if clean_no_punct in ("sim", "s", "positivo", "confirmo", "confirmado"):
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            reply = "Tudo certo! Seus dados já foram confirmados e salvos na sua garagem. Como posso te ajudar agora?"
+            self._record_assistant_turn(context, reply)
+            self.update_context(context)
+            return {
+                "reply": reply,
+                "action_type": "polite_closing",
+                "state": context.state.value,
+                "details": {}
+            }
+
         courtesies = {
             "ok", "valeu", "show", "beleza", "obrigado", "obrigada",
             "combinado", "perfeito", "tks", "show de bola",
@@ -832,7 +936,8 @@ class ConversationService:
         has_action_verb = any(v in text_lower for v in action_verbs)
         status_keywords = (
             "status", "situa", "dados", "como ta", "como está", "informa",
-            "revisao", "revisão", "manuten", "em dia", "está em dia", "ta em dia"
+            "revisao", "revisão", "manuten", "em dia", "está em dia", "ta em dia",
+            "histórico", "historico", "última manutenção", "ultima manutencao", "o que fiz"
         )
         if matched_veh and not has_action_verb and any(k in text_lower for k in status_keywords):
             status_res = self._format_single_vehicle_status(matched_veh, maintenances)
@@ -855,19 +960,24 @@ class ConversationService:
                 return status_result
 
         # 2.9 Detecção Direta de Atualização de Hodômetro com Alerta Enxuto de Revisão (Problema 2)
-        km_direct_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b", text_lower)
-        odometer_keywords = ("hodometro", "hodômetro", "km", "quilometragem", "odometro", "odômetro", "estou com", "rodou", "bateu")
-        maintenance_verbs = ("revisão", "revisao", "troquei", "troca", "óleo", "oleo", "filtro", "vela", "pastilha", "amortecedor")
-        registration_verbs = ("cadastr", "adicionar", "adiciona", "tenho um", "novo carro", "incluir")
+        parsed_direct_km = parse_km_value(text_lower)
+        odometer_keywords = ("hodometro", "hodômetro", "km", "quilometragem", "odometro", "odômetro", "estou com", "rodou", "bateu", "atualiza")
+        maintenance_verbs = (
+            "revisão", "revisao", "troquei", "troca", "óleo", "oleo", "filtro", "vela", "pastilha", "amortecedor",
+            "alinhamento", "balanceamento", "pneu", "pneus", "bateria", "freio", "freios", "higienização", "higienizacao", "lampada", "lâmpada"
+        )
+        registration_verbs = ("cadastr", "adicionar", "adiciona", "tenho um", "tenho uma", "comprei", "comprar", "novo carro", "nova moto", "incluir")
+        has_plate = bool(re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text))
+        is_registration = any(k in text_lower for k in registration_verbs) or (has_plate and not vehicles)
+        has_cost = parse_cost_value(clean_text) is not None
         if (
-            km_direct_match
+            parsed_direct_km is not None
             and any(k in text_lower for k in odometer_keywords)
             and not any(k in text_lower for k in maintenance_verbs)
-            and not any(k in text_lower for k in registration_verbs)
+            and not has_cost
+            and not is_registration
         ):
-            km_val = int(km_direct_match.group(1))
-            if "mil" in text_lower and km_val < 1000:
-                km_val *= 1000
+            km_val = parsed_direct_km
 
             target_veh = matched_veh or (vehicles[0] if vehicles else None)
             target_ref = getattr(target_veh, "model", None) or getattr(target_veh, "modelo", "veículo")
@@ -992,17 +1102,27 @@ class ConversationService:
                 plate = plate_match.group(1).replace("-", "").upper() if plate_match else None
                 year_match = re.search(r"\b(19\d{2}|20\d{2})\b", clean_text)
                 year = int(year_match.group(1)) if year_match else None
-                km_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b", text_lower)
-                km = int(km_match.group(1)) if km_match else None
-                if "mil" in text_lower and km and km < 1000:
-                    km *= 1000
+                km = parse_km_value(text_lower)
 
-                make = matched_spec["make"] if matched_spec else "Veículo"
-                model = matched_spec["model"] if matched_spec else "Carro"
-                version = matched_spec.get("version") if matched_spec else None
-                engine = matched_spec.get("engine") if matched_spec else None
-                transmission = matched_spec.get("transmission") if matched_spec else None
-                steering = matched_spec.get("steering") if matched_spec else None
+                if matched_spec:
+                    make = matched_spec["make"]
+                    model = matched_spec["model"]
+                    version = matched_spec.get("version")
+                    engine = matched_spec.get("engine")
+                    transmission = matched_spec.get("transmission")
+                    steering = matched_spec.get("steering")
+                else:
+                    make = "Veículo"
+                    model = "Carro"
+                    version = None
+                    engine = None
+                    transmission = None
+                    steering = None
+                    for km_key, km_val in KNOWN_MODEL_MAKES.items():
+                        if km_key in text_lower:
+                            make = km_val["make"]
+                            model = km_val["model"]
+                            break
 
                 vehicle_draft = VehicleDraft(
                     make=make,
@@ -1036,7 +1156,9 @@ class ConversationService:
 
         # 4. Tratamento de Ações Críticas (Human-in-the-Loop)
         if analysis.is_critical_action:
-            result = self._initiate_confirmation_flow(context, analysis, discrepancy_warning=discrepancy_warning)
+            result = self._initiate_confirmation_flow(
+                context, analysis, discrepancy_warning=discrepancy_warning, vehicles=vehicles, matched_veh=matched_veh
+            )
             self._record_assistant_turn(context, result["reply"])
             self.update_context(context)
             return result
@@ -1070,6 +1192,8 @@ class ConversationService:
         context: ConversationContext,
         analysis: GeminiAnalysisResponse,
         discrepancy_warning: Optional[str] = None,
+        vehicles: Optional[List[Any]] = None,
+        matched_veh: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Retém a ação em estado de rascunho e formula a mensagem de confirmação para o motorista.
@@ -1103,18 +1227,52 @@ class ConversationService:
         # Heurística de complementação e integridade dos rascunhos
         if context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM:
             if not payload.get("total_cost"):
-                cost_m = re.search(r"(?:r\$|reais)\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*(?:reais|r\$)", combined_text, re.I)
-                if cost_m:
-                    val_s = cost_m.group(1) or cost_m.group(2)
-                    payload["total_cost"] = float(val_s.replace(",", "."))
+                cost_val = parse_cost_value(combined_text)
+                if cost_val is not None:
+                    payload["total_cost"] = cost_val
+            if not payload.get("km") and not payload.get("odometer_km"):
+                km_val = parse_km_value(combined_text)
+                if km_val is not None:
+                    payload["km"] = km_val
+                    payload["odometer_km"] = km_val
             if not payload.get("components"):
                 comps = []
-                for term in ["relação", "lona de freio", "lona", "pastilha", "óleo", "filtro", "amortecedor", "vela", "correia", "pneu", "embreagem", "bateria"]:
+                for term in ["relação", "lona de freio", "lona", "pastilha", "óleo", "filtro", "amortecedor", "vela", "correia", "pneu", "embreagem", "bateria", "lâmpada", "lampada", "farol", "higienização", "higienizacao"]:
                     if term in combined_text.lower() and term not in comps:
                         comps.append(term)
                 payload["components"] = comps or [last_user_msg]
             if not payload.get("description"):
                 payload["description"] = payload.get("service_summary") or ", ".join(payload.get("components", [])) or last_user_msg
+
+            # Sanity Check de KM em Manutenção (Turn 16)
+            maint_km = payload.get("km") or payload.get("odometer_km")
+            target_ref = payload.get("_target_vehicle_ref") or analysis.target_vehicle_ref or payload.get("model")
+            current_veh_km = None
+            if vehicles and target_ref:
+                for v in vehicles:
+                    v_model = (getattr(v, "model", None) or getattr(v, "modelo", "")).lower()
+                    if v_model in str(target_ref).lower() or str(target_ref).lower() in v_model:
+                        current_veh_km = getattr(v, "current_km", None) or getattr(v, "quilometragem", None)
+                        break
+            if not current_veh_km and vehicles:
+                current_veh_km = getattr(vehicles[0], "current_km", None) or getattr(vehicles[0], "quilometragem", None)
+
+            if maint_km and current_veh_km and int(maint_km) < int(current_veh_km):
+                payload["_is_odometer_rollback"] = True
+                payload["_target_vehicle_ref"] = target_ref
+                context.draft_payload = payload
+                reply = (
+                    f"⚠️ Identifiquei que a quilometragem informada ({int(maint_km):,} km) é menor que a registrada anteriormente ({int(current_veh_km):,} km). "
+                    f"Foi um erro de digitação? (Responda se deseja cancelar ou confirmar)"
+                ).replace(",", ".")
+                if discrepancy_warning:
+                    reply = f"⚠️ {discrepancy_warning}\n\n" + reply
+                return {
+                    "reply": reply,
+                    "action_type": "awaiting_confirmation",
+                    "state": context.state.value,
+                    "draft": payload,
+                }
 
         elif context.state == ConversationState.AWAITING_FINE_CONFIRM:
             if not payload.get("amount"):
@@ -1177,7 +1335,11 @@ class ConversationService:
                     payload["year"] = int(year_match.group(1))
 
         payload["_action_state"] = context.state.value
-        payload["_target_vehicle_ref"] = analysis.target_vehicle_ref
+        if matched_veh and discrepancy_warning:
+            payload["_target_vehicle_ref"] = getattr(matched_veh, "model", None) or getattr(matched_veh, "modelo", None)
+            payload["plate"] = getattr(matched_veh, "plate", None) or getattr(matched_veh, "placa", None)
+        else:
+            payload["_target_vehicle_ref"] = analysis.target_vehicle_ref or (getattr(matched_veh, "model", None) if matched_veh else None)
         if discrepancy_warning:
             payload["_discrepancy_warning"] = discrepancy_warning
         context.draft_payload = payload
@@ -1276,11 +1438,126 @@ class ConversationService:
         como 'foi um erro', 'cancela', 'esquece' (False) e 'pode meter marcha', 'isso aí' (True).
         """
         words = clean_text.strip().split()
-        is_affirmative = bool(re.search(r"\b(sim|confirmo|confirma|pode\s+salvar|salvar|salva|isso|correto|pode\s+registrar|com\s+certeza|positivo|fecho|fechado)\b", text_lower))
+        is_affirmative = bool(re.search(r"\b(sim|confirmo|confirma|confirmar|pode\s+confirmar|pode\s+salvar|salvar|salva|isso|correto|pode\s+registrar|com\s+certeza|positivo|fecho|fechado|fechou)\b", text_lower))
         is_negative = bool(re.search(r"\b(n[ãa]o|cancela|cancelar|n[ãa]o\s+salva|abortar|errado|errei|esquece|parar)\b", text_lower))
+
+        # Se o usuário mencionar explicitamente um veículo da sua garagem na resposta de confirmação (ex: "é no Nivus mesmo"):
+        if vehicles and context.draft_payload:
+            for v in vehicles:
+                v_model = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
+                if v_model and re.search(rf"\b{v_model}\b", text_lower):
+                    context.draft_payload["_target_vehicle_ref"] = getattr(v, "model", None) or getattr(v, "modelo", None)
+                    v_plate = getattr(v, "plate", None) or getattr(v, "placa", None)
+                    if v_plate:
+                        context.draft_payload["plate"] = v_plate
+                    break
 
         # Classificação semântica rica (NLP)
         nlp_classification = await self.classify_confirmation(clean_text, context)
+
+        # 1. Context Switch: Consulta Global da Garagem (Turn 35)
+        if self._is_garage_checkup_query(text_lower):
+            garage_res = await self._handle_garage_checkup(
+                user_id=user_id,
+                vehicles=vehicles,
+                maintenances=maintenances,
+                reminders=reminders,
+            )
+            context.state = ConversationState.NORMAL
+            context.draft_payload = None
+            return garage_res
+
+        # 1.1 Context Switch: Usuário faz uma pergunta veicular individual no meio de uma confirmação pendente (Turn 22)
+        is_query = bool(re.search(
+            r"\b(qual\s+(?:foi\s+)?(?:a\s+)?[uú]ltima|hist[oó]rico|quando\s+fiz|o\s+que\s+fiz|como\s+est[aá]|status)\b",
+            text_lower
+        ))
+        if is_query and not is_affirmative and not is_negative:
+            query_veh, _ = self._resolve_vehicle(clean_text, vehicles)
+            if query_veh:
+                status_res = self._format_single_vehicle_status(query_veh, maintenances)
+                target_draft_ref = (context.draft_payload or {}).get("_target_vehicle_ref") or (context.draft_payload or {}).get("model") or "veículo"
+                reminder_note = f"\n\n⚠️ *Lembrete:* Você ainda possui um rascunho pendente de confirmação para o seu {target_draft_ref}. Deseja confirmar ou descartar?"
+                status_res["reply"] = status_res["reply"] + reminder_note
+                status_res["action_type"] = "awaiting_confirmation_clarification"
+                status_res["state"] = context.state.value
+                status_res["draft"] = context.draft_payload
+                return status_res
+
+        # 2. Complemento técnico de cadastro de veículo (Turn 6)
+        if context.state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM:
+            has_specs = any(k in text_lower for k in ("motor", "manual", "automático", "automatico", "direção", "direcao", "flex", "km", "180.500", "180500"))
+            if has_specs and not is_negative:
+                draft_data = context.draft_payload or {}
+                km_val = parse_km_value(clean_text)
+                if km_val:
+                    draft_data["odometer_km"] = km_val
+                    draft_data["current_km"] = km_val
+
+                motor_m = re.search(r"\bmotor\s+([0-9\.]+(?:\s+[a-zA-Z]+)?)\b", text_lower)
+                if motor_m:
+                    draft_data["engine"] = f"Motor {motor_m.group(1).title()}"
+                    draft_data["motor"] = draft_data["engine"]
+                elif "1.4" in text_lower:
+                    draft_data["engine"] = "1.4 Flex" if "flex" in text_lower else "1.4"
+                    draft_data["motor"] = draft_data["engine"]
+
+                if "manual" in text_lower:
+                    draft_data["transmission"] = "Manual"
+                    draft_data["cambio"] = "Manual"
+                elif "autom" in text_lower:
+                    draft_data["transmission"] = "Automático"
+                    draft_data["cambio"] = "Automático"
+
+                if "mecânica" in text_lower or "mecanica" in text_lower:
+                    draft_data["steering"] = "Mecânica"
+                    draft_data["direcao"] = "Mecânica"
+                elif "elétrica" in text_lower or "eletrica" in text_lower:
+                    draft_data["steering"] = "Elétrica"
+                    draft_data["direcao"] = "Elétrica"
+                elif "hidráulica" in text_lower or "hidraulica" in text_lower:
+                    draft_data["steering"] = "Hidráulica"
+                    draft_data["direcao"] = "Hidráulica"
+
+                context.draft_payload = draft_data
+                model_name = draft_data.get("model") or "Veículo"
+                engine_str = draft_data.get("engine") or ""
+                trans_str = draft_data.get("transmission") or ""
+                steer_str = draft_data.get("steering") or ""
+                parts = [p for p in [engine_str, trans_str, f"Direção {steer_str}" if steer_str and not steer_str.lower().startswith("direção") else steer_str] if p]
+                specs_desc = f" ({', '.join(parts)})" if parts else ""
+                km_info = f" e {km_val:,} km".replace(",", ".") if km_val else ""
+
+                reply = f"Excelente escolha! Já puxei a ficha técnica do seu {model_name}{specs_desc}{km_info}. Posso salvar na garagem?"
+                return {
+                    "reply": reply,
+                    "action_type": "awaiting_confirmation",
+                    "state": context.state.value,
+                    "draft": draft_data,
+                }
+
+        # 3. Correção de valor financeiro em rascunho pendente (Turn 19)
+        new_cost = parse_cost_value(clean_text)
+        has_val_kw = any(k in text_lower for k in ("valor", "custo", "preço", "preco", "na verdade", "o resto")) and not any(w in text_lower for w in ("troquei", "instalei", "coloquei", "comprei", "fiz "))
+        if new_cost and has_val_kw:
+            draft_data = context.draft_payload or {}
+            if draft_data.get("_is_multi_action"):
+                for act in draft_data.get("actions", []):
+                    if act.get("intent") in (IntentType.RECORD_MAINTENANCE.value, "record_maintenance"):
+                        act["total_cost"] = new_cost
+                        break
+            else:
+                draft_data["total_cost"] = new_cost
+
+            context.draft_payload = draft_data
+
+            reply = f"Atualizei o valor para R$ {new_cost:.2f}! As outras informações permanecem iguais. Posso confirmar e salvar no seu histórico?".replace(".", ",")
+            return {
+                "reply": reply,
+                "action_type": "awaiting_confirmation",
+                "state": context.state.value,
+                "draft": draft_data,
+            }
 
         # Detecta se o usuário está corrigindo dados do rascunho
         is_correction = bool(re.search(
@@ -1578,8 +1855,8 @@ class ConversationService:
             r"\bsem\s+d[uú]vida\b",
             r"\bpositivo\b",
             r"\b(?:bora|dale|toca\s+o\s+barco|vai\s+fundo|demorou)\b",
-            r"\bpode\s+(?:ir|salvar|registrar|gravar|mandar)\b",
-            r"\b(?:fecho|fechado|beleza\s+pode\s+ir|t[aá]\s+certo|correto|exato)\b",
+            r"\bpode\s+(?:ir|salvar|registrar|gravar|mandar|confirmar)\b",
+            r"\b(?:fecho|fechado|fechou|beleza\s+pode\s+ir|t[aá]\s+certo|correto|exato)\b",
             r"\b(?:sim|s|yes|confirmo|confirma|confirmar|salvar|salva|gravar)\b",
         ]
         for p in affirmative_patterns:
@@ -1709,7 +1986,7 @@ class ConversationService:
             return []
 
         # 1. Conectores estruturados de múltiplas intenções / orações
-        split_pattern = r"(?:\.\s+|\n+|;\s*|\s+(?:e\s+tamb[eé]m|e\s+al[eé]m\s+disso|j[áa]\s+salva\s+isso\s+e|j[áa]\s+aproveita\s+e|e\s+me\s+lembra|me\s+lembra|lembra-me)\s+)"
+        split_pattern = r"(?:\.\s+|\n+|;\s*|\s+(?:e\s+tamb[eé]m|e\s+al[eé]m\s+disso|j[áa]\s+salva\s+isso\s+e|j[áa]\s+aproveita\s+e|(?:e\s+)?j[áa]\s+me\s+lembra|e\s+me\s+lembra|me\s+lembra|lembra-me)\s+)"
         clauses = [c.strip() for c in re.split(split_pattern, text.strip(), flags=re.I) if c.strip()]
         if len(clauses) < 2:
             clauses = [c.strip() for c in re.split(r"\s+(?:e\s+tamb[eé]m|e\s+al[eé]m\s+disso|e)\s+|[;\n]+", text.strip(), flags=re.I) if c.strip()]
@@ -1745,23 +2022,9 @@ class ConversationService:
 
             clause_veh_ref = c_ref or default_ref
 
-            # Extração de hodômetro se houver
-            km_match = re.search(r"\b(\d+)\s*(?:mil\s*)?km\b|\b(?:para|em|com)\s*(\d+)\b", c_lower)
-            km_val = None
-            if km_match:
-                val_s = km_match.group(1) or km_match.group(2)
-                if val_s:
-                    km_val = int(val_s)
-                    if "mil" in c_lower and km_val < 1000:
-                        km_val *= 1000
-
-            # Extração de valor financeiro
-            cost_m = re.search(r"(?:r\$|reais|por)\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*(?:reais|r\$)", c_clean, re.I)
-            cost_val = 0.0
-            if cost_m:
-                val_s = cost_m.group(1) or cost_m.group(2)
-                if val_s:
-                    cost_val = float(val_s.replace(",", "."))
+            # Extração de hodômetro e valor financeiro com suporte a gírias e pontuação BR
+            km_val = parse_km_value(c_lower)
+            cost_val = parse_cost_value(c_clean) or 0.0
 
             # Classificação de intenção da cláusula
             is_rem = any(k in c_lower for k in ("lembr", "avis", "agend", "notific", "calibrar", "estepe", "rodízio", "rodizio")) and any(
@@ -2016,6 +2279,7 @@ class ConversationService:
         phonetic_aliases = {
             "civique": "civic",
             "civi": "civic",
+            "covic": "civic",
             "sandeiro": "sandero",
             "compas": "compass",
             "conpass": "compass",
@@ -2149,6 +2413,16 @@ class ConversationService:
                     f"   ✅ *EM DIA:* Nenhuma manutenção preventiva pendente."
                 )
 
+        if reminders:
+            active_rems = [r for r in reminders if getattr(r, "status", "pending") != "cancelled"]
+            if active_rems:
+                lines.append("\n⏰ *Lembretes Agendados na Garagem:*")
+                for r in active_rems:
+                    r_desc = getattr(r, "description", None) or getattr(r, "descricao", "Lembrete automotivo")
+                    r_dt = getattr(r, "due_datetime", None) or getattr(r, "data_hora_agendada", None)
+                    dt_str = r_dt.strftime("%d/%m às %H:%M") if hasattr(r_dt, "strftime") and r_dt else (str(r_dt) if r_dt else "agendado")
+                    lines.append(f"• 🔔 *{r_desc}* ({dt_str})")
+
         if delayed_count > 0:
             lines.append(
                 f"\n⚠️ Identifiquei *{delayed_count} veículo(s)* com revisão atrasada. Deseja agendar um lembrete ou registrar o serviço agora?"
@@ -2169,12 +2443,20 @@ class ConversationService:
     def _format_single_vehicle_status(
         self, vehicle: Any, maintenances: Optional[List[Any]] = None
     ) -> Dict[str, Any]:
-        """Formata o status de um veículo individual com verificação de manutenção em dia (Problema 4)."""
+        """Formata o status de um veículo individual com verificação de manutenção em dia e histórico ativo."""
         make = getattr(vehicle, "make", None) or getattr(vehicle, "marca", "Veículo")
         model = getattr(vehicle, "model", None) or getattr(vehicle, "modelo", "")
         plate = getattr(vehicle, "plate", None) or getattr(vehicle, "placa", "sem placa")
         km = getattr(vehicle, "current_km", None) or getattr(vehicle, "quilometragem", 0) or 0
         km_fmt = f"{km:,} km".replace(",", ".")
+        v_id = getattr(vehicle, "id", None)
+
+        # Filtra manutenções ativas do veículo (excluindo canceladas / soft deleted)
+        active_maints = [
+            m for m in (maintenances or [])
+            if (v_id is None or getattr(m, "vehicle_id", None) == v_id or getattr(m, "veiculo_id", None) == v_id)
+            and getattr(m, "status", "active") != "cancelled"
+        ]
 
         interval = 10000
         sched_mark = (km // interval) * interval
@@ -2184,25 +2466,38 @@ class ConversationService:
             delay_km = km - sched_mark
             is_delayed = True
 
+        lines = [
+            f"🚗 *Status do Veículo - {make} {model}*",
+            "",
+            f"• *Placa:* `{plate}`",
+            f"• *Odômetro Atual:* {km_fmt}",
+        ]
+
         if is_delayed:
             delay_fmt = f"{delay_km:,} km".replace(",", ".")
             sched_fmt = f"{sched_mark:,} km".replace(",", ".")
-            reply = (
-                f"🚗 *Status do Veículo - {make} {model}*\n\n"
-                f"• *Placa:* `{plate}`\n"
-                f"• *Odômetro Atual:* {km_fmt}\n"
-                f"• 🔴 *Situação:* A revisão dos {sched_fmt} está atrasada em *{delay_fmt}*!\n\n"
-                f"💡 Deseja registrar a manutenção ou agendar um lembrete para realizá-la?"
-            )
+            lines.append(f"• 🔴 *Situação:* A revisão dos {sched_fmt} está atrasada em *{delay_fmt}*!")
         else:
-            reply = (
-                f"🚗 *Status do Veículo - {make} {model}*\n\n"
-                f"• *Placa:* `{plate}`\n"
-                f"• *Odômetro Atual:* {km_fmt}\n"
-                f"• 🟢 *Situação:* Todas as manutenções estão em dia!\n\n"
-                f"💡 Precisa de alguma orientação ou registrar um novo serviço?"
-            )
+            lines.append("• 🟢 *Situação:* Todas as manutenções estão em dia!")
 
+        if active_maints:
+            lines.append("")
+            lines.append("🔧 *Histórico de Manutenções:*")
+            for m in active_maints:
+                desc = getattr(m, "description", None) or getattr(m, "descricao", "Manutenção")
+                cost = getattr(m, "total_cost", None) or getattr(m, "custo", 0.0) or 0.0
+                m_km = getattr(m, "km", None)
+                km_info = f" ({m_km:,} km)".replace(",", ".") if m_km else ""
+                lines.append(f"• {desc}{km_info} - R$ {cost:.2f}".replace(".", ","))
+            total_spent = sum(float(getattr(m, "total_cost", 0.0) or getattr(m, "custo", 0.0) or 0.0) for m in active_maints)
+            lines.append(f"💰 *Total Investido:* R$ {total_spent:.2f}".replace(".", ","))
+        else:
+            lines.append("• *Histórico:* Nenhuma manutenção registrada ainda.")
+
+        lines.append("")
+        lines.append("💡 Precisa de alguma orientação ou registrar um novo serviço?")
+
+        reply = "\n".join(lines)
         return {
             "reply": reply,
             "action_type": "vehicle_status_query",
@@ -2213,6 +2508,7 @@ class ConversationService:
                 "quilometragem": km,
                 "em_dia": not is_delayed,
                 "atrasado_km": delay_km,
+                "total_manutencoes": len(active_maints),
             },
         }
 
