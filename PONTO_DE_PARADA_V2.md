@@ -1,7 +1,7 @@
-# 📍 PONTO DE PARADA TOTAL - AUTOQUER / AUTOCARE V2 (DEEP MERGE NO UPSERT & ROTEAMENTO ESTRITO DE EDIÇÃO SEM ALUCINAÇÃO)
+# 📍 PONTO DE PARADA TOTAL - AUTOQUER / AUTOCARE V2 (MERGE ATÔMICO E ROTEAMENTO ESTRITO AI-FIRST)
 
-**Data do Checkpoint:** 29/10/2026 - 18:40  
-**Versão:** Autoquer / AutoCare V2.10.0 (Deep Merge on Draft Upsert, Strict Edit Routing with Anti-Hallucination, Multi-Tool Calls, Silent Odometer Update & Debounce Buffer)  
+**Data do Checkpoint:** 29/10/2026 - 19:05  
+**Versão:** Autoquer / AutoCare V2.11.0 (Atomic Deep Merge on Upsert, Strict AI-First Tool Routing, Elimination of Local Regex Heuristics, Multi-Tool Calls & Debounce Buffer)  
 **Status do Projeto:** 100% Funcional, 89/89 Testes Pytest Aprovados e 35/35 Turnos da Bateria do Caos Aprovados (100% Pass Rate).  
 
 ---
@@ -10,7 +10,7 @@
 
 | Suíte de Testes | Arquivo / Comando | Abrangência / Escopo | Resultado |
 | :--- | :--- | :--- | :---: |
-| **Refatoração AI-First & Function Calling** | `tests/test_ai_first_refactoring.py` | `upsert_draft` (Deep Merge), `confirm_and_save_draft`, `update_last_saved_service` (Anti-Alucinação), `get_service_history` | **7/7 PASS (100%) ✅** |
+| **Refatoração AI-First & Function Calling** | `tests/test_ai_first_refactoring.py` | `upsert_draft` (Deep Merge Atômico), `confirm_and_save_draft`, `update_last_saved_service` (Anti-Alucinação), `get_service_history` | **7/7 PASS (100%) ✅** |
 | **Debounce, Patch Atômico & Hodômetro** | `tests/test_webhook_debounce_and_patch.py` | Debounce anti-atropelo (2.0s), patch atômico de ficha técnica, atualização silenciosa de odômetro e Multi-Tool Call | **7/7 PASS (100%) ✅** |
 | **Bateria do Caos (E2E 35 Turnos)** | `tests/test_fire_chaos_suite.py` | 35 turnos sequenciais ponta a ponta com clock virtual, sem interrupção de fluxo nem corrupção | **1/1 (35 turnos) PASS (100%) ✅** |
 | **Guardrails de Escopo e Tokens** | `tests/test_guardrails_and_token_limits.py` | Bloqueio pré-LLM custo zero, teto de tokens, pruning de histórico | **20/20 PASS (100%) ✅** |
@@ -26,26 +26,22 @@
 
 ---
 
-## 🚀 Implementações da Versão V2.10.0 (Deep Merge & Roteamento Estrito Anti-Alucinação)
+## 🚀 Implementações da Versão V2.11.0 (Refatoração Cirúrgica: Merge Atômico & Roteamento Estrito)
 
-### 1. Deep Merge no Upsert de Rascunho (`upsert_draft`)
-- **Problema Anterior**: Ao receber um item adicional durante `AWAITING_CONFIRMATION` (ex: *"também troquei filtro de combustível"*), a Tool `upsert_draft` apagava os itens anteriores, zerava a quilometragem e redefinia a data para o dia atual.
-- **Solução Implementada**:
-  - `_upsert_maintenance_draft` realiza um **Deep Merge**: novos itens são adicionados (appended) à lista cumulativa existente, sem duplicidade.
-  - Se o usuário não mencionar nova quilometragem, data ou oficina, os valores anteriormente capturados no rascunho são **estritamente preservados**. A data não é redefinida para a data de hoje.
-  - Formatação monetária padronizada no padrão brasileiro (`R$ 1.250,50`).
-  - Verificação de retrocesso de hodômetro no fluxo unificado de upsert.
+### 1. Reescrita Cirúrgica de `_upsert_maintenance_draft` (Deep Merge Implacável)
+- **Merge de Itens:** Mesclagem (`append` cumulativo) dos itens do `existing_draft` com os novos `itens`/`components` fornecidos pela IA, com desduplicação insensível a maiúsculas/minúsculas.
+- **Preservação Blindada (KM e Valor):** Quando a nova chamada da IA não enviar valor numérico para `km`, o valor exato de `existing_draft.get("km")` é incondicionalmente preservado. Para `valor`, preserva o valor anterior ou soma custos cumulativos caso o usuário cite termos de adição (*"também"*, *"mais"*).
+- **Preservação Blindada de Data:** Removidas checagens de palavras circunstanciais como `"hoje" in clean_text.lower()`. Se a IA não extrair uma nova data explícita, a data original do rascunho é **estritamente preservada**.
+- **Preservação de Oficina:** A oficina original é preservada inalterada caso a nova mensagem não especifique outro estabelecimento.
 
-### 2. Roteamento Estrito de Edição & Anti-Alucinação (`update_last_saved_service`)
-- **Problema Anterior**: Ao receber comandos como *"quero corrigir o km desse último serviço"*, o LLM alucinava um novo rascunho de serviço com o nome genérico *"Revisão geral periódica"*, em vez de acionar a ferramenta de edição do registro existente.
-- **Solução Implementada**:
-  - Instruções de sistema atualizadas com regra mandatória: comandos para corrigir/editar/alterar o último serviço gravado **devem acionar obrigatoriamente** `update_last_saved_service`, com o `service_id` do estado invisível.
-  - Proibição estrita de invenção de nomes de serviço genéricos como *"Revisão geral periódica"*.
-  - Roteamento determinístico no orquestrador: se o usuário solicita edição do último serviço, o fluxo é roteado diretamente para `_handle_edit_last_saved_service`, ordenando decrescente por data e ID e buscando a manutenção exata por ID.
-  - Schemas Pydantic ajustados (`service_id: Optional[Union[int, str]]`) para flexibilidade completa entre chaves primárias numéricas e mocks de teste.
+### 2. Blindagem do Roteamento em `_handle_pending_confirmation_state`
+- **Sub-bloco 4.1 (Edição do Último Serviço):** Curto-circuito mandatário (`return early`). Se `is_edit_service` for `True` ou se a ferramenta `update_last_saved_service` for acionada, a execução retorna o resultado de `_handle_edit_last_saved_service` imediatamente, sem risco de cair em interceptadores de criação de rascunho.
+- **Sub-bloco 4.2 (Upsert de Rascunho):** Eliminadas regexes e inferências manuais locais (`is_cumulative_text`). A decisão de acionar `_upsert_maintenance_draft` é delegada estritamente às chamadas de Tool (`has_upsert_tc`) ou intenções da IA.
 
-### 3. Desambiguação de Consultas vs. Edição
-- `is_edit_last_service_intent` refinado para não capturar perguntas informativas sobre histórico (ex: *"Qual foi a última manutenção que fiz no Nivus?"*), garantindo a preservação de trocas de contexto (Context Switch) durante confirmações pendentes.
+### 3. Remoção de Lógicas Antigas (Delete-First)
+- **Eliminação de Heurísticas de Fallback:** O fallback offline não tenta mais emular rascunhos cumulativos ou mesclagens de rascunhos via regex quando a IA estiver offline, emitindo aviso limpo caso haja falha externa.
+- **Prompt Mestre (`src/ai/prompts.py`):** Adicionada a **Regra 4 (Separação Estrita de Tools)**, definindo expressamente que mensagens adicionais a um rascunho aberto devem acionar exclusivamente `upsert_draft`, enquanto comandos de correção do serviço já salvo devem acionar exclusivamente `update_last_saved_service`.
+- **Motor Offline no GeminiClient (`src/ai/client.py`):** `_build_offline_fallback` alinhado à arquitetura de Tools estruturadas, simulando com precisão o retorno de `ToolCallAction` para execução em ambientes de teste sem quota externa.
 
 ---
 

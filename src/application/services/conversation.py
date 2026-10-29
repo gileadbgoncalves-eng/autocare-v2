@@ -790,6 +790,12 @@ class ConversationService:
                 and not (is_revisao_query and parse_km_value(text_lower) is not None and not parse_cost_value(clean_text))
             )
             if is_maint:
+                # O fallback NÃO deve emular rascunhos cumulativos caso já exista rascunho
+                if context.is_awaiting_confirmation() or context.draft_payload:
+                    reply = "⚠️ Não foi possível mesclar os itens no rascunho no momento devido à indisponibilidade temporária da IA. Por favor, tente novamente em instantes."
+                    self._record_assistant_turn(context, reply)
+                    self.update_context(context)
+                    return {"reply": reply, "action_type": "offline_error", "state": context.state.value}
                 upsert_res = self._upsert_maintenance_draft(context=context, analysis=analysis, clean_text=clean_text, vehicles=vehicles, matched_veh=matched_veh, discrepancy_warning=discrepancy_warning)
                 self._record_assistant_turn(context, upsert_res["reply"])
                 self.update_context(context)
@@ -802,7 +808,7 @@ class ConversationService:
             if matched_veh and not any(rv in text_lower for rv in registration_verbs):
                 is_registration = False
             else:
-                is_registration = (any(rv in text_lower for rv in registration_verbs) or bool(matched_spec) or (has_plate and not vehicles)) and not is_maint
+                is_registration = any(rv in text_lower for rv in registration_verbs) or bool(matched_spec) or (has_plate and not vehicles)
 
             if is_registration:
                 make = matched_spec["make"] if matched_spec else "Veículo"
@@ -1133,11 +1139,12 @@ class ConversationService:
         elif analysis.tool_call is not None:
             tool_calls_list.append(analysis.tool_call)
 
-        # 4.1 Se for comando de edição do último serviço salvo
+        # 4.1 Se for comando de edição do último serviço salvo (curto-circuito antecipado)
+        has_edit_tc = any(getattr(tc, "name", None) == "update_last_saved_service" for tc in tool_calls_list)
         is_edit_service = (
-            analysis.intent == IntentType.UPDATE_LAST_SAVED_SERVICE
+            has_edit_tc
+            or analysis.intent == IntentType.UPDATE_LAST_SAVED_SERVICE
             or is_edit_last_service_intent(clean_text, context)
-            or any(getattr(tc, "name", None) == "update_last_saved_service" for tc in tool_calls_list)
         )
         if is_edit_service:
             return await self._handle_edit_last_saved_service(
@@ -1148,13 +1155,23 @@ class ConversationService:
                 vehicles=vehicles,
             )
 
-        # 4.2 Se a IA indicou upsert_draft ou o usuário adicionou itens cumulativamente
-        is_maint_draft = (context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM and isinstance(context.draft_payload, dict) and not context.draft_payload.get("_is_multi_action"))
+        # 4.2 Se a IA indicou upsert_draft (decisão 100% via IA / Tool Call, sem regex local)
+        is_maint_draft = (
+            context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM
+            and isinstance(context.draft_payload, dict)
+            and not context.draft_payload.get("_is_multi_action")
+        )
         if is_maint_draft:
             has_upsert_tc = any(getattr(tc, "name", None) == "upsert_draft" for tc in tool_calls_list)
-            is_cumulative_text = any(k in text_lower for k in ("também", "tambem", "adiciona", "inclui", "mais", "valor", "data", "troquei", "coloquei", "filtro", "óleo", "oleo", "peça", "peca")) or bool(extract_maintenance_items_strict(clean_text))
-            if has_upsert_tc or analysis.intent in (IntentType.UPSERT_DRAFT, IntentType.RECORD_MAINTENANCE) or is_cumulative_text:
-                return self._upsert_maintenance_draft(context=context, analysis=analysis, clean_text=clean_text, vehicles=vehicles, matched_veh=matched_veh, discrepancy_warning=discrepancy_warning)
+            if has_upsert_tc or analysis.intent in (IntentType.UPSERT_DRAFT, IntentType.RECORD_MAINTENANCE):
+                return self._upsert_maintenance_draft(
+                    context=context,
+                    analysis=analysis,
+                    clean_text=clean_text,
+                    vehicles=vehicles,
+                    matched_veh=matched_veh,
+                    discrepancy_warning=discrepancy_warning,
+                )
 
         # Atualização cumulativa de ficha técnica no cadastro de veículo (PATCH ATÔMICO)
         if context.state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM and isinstance(context.draft_payload, dict):
@@ -1413,7 +1430,7 @@ class ConversationService:
         matched_veh: Optional[Any] = None,
         discrepancy_warning: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Cria ou atualiza cumulativamente o rascunho de manutenção aberto via Deep Merge."""
+        """Cria ou atualiza cumulativamente o rascunho de manutenção aberto via Deep Merge atômico."""
         existing_draft = dict(context.draft_payload) if (
             isinstance(context.draft_payload, dict)
             and not context.draft_payload.get("_is_multi_action")
@@ -1432,15 +1449,14 @@ class ConversationService:
         if maint_obj:
             entities.update(maint_obj.model_dump(exclude_none=True))
 
-        # 1. Itens anteriores (recupera de itens, components ou description)
+        # 1. Recuperação de itens anteriores do rascunho
         prev_items: List[str] = []
         raw_prev = existing_draft.get("itens") or existing_draft.get("components")
         if isinstance(raw_prev, list):
             prev_items = [str(i).strip() for i in raw_prev if str(i).strip()]
         elif isinstance(raw_prev, str) and raw_prev.strip():
             prev_items = [raw_prev.strip()]
-
-        if not prev_items and existing_draft.get("description"):
+        elif existing_draft.get("description"):
             desc_str = str(existing_draft.get("description")).strip()
             extracted_from_desc = extract_maintenance_items_strict(desc_str)
             if extracted_from_desc:
@@ -1448,7 +1464,7 @@ class ConversationService:
             elif desc_str.lower() not in ("manutenção realizada", "manutenção", "serviço"):
                 prev_items = [desc_str]
 
-        # 2. Novos itens (de tool_calls, entities ou texto)
+        # 2. Novos itens fornecidos na chamada da Tool, entities ou texto
         new_items: List[str] = []
         for tc_item in tool_calls_list:
             if getattr(tc_item, "itens", None):
@@ -1458,28 +1474,23 @@ class ConversationService:
                 elif isinstance(tc_it, str) and tc_it.strip():
                     new_items.append(tc_it.strip())
 
-        if entities.get("components"):
-            c = entities["components"]
-            if isinstance(c, list):
-                new_items.extend([str(i).strip() for i in c if str(i).strip()])
-            elif isinstance(c, str) and c.strip():
-                new_items.append(c.strip())
-        elif entities.get("itens"):
-            it = entities["itens"]
-            if isinstance(it, list):
-                new_items.extend([str(i).strip() for i in it if str(i).strip()])
-            elif isinstance(it, str) and it.strip():
-                new_items.append(it.strip())
+        if not new_items:
+            raw_c = entities.get("components") or entities.get("itens")
+            if isinstance(raw_c, list):
+                new_items.extend([str(i).strip() for i in raw_c if str(i).strip()])
+            elif isinstance(raw_c, str) and raw_c.strip():
+                new_items.append(raw_c.strip())
 
         strict_items = extract_maintenance_items_strict(clean_text)
         if strict_items:
             new_items = merge_maintenance_items(new_items, strict_items)
 
+        # Merge de Itens (Deep Merge: mescla/append itens do existing_draft com novos itens)
         merged_items = merge_maintenance_items(prev_items, new_items)
         if not merged_items and prev_items:
             merged_items = prev_items
 
-        # 3. Quilometragem (Deep Merge: preserva KM existente se não fornecido)
+        # 3. Preservação Blindada (KM): Se novo payload da IA não contiver valor numérico, preserva existing_draft
         new_km = None
         for tc_item in tool_calls_list:
             if getattr(tc_item, "km", None) is not None:
@@ -1491,13 +1502,14 @@ class ConversationService:
             new_km = entities.get("odometer_km")
         if new_km is None and maint_obj and getattr(maint_obj, "odometer_km", None) is not None:
             new_km = maint_obj.odometer_km
-        if new_km is None:
-            new_km = parse_km_value(clean_text)
 
         prev_km = existing_draft.get("km") if existing_draft.get("km") is not None else existing_draft.get("odometer_km")
-        final_km = new_km if new_km is not None else prev_km
+        if is_updating:
+            final_km = new_km if new_km is not None else prev_km
+        else:
+            final_km = new_km if new_km is not None else parse_km_value(clean_text)
 
-        # 4. Data (Deep Merge: preserva Data existente se o usuário não citou nova data)
+        # 4. Preservação Blindada de Data: Se IA não extrair nova data, PRESERVA incondicionalmente data anterior
         new_data = None
         for tc_item in tool_calls_list:
             if getattr(tc_item, "data", None):
@@ -1509,17 +1521,14 @@ class ConversationService:
             new_data = entities.get("date_str")
         if not new_data and maint_obj and getattr(maint_obj, "date_str", None):
             new_data = maint_obj.date_str
-        if not new_data:
-            new_data = extract_date_strict(clean_text)
 
         prev_data = existing_draft.get("data") or existing_draft.get("date_str") or existing_draft.get("date")
-        has_user_date = bool(extract_date_strict(clean_text)) or "hoje" in clean_text.lower() or "ontem" in clean_text.lower()
-        if is_updating and prev_data and not has_user_date:
-            final_data = prev_data
-        else:
+        if is_updating:
             final_data = new_data if new_data else prev_data
+        else:
+            final_data = new_data or extract_date_strict(clean_text) or datetime.now().strftime("%d/%m/%Y")
 
-        # 5. Oficina (Deep Merge: preserva Oficina existente se não fornecida)
+        # 5. Preservação Blindada de Oficina: Preserva oficina do rascunho anterior se não informada nova
         new_oficina = None
         for tc_item in tool_calls_list:
             if getattr(tc_item, "oficina", None):
@@ -1531,13 +1540,14 @@ class ConversationService:
             new_oficina = entities.get("oficina")
         if not new_oficina and maint_obj and getattr(maint_obj, "workshop_name", None):
             new_oficina = maint_obj.workshop_name
-        if not new_oficina:
-            new_oficina = extract_workshop_strict(clean_text)
 
         prev_oficina = existing_draft.get("oficina") or existing_draft.get("workshop_name")
-        final_oficina = new_oficina if new_oficina else prev_oficina
+        if is_updating:
+            final_oficina = new_oficina if new_oficina else prev_oficina
+        else:
+            final_oficina = new_oficina or extract_workshop_strict(clean_text)
 
-        # 6. Valor / Custo (Deep Merge: soma se cumulativo, ou substitui/preserva)
+        # 6. Preservação Blindada de Valor: Permite que a IA adicione custos cumulativamente se indicado
         new_cost = None
         for tc_item in tool_calls_list:
             if getattr(tc_item, "valor", None) is not None:
@@ -1549,18 +1559,18 @@ class ConversationService:
             new_cost = entities.get("valor")
         if new_cost is None and maint_obj and getattr(maint_obj, "total_cost", None) is not None:
             new_cost = maint_obj.total_cost
-        if new_cost is None:
-            new_cost = parse_cost_value(clean_text)
 
         prev_cost = existing_draft.get("valor") if existing_draft.get("valor") is not None else existing_draft.get("total_cost")
         if is_updating and new_cost is not None and prev_cost is not None:
             tl = clean_text.lower()
-            if any(k in tl for k in ("também", "tambem", "mais", "adiciona", "inclui")):
+            if any(k in tl for k in ("também", "tambem", "mais", "adiciona", "inclui", "somar", "soma")):
                 final_cost = float(prev_cost) + float(new_cost)
             else:
                 final_cost = float(new_cost)
+        elif is_updating:
+            final_cost = prev_cost
         else:
-            final_cost = new_cost if new_cost is not None else prev_cost
+            final_cost = new_cost if new_cost is not None else parse_cost_value(clean_text)
 
         target_veh_ref = (
             existing_draft.get("_target_vehicle_ref")

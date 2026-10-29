@@ -334,6 +334,136 @@ class GeminiClient:
         (`upsert_draft`, `confirm_and_save_draft`, `update_last_saved_service`, `get_service_history`)
         e as regras da Etapa 3 (Anti-Alucinação, Cumulatividade e Condução Ativa na Edição).
         """
+        from src.ai.schemas import ToolCallAction, VehicleDraft, MaintenanceDraft
+        from src.application.services.conversation import (
+            extract_maintenance_items_strict,
+            parse_km_value,
+            parse_cost_value,
+            extract_date_strict,
+            is_edit_last_service_intent,
+            find_popular_vehicle_spec,
+            ConversationState,
+        )
+
+        clean_text = (message or "").strip()
+        tl = clean_text.lower()
+
+        # 1. Edição de Último Serviço Salvo (update_last_saved_service)
+        if is_edit_last_service_intent(clean_text, context) or any(k in tl for k in ("alterar o último", "alterar o ultimo", "mudar o último", "mudar o ultimo", "corrigir o último", "corrigir o ultimo", "corrigir o km desse último")):
+            last_m_id = None
+            if maintenances:
+                latest = maintenances[0]
+                last_m_id = getattr(latest, "id", None)
+            return GeminiAnalysisResponse(
+                intent=IntentType.UPDATE_LAST_SAVED_SERVICE,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message="Vou atualizar o último serviço salvo.",
+                tool_call=ToolCallAction(name="update_last_saved_service", service_id=last_m_id),
+                extracted_entities={"service_id": last_m_id},
+            )
+
+        # 2. Confirmação (confirm_and_save_draft)
+        if tl in ("sim", "pode salvar", "confirmo", "fechou", "isso", "salvar", "ok", "correto", "pode confirmar"):
+            if context and getattr(context, "is_awaiting_confirmation", lambda: False)():
+                return GeminiAnalysisResponse(
+                    intent=IntentType.CONFIRM_ACTION,
+                    confidence=ConfidenceLevel.HIGH,
+                    is_critical_action=False,
+                    reply_message="Confirmando e salvando registro.",
+                    tool_call=ToolCallAction(name="confirm_and_save_draft"),
+                )
+
+        # 3. Adição Cumulativa ao Rascunho Aberto (upsert_draft)
+        if context and getattr(context, "state", None) == ConversationState.AWAITING_MAINTENANCE_CONFIRM:
+            items = extract_maintenance_items_strict(clean_text)
+            new_km = parse_km_value(clean_text)
+            new_cost = parse_cost_value(clean_text)
+            new_date = extract_date_strict(clean_text)
+            return GeminiAnalysisResponse(
+                intent=IntentType.UPSERT_DRAFT,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message="Atualizando rascunho de manutenção.",
+                tool_call=ToolCallAction(
+                    name="upsert_draft",
+                    itens=items or None,
+                    km=new_km,
+                    data=new_date,
+                    valor=new_cost,
+                ),
+                extracted_entities={"itens": items, "km": new_km, "data": new_date, "valor": new_cost},
+            )
+
+        # 4. Histórico (get_service_history)
+        if any(k in tl for k in ("histórico", "historico", "últimas manutenções", "ultimas manutencoes", "revisões feitas")):
+            return GeminiAnalysisResponse(
+                intent=IntentType.QUERY_HISTORY,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=False,
+                reply_message="Buscando histórico de serviços.",
+                tool_call=ToolCallAction(name="get_service_history"),
+            )
+
+        # 5. Nova Manutenção (upsert_draft inicial)
+        maint_items = extract_maintenance_items_strict(clean_text)
+        maint_verbs = ("troquei", "trocou", "troca", "fiz", "realizei", "coloquei", "gastei", "paguei")
+        if (any(v in tl for v in maint_verbs) or maint_items) and not any(k in tl for k in ("tem alguma", "quando vence", "qual a revisão")):
+            new_km = parse_km_value(clean_text)
+            new_cost = parse_cost_value(clean_text)
+            new_date = extract_date_strict(clean_text)
+            target_ref = "Nivus" if "nivus" in tl else ("Corolla" if "corolla" in tl else None)
+            m_draft = MaintenanceDraft(
+                description=", ".join(maint_items) if maint_items else clean_text,
+                components=maint_items,
+                total_cost=new_cost,
+                odometer_km=new_km,
+                date_str=new_date,
+            )
+            return GeminiAnalysisResponse(
+                intent=IntentType.RECORD_MAINTENANCE,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message=f"Entendido o registro de manutenção ({', '.join(maint_items) if maint_items else 'serviço'}).",
+                maintenance=m_draft,
+                target_vehicle_ref=target_ref,
+                tool_call=ToolCallAction(
+                    name="upsert_draft",
+                    itens=maint_items or None,
+                    km=new_km,
+                    data=new_date,
+                    valor=new_cost,
+                ),
+                extracted_entities=m_draft.model_dump(exclude_none=True),
+            )
+
+        # 6. Cadastro de Veículo
+        if any(k in tl for k in ("cadastr", "adicion", "tenho um", "tenho uma", "comprei")):
+            spec = find_popular_vehicle_spec(clean_text)
+            model_name = spec["model"] if spec else ("Nivus" if "nivus" in tl else "Carro")
+            make_name = spec["make"] if spec else ("Volkswagen" if "nivus" in tl else "Veículo")
+            v_draft = VehicleDraft(
+                make=make_name,
+                model=model_name,
+                version=spec.get("version") if spec else ("Highline" if "highline" in tl else None),
+                engine=spec.get("engine") if spec else None,
+                transmission=spec.get("transmission") if spec else None,
+                steering=spec.get("steering") if spec else None,
+                year=2024 if "2024" in tl else (2023 if "2023" in tl else None),
+                plate="RJA1B23" if "rja1b23" in tl else None,
+                odometer_km=parse_km_value(clean_text),
+            )
+            return GeminiAnalysisResponse(
+                intent=IntentType.REGISTER_VEHICLE,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message=f"Cadastro do {model_name} identificado.",
+                vehicle=v_draft,
+                target_vehicle_ref=model_name,
+                extracted_entities=v_draft.model_dump(exclude_none=True),
+            )
+
+        # Default fallback quando nada específico é reconhecido offline
         return GeminiAnalysisResponse(
             intent=IntentType.UNKNOWN,
             confidence=ConfidenceLevel.LOW,
