@@ -146,6 +146,8 @@ class ConversationContext(BaseModel):
     updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
     draft_updated_at: Optional[dt.datetime] = Field(default=None, description="Última atividade do rascunho pendente (base do TTL, UTC)")
     turn_seq: int = Field(default=0, description="Contador sequencial monótono de turnos para controle de concorrência")
+    pending_edit_field: Optional[str] = Field(default=None, description="Campo do último serviço aguardando novo valor na condução ativa")
+    pending_edit_service_id: Optional[Any] = Field(default=None, description="ID do último serviço salvo em processo de edição")
 
     def advance_turn(self, content: str) -> int:
         self.turn_seq += 1

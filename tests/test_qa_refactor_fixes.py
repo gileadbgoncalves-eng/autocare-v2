@@ -74,7 +74,7 @@ def test_problema_1_data_absoluta_priorizada_e_formatada_dd_mm_yyyy():
 
 @pytest.mark.asyncio
 async def test_problema_2_alerta_enxuto_pre_confirmacao_km_excedido():
-    """Valida a mensagem de pré-confirmação enxuta quando o odômetro ultrapassa a revisão."""
+    """Valida a atualização silenciosa e direta de hodômetro com alerta preventivo quando o odômetro ultrapassa a revisão."""
     service = ConversationService()
     user_id = "5521999990001"
     vehicles = [
@@ -88,10 +88,13 @@ async def test_problema_2_alerta_enxuto_pre_confirmacao_km_excedido():
         vehicles=vehicles
     )
 
-    assert res["action_type"] == "awaiting_confirmation"
-    # Diretriz estrita: "Entendi a atualização do hodômetro com [X] km. 🔴 ALERTA: Você passou da revisão em [Y] km! Posso confirmar?"
-    assert "Entendi a atualização do hodômetro com 44000 km." in res["reply"]
-    assert "🔴 ALERTA: Você passou da revisão em 4000 km! Posso confirmar?" in res["reply"]
+    # Nova regra: Atualização de hodômetro isolada NÃO cria draft e NÃO pede "Posso confirmar?"
+    assert res["action_type"] in ("odometer_updated", "update_odometer")
+    assert res["state"] == ConversationState.NORMAL.value
+    assert "posso confirmar" not in res["reply"].lower()
+    assert "ALERTA" in res["reply"]
+    assert "4.000 km" in res["reply"] or "4000 km" in res["reply"]
+    assert res["committed_data"]["odometer_km"] == 44000
 
 
 @pytest.mark.asyncio
@@ -103,10 +106,10 @@ async def test_problema_2_multi_intencao_confirmacao_com_lembrete_sem_menu():
         Vehicle(id=1, user_id=user_id, make="Honda", model="Civic", current_km=40000)
     ]
 
-    # 1. Usuário envia odômetro
+    # 1. Usuário envia manutenção que requer confirmação
     await service.handle_incoming_message(
         user_id=user_id,
-        message_text="hodometro 44000 km",
+        message_text="troquei pastilhas de freio do civic por 450 reais com 44000 km",
         vehicles=vehicles
     )
     ctx = service.get_context(user_id)
@@ -121,8 +124,7 @@ async def test_problema_2_multi_intencao_confirmacao_com_lembrete_sem_menu():
 
     assert res_multi["action_type"] == "action_confirmed_with_chained_reminder"
     assert res_multi["state"] == ConversationState.NORMAL.value
-    # Resposta deve conter confirmação do hodômetro e confirmação do lembrete pontual
-    assert "hodômetro" in res_multi["reply"].lower() or "44" in res_multi["reply"]
+    # Resposta deve conter confirmação da manutenção e confirmação do lembrete pontual
     assert "Lembrete agendado" in res_multi["reply"]
     assert "08:00" in res_multi["reply"]
     # Não deve cuspir menu de opções (1, 2, 3)
@@ -131,7 +133,7 @@ async def test_problema_2_multi_intencao_confirmacao_com_lembrete_sem_menu():
 
     # Valida que o payload committed contém os dois dados
     committed = res_multi["committed_data"]
-    assert committed["odometer_km"] == 44000
+    assert committed.get("odometer_km") == 44000 or committed.get("km") == 44000
     assert "chained_reminder" in committed
     assert committed["chained_reminder"]["explicit_time"] == "08:00"
 

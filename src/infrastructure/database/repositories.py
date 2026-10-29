@@ -284,6 +284,79 @@ class VehicleRepository:
         """Alias para save (inserção/persistência de veículo)."""
         return await self.save(vehicle)
 
+    async def patch_vehicle_profile(self, vehicle_id: int, **fields) -> Optional[Vehicle]:
+        """
+        Atualiza de forma atômica e seletiva (PATCH) a ficha técnica de um veículo existente.
+        Campos com valores nulos, vazios ou placeholders genéricos nunca sobrescrevem
+        dados legítimos já gravados no banco.
+        """
+        stmt = select(VehicleModel).where(VehicleModel.id == vehicle_id)
+        result = await self.session.execute(stmt)
+        model = result.scalar_one_or_none()
+        if not model:
+            return None
+
+        placeholder_strings = {
+            "a cadastrar", "padrao", "padrão", "desconhecido", "none", "null",
+            "veículo", "veiculo", "carro", "padrão do modelo", "padrao do modelo", ""
+        }
+
+        for key, val in fields.items():
+            if val is None:
+                continue
+            if isinstance(val, str) and val.strip().lower() in placeholder_strings:
+                continue
+            if isinstance(val, str) and not val.strip():
+                continue
+
+            if key in ("plate", "placa"):
+                clean_p = str(val).upper().replace("-", "").strip()
+                if clean_p and clean_p.lower() not in placeholder_strings:
+                    model.plate = clean_p
+            elif key in ("make", "marca"):
+                model.make = str(val).strip()
+            elif key in ("model", "modelo"):
+                model.model = str(val).strip()
+            elif key in ("version", "versao"):
+                model.version = str(val).strip()
+            elif key in ("year", "ano"):
+                try:
+                    model.year = int(val)
+                except (ValueError, TypeError):
+                    pass
+            elif key in ("engine", "motor"):
+                model.engine = str(val).strip()
+            elif key in ("transmission", "cambio"):
+                model.transmission = str(val).strip()
+            elif key in ("steering", "direcao"):
+                model.steering = str(val).strip()
+            elif key in ("current_km", "km", "odometer_km"):
+                try:
+                    km_int = int(val)
+                    if model.current_km is None or km_int >= model.current_km:
+                        model.current_km = km_int
+                except (ValueError, TypeError):
+                    pass
+            elif key == "vehicle_type":
+                if isinstance(val, VehicleType):
+                    model.vehicle_type = val.value
+                elif str(val) in [e.value for e in VehicleType]:
+                    model.vehicle_type = str(val)
+            elif key == "fuel_type":
+                if isinstance(val, FuelType):
+                    model.fuel_type = val.value
+                elif str(val) in [e.value for e in FuelType]:
+                    model.fuel_type = str(val)
+            elif key == "usage_profile":
+                if isinstance(val, UsageProfile):
+                    model.usage_profile = val.value
+                elif str(val) in [e.value for e in UsageProfile]:
+                    model.usage_profile = str(val)
+
+        await self.session.commit()
+        await self.session.refresh(model)
+        return self._to_entity(model)
+
     async def update_km(self, vehicle_id: int, km: int) -> Optional[Vehicle]:
         """Atualiza a quilometragem atual do veículo de forma atômica."""
         stmt = select(VehicleModel).where(VehicleModel.id == vehicle_id)
@@ -422,6 +495,71 @@ class MaintenanceRepository:
         result = await self.session.execute(stmt)
         models = result.scalars().all()
         return [self._to_entity(m) for m in models]
+
+    async def update_maintenance_record(
+        self,
+        service_id: int,
+        components: Optional[List[str]] = None,
+        km: Optional[int] = None,
+        date_val: Optional[object] = None,
+        workshop_name: Optional[str] = None,
+        total_cost: Optional[float] = None,
+        description: Optional[str] = None,
+    ) -> Optional[MaintenanceRecord]:
+        """
+        Atualiza diretamente os campos de um registro de manutenção salvo (update_last_saved_service).
+        """
+        from datetime import date as date_cls
+
+        target_id = int(service_id) if isinstance(service_id, str) and service_id.isdigit() else service_id
+        stmt = select(MaintenanceRecordModel).where(MaintenanceRecordModel.id == target_id)
+        result = await self.session.execute(stmt)
+        model = result.scalar_one_or_none()
+        if not model:
+            return None
+
+        if components is not None:
+            clean_comps = [str(c).strip() for c in components if str(c).strip()]
+            if clean_comps:
+                model.components = clean_comps
+                model.description = description or ", ".join(clean_comps)
+        elif description is not None:
+            model.description = description
+
+        if km is not None:
+            model.km = int(km)
+            veh_stmt = select(VehicleModel).where(VehicleModel.id == model.vehicle_id)
+            veh_res = await self.session.execute(veh_stmt)
+            veh = veh_res.scalar_one_or_none()
+            if veh and (veh.current_km is None or int(km) >= veh.current_km):
+                veh.current_km = int(km)
+
+        if date_val is not None:
+            parsed_date = None
+            if isinstance(date_val, datetime):
+                parsed_date = date_val.date()
+            elif isinstance(date_val, date_cls):
+                parsed_date = date_val
+            elif isinstance(date_val, str):
+                s = date_val.strip()
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                    try:
+                        parsed_date = datetime.strptime(s, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+            if parsed_date is not None:
+                model.date = parsed_date
+
+        if workshop_name is not None:
+            model.workshop_name = workshop_name
+
+        if total_cost is not None:
+            model.total_cost = float(total_cost)
+
+        await self.session.commit()
+        await self.session.refresh(model)
+        return self._to_entity(model)
 
     async def delete_all_by_user_id(self, user_id: str) -> int:
         """Remove todos os registros de manutenção do usuário."""

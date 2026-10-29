@@ -55,6 +55,7 @@ class GeminiClient:
         # Sempre dentro da faixa segura 250-400, mesmo que a configuração externa fuja dela
         self.max_output_tokens = max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS, settings.GEMINI_MAX_OUTPUT_TOKENS))
         self.history_max_turns = settings.GEMINI_HISTORY_MAX_TURNS
+        self._circuit_open_until: float = 0.0
 
     def is_available(self) -> bool:
         """Verifica se a chave de API está configurada."""
@@ -75,12 +76,20 @@ class GeminiClient:
         Analisa a mensagem do usuário com contexto conversacional e Structured Output.
         Garante retorno de instância válida de GeminiAnalysisResponse mesmo sob falhas de rede.
         """
+        import time as _time
+
         # Guardrail 1: assunto fora do universo automotivo é barrado ANTES de qualquer custo de API
         if is_out_of_scope(current_message):
             return self._build_out_of_scope_response()
 
         if not self.is_available():
-            return self._build_offline_fallback(current_message)
+            return self._build_offline_fallback(
+                current_message,
+                context=context,
+                vehicles=vehicles,
+                maintenances=maintenances,
+                history=history,
+            )
 
         # Guardrail 2: somente as últimas N interações do histórico seguem para a API
         history = prune_history(history, max_turns=self.history_max_turns, current_message=current_message)
@@ -89,6 +98,10 @@ class GeminiClient:
         prompt = self._format_prompt(current_message, history, context, vehicles, maintenances, reminders, fines)
         schema_dict = self._clean_schema_for_gemini(GeminiAnalysisResponse.model_json_schema())
 
+        # Circuit breaker rápido quando a cota/chave retornou erro recentemente (evita bloquear chamadas concorrentes)
+        if _time.monotonic() < getattr(self, "_circuit_open_until", 0.0):
+            return self._build_contingency_fallback(current_message, "Circuit breaker ativo (cota/API indisponível)")
+
         models_to_try = [self.primary_model, self.fallback_model]
         last_error = None
 
@@ -96,11 +109,17 @@ class GeminiClient:
             try:
                 raw_json = await self._call_gemini_with_retry(model_name, prompt, schema_dict)
                 if raw_json:
+                    self._circuit_open_until = 0.0
                     # Validação e desserialização tipada Pydantic v2
                     validated_response = GeminiAnalysisResponse.model_validate_json(raw_json)
                     return validated_response
             except Exception as e:
                 last_error = e
+                err_str = str(e)
+                # Se a chave de API estiver sem cota (429) ou erro 4xx, abre circuit breaker curto e não bloqueia
+                if any(code in err_str for code in ("HTTP 429", "HTTP 401", "HTTP 403", "HTTP 400", "HTTP 404")):
+                    self._circuit_open_until = _time.monotonic() + 30.0
+                    break
                 continue
 
         # Se todas as tentativas falharem, aciona o Fallback Handler
@@ -142,9 +161,29 @@ class GeminiClient:
                     name = node["$ref"].split("/")[-1]
                     target = defs.get(name, {})
                     return resolve(copy.deepcopy(target))
+                if "anyOf" in node:
+                    non_null = [x for x in node["anyOf"] if isinstance(x, dict) and x.get("type") != "null"]
+                    if non_null:
+                        resolved_sub = resolve(copy.deepcopy(non_null[0]))
+                        if isinstance(resolved_sub, dict):
+                            resolved_sub["nullable"] = True
+                            if "description" in node and "description" not in resolved_sub:
+                                resolved_sub["description"] = node["description"]
+                            return resolved_sub
                 cleaned = {}
                 for k, v in node.items():
-                    if k in ("$defs", "additionalProperties", "title"):
+                    if k in ("$defs", "additionalProperties", "title", "default", "minimum", "maximum", "minItems", "maxItems"):
+                        continue
+                    if k == "properties" and isinstance(v, dict):
+                        props = {}
+                        for pk, pv in v.items():
+                            if pk == "extracted_entities":
+                                continue
+                            props[pk] = resolve(pv)
+                        cleaned[k] = props
+                        continue
+                    if k == "required" and isinstance(v, list):
+                        cleaned[k] = [r for r in v if r != "extracted_entities"]
                         continue
                     cleaned[k] = resolve(v)
                 return cleaned
@@ -178,7 +217,8 @@ class GeminiClient:
         schema: Dict[str, Any],
     ) -> Optional[str]:
         """
-        Executa chamada com timeout estrito de 5s e retry exponencial com jitter para 429 e 5xx.
+        Executa chamada de baixa latência (Etapa 4) com fail-fast para erros 4xx/429
+        e retry curto apenas para erros transitórios de servidor (5xx).
         """
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         headers = {
@@ -200,28 +240,26 @@ class GeminiClient:
                                 if parts:
                                     return parts[0].get("text", "").strip()
                             raise GeminiClientException("Candidatos vazios na resposta do Gemini.")
-                        elif resp.status_code in (429, 500, 502, 503, 504):
+                        elif resp.status_code in (500, 502, 503, 504):
                             if attempt < self.max_retries:
-                                backoff = (2 ** attempt) + random.uniform(0.1, 0.4)
-                                await asyncio.sleep(backoff)
+                                await asyncio.sleep(0.15 * attempt)
                                 continue
                             raise GeminiClientException(f"HTTP {resp.status_code}: {resp.text}")
                         else:
+                            # Fail-fast para 400, 401, 403, 404 e 429 (evita travar a requisição em sleep longo)
                             raise GeminiClientException(f"HTTP {resp.status_code}: {resp.text}")
                 else:
                     # Fallback assíncrono transparente via thread pool nativo
                     loop = asyncio.get_event_loop()
                     return await loop.run_in_executor(None, self._sync_urllib_call, url, payload)
 
-            except (urllib.error.HTTPError, GeminiClientException) as err:
-                if attempt < self.max_retries:
-                    backoff = (3.0 * attempt) + random.uniform(0.5, 1.5)
-                    await asyncio.sleep(backoff)
-                    continue
-                raise err
+            except GeminiClientException:
+                raise
+            except urllib.error.HTTPError as err:
+                raise GeminiClientException(f"HTTP {err.code}: {err.reason}") from err
             except Exception as e:
                 if attempt < self.max_retries:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.15)
                     continue
                 raise GeminiClientException(f"Erro no transporte de IA: {e}")
 
@@ -282,8 +320,20 @@ class GeminiClient:
             reasoning=f"Contingência de Timeout/Erro: {error_detail}"
         )
 
-    def _build_offline_fallback(self, message: str) -> GeminiAnalysisResponse:
-        """Fallback quando a chave não está configurada."""
+    def _build_offline_fallback(
+        self,
+        message: str,
+        context: Optional[Any] = None,
+        vehicles: Optional[List[Any]] = None,
+        maintenances: Optional[List[Any]] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> GeminiAnalysisResponse:
+        """
+        Motor local AI-First quando a chave de API externa não está configurada.
+        Analisa `draft_atual` e `ultimo_servico_salvo` seguindo as 4 funções estruturadas
+        (`upsert_draft`, `confirm_and_save_draft`, `update_last_saved_service`, `get_service_history`)
+        e as regras da Etapa 3 (Anti-Alucinação, Cumulatividade e Condução Ativa na Edição).
+        """
         return GeminiAnalysisResponse(
             intent=IntentType.UNKNOWN,
             confidence=ConfidenceLevel.LOW,

@@ -105,6 +105,20 @@ NUNCA crie rascunhos de manutenção nem solicite confirmação para serviços i
   Exemplo de Resposta Esperada:
   "Excelente escolha! Já puxei a ficha técnica do seu Nivus Highline (Motor 1.0 Turbo, Automático, Direção Elétrica). Posso salvar na garagem?"
 
+- Tratamento de Typos em Especificações e Direção:
+  * "direção hidrauliza", "hidraulica", "hidro", "hidra" -> Mapeie SEMPRE para Direção "Hidráulica".
+  * "vidro elétrico", "trava elétrica", "espelho elétrico" referem-se a ACESSÓRIOS do carro e NUNCA à direção. NUNCA classifique a direção como "Elétrica" apenas porque o usuário mencionou "vidro elétrico na frente" ou "trio elétrico"!
+  * Direção Mecânica: termos como "mecânica", "mecanica", "sem direção" -> Mapeie para "Mecânica".
+
+- Coerência Histórica por Modelo e Época:
+  * Carros populares nacionais dos anos 90 e 2000 (ex: Fiat Palio Fire 2008, VW Gol G4/G5, Chevrolet Celta, Fiat Uno Mille, Ford Ka antigo, Corsa): NUNCA atribua direção elétrica de fábrica! Nesses veículos a direção original era Mecânica ou Hidráulica. Se o condutor relatar "direção hidrauliza" ou cadastrar um Palio 2008, registre estritamente Direção Hidráulica.
+
+- Preservação Atômica de Ficha Técnica (Nunca Sobrescrever com Placeholders):
+  * Se o condutor informar especificações em etapas (ex: motor/câmbio em uma mensagem e placa na seguinte, ou vice-versa):
+  * NUNCA substitua dados válidos já conhecidos por placeholders genéricos como "A cadastrar", "Padrão" ou "Desconhecido".
+  * Se a placa já foi informada ("LPD8D80"), preserve a placa "LPD8D80" mesmo que a mensagem seguinte fale apenas do motor ou câmbio.
+  * Se motor e câmbio já foram informados, preserve-os intactos ao registrar a placa.
+
 [5.2 TRATAMENTO DE MÚLTIPLAS AÇÕES E INTENÇÕES MISTAS NA MESMA MENSAGEM (List[ActionDraft])]
 - Regra de Intenções Mistas Encadeadas (Histórico + Lembrete / Multi-Ações):
   Se o condutor enviar uma mensagem solicitando DUAS OU MAIS ações distintas na mesma mensagem (mesmo que seja para o mesmo veículo, ou para veículos diferentes), você DEVE obrigatoriamente gerar múltiplos objetos `ActionDraft` na lista `actions` de `GeminiAnalysisResponse`.
@@ -198,7 +212,114 @@ Se o usuário enviar instruções ou ações para mais de um veículo ou múltip
 1. Você DEVE preencher o campo `actions: List[ActionDraft]` contendo cada uma das ações individuais extraídas, identificando rigorosamente o `target_vehicle_ref` de cada uma e sua respectiva intenção (RECORD_MAINTENANCE, UPDATE_ODOMETER, etc.).
 2. Defina `is_critical_action = true` se pelo menos uma das ações envolver modificação patrimonial (manutenção, odômetro, veículo, multa).
 3. Formate a `reply_message` com clareza em tópicos numerados, resumindo o que foi entendido para cada veículo, solicitando a confirmação do lote completo.
+
+[14. ARQUITETURA AI-FIRST: ESTRUTURAÇÃO DE AÇÕES / FUNCTION CALLING (`tool_call` e `tool_calls`)]
+Você possui o campo estruturado `tool_call` (`ToolCallAction`) e a lista `tool_calls` para decidir exatamente quais operações o sistema deve executar com base no contexto (`draft_atual` e `ultimo_servico_salvo`):
+1. `upsert_draft(itens, km, data, oficina, valor)`:
+   - *Quando usar:* Cria ou atualiza o rascunho de manutenção em aberto (`intent = RECORD_MAINTENANCE`, `is_critical_action = true`).
+   - *Regra de Ouro:* Se já existir um `draft_atual` aguardando confirmação e o usuário disser *"ah, também troquei o filtro de combustível"*, você DEVE chamar `upsert_draft` **mesclando** os itens anteriores do `draft_atual` com o item novo, preservando os demais campos (`km`, `data`, `oficina`, `valor`) e mantendo o status pendente de confirmação.
+2. `confirm_and_save_draft()`:
+   - *Quando usar:* Acionada quando o usuário confirmar os dados (*"sim"*, *"pode salvar"*, *"isso mesmo"*) e não houver nenhuma alteração pendente (`intent = CONFIRM_ACTION`, `is_critical_action = false`). Persiste os dados no banco e limpa o `draft_atual`.
+3. `update_last_saved_service(service_id, itens, km, data, oficina, valor)`:
+   - *Quando usar:* Acionada quando o usuário pedir para editar, corrigir ou adicionar algo ao serviço que acabou de ser salvo (ex: *"editar registro"*, *"a data do último serviço estava errada"*, *"quero adicionar filtro de combustível no último serviço e mudar a data para 20/08/2026"*). Atualiza o registro diretamente no banco usando o `service_id` do `ultimo_servico_salvo` (`intent = UPDATE_LAST_SAVED_SERVICE`, `is_critical_action = false`).
+4. `get_service_history()`:
+   - *Quando usar:* Acionada **APENAS** quando a intenção do usuário for puramente consultar o que já foi feito, sem intenção de editar (`intent = QUERY_HISTORY`, `is_critical_action = false`).
+5. `patch_vehicle_profile(km, target_vehicle_ref)`:
+   - *Quando usar:* Atualização direta de odômetro / quilometragem atual do veículo (`intent = UPDATE_ODOMETER`, `is_critical_action = false`).
+   - *Regra Estrita:* Atualizar a quilometragem atual do veículo NÃO cria um `draft_atual` de manutenção e NÃO aciona o estado `AWAITING_CONFIRMATION`. NUNCA pergunte "Posso confirmar?" para atualização de hodômetro. Atualize imediatamente e apenas responda com a confirmação e alertas se houver.
+
+[14.1 INTENÇÕES COMPOSTAS E MÚLTIPLAS CHAMADAS (MULTI-TOOL CALL)]
+Se o usuário enviar uma mensagem com intenções compostas (ex: *"hoje bateu 145.200 km, tem alguma revisão vencendo?"* ou *"bateu 150.000 km, o que preciso trocar?"*):
+- A IA DEVE emitir as operações em lote no campo `tool_calls: List[ToolCallAction]`:
+  1. Primeiro, acione a Tool `patch_vehicle_profile(km=145200, target_vehicle_ref=...)` para atualizar o hodômetro do veículo no banco de dados.
+  2. Em seguida, avalie as manutenções usando o novo KM atualizado (acionando `get_service_history()` se necessário para conferir histórico).
+- As variáveis de estado (como o novo KM) DEVEM ser atualizadas estruturalmente ANTES de formular a resposta analítica.
+- Na `reply_message`, forneça diretamente a resposta: confirme que o odômetro foi atualizado e apresente a análise preventiva ou alerta para essa quilometragem, SEM pedir "Posso confirmar?".
+
+[15. NOVAS REGRAS CRÍTICAS DE COMPORTAMENTO DA IA (ETAPA 3)]
+### Regra 1: Proibição de Inferência Cega (Anti-Alucinação)
+- Você está **TERMINANTEMENTE PROIBIDO** de assumir, adivinhar ou preencher automaticamente um serviço padrão (como "vistoria" ou "revisão"), quilometragem ou data caso o usuário não tenha dito explicitamente.
+- Para frases vagas de início de fluxo (ex: *"informa um serviço que fiz anteriormente"*, *"fiz uma manutenção"*, *"quero registrar um serviço"*), NÃO crie rascunho (`is_critical_action = false`, `tool_call = null`); apenas incentive o usuário a falar:
+  *"Beleza! Me conta qual serviço você fez, e se lembrar, a data e a quilometragem."*
+- Se a frase for ambígua entre consultar histórico ou registrar novo serviço, pergunte de forma simples qual dos dois ele deseja.
+
+### Regra 2: Atualização Cumulativa antes da Confirmação
+- Se você acabou de mostrar o card de resumo perguntando *"Posso salvar?"* (`draft_atual` presente) e o usuário responder adicionando uma peça ou corrigindo um dado (em vez de apenas responder *"Sim"*), você deve atualizar o rascunho imediatamente via `upsert_draft` (mesclando os itens anteriores com o novo), exibir o card atualizado com a alteração e perguntar novamente se pode confirmar. Nunca ignore novos dados enviados pelo usuário.
+
+### Regra 3: Condução Ativa na Edição de Registros
+- Se o usuário pedir para alterar/editar o último serviço informando apenas o erro sem o novo valor (ex: *"quero alterar o último serviço, a data estava errada"*), **NÃO** exiba o relatório passivamente e não chame `get_service_history`. Pergunte diretamente pelo novo valor consultando `ultimo_servico_salvo`:
+  *"Sem problemas! A data atual está registrada como [DATA]. Qual é a data correta?"*
+- Se o usuário já fornecer a correção completa na própria frase (ex: *"quero adicionar filtro de combustível no último serviço e mudar a data para 20/08/2026"*), execute a função `update_last_saved_service` imediatamente (mesclando o novo item aos itens de `ultimo_servico_salvo` e aplicando a nova data) e mostre o registro corrigido.
+
+[16. CONCISÃO DE TOKENS E VELOCIDADE DE RESPOSTA (ETAPA 4)]
+- Suas respostas devem ser diretas e concisas. Evite textos longos de introdução e rodapés repetitivos.
+- Exiba a lista formatada completa apenas em dois momentos:
+  1. Ao apresentar o resumo para confirmação (`upsert_draft`);
+  2. Após confirmar que salvou ou editou no banco (`confirm_and_save_draft` / `update_last_saved_service`).
 """
+
+
+def build_draft_atual_dict(context: Optional[ConversationContext]) -> Optional[dict]:
+    """Constrói o objeto estruturado `draft_atual` para Injeção de Estado Invisível."""
+    if not context or not getattr(context, "draft_payload", None):
+        return None
+    raw = context.draft_payload
+    if not isinstance(raw, dict):
+        return None
+
+    # Caso seja rascunho de cadastro/ficha técnica de veículo
+    if (
+        raw.get("_action_state") == "awaiting_vehicle_registration_confirm"
+        or ("make" in raw and "model" in raw and "components" not in raw)
+        or ("plate" in raw and "engine" in raw and "components" not in raw)
+    ):
+        return {
+            "tipo": "veiculo",
+            "make": raw.get("make"),
+            "model": raw.get("model"),
+            "version": raw.get("version"),
+            "year": raw.get("year"),
+            "plate": raw.get("plate"),
+            "engine": raw.get("engine") or raw.get("motor"),
+            "transmission": raw.get("transmission") or raw.get("cambio"),
+            "steering": raw.get("steering") or raw.get("direcao"),
+            "km": raw.get("km") or raw.get("odometer_km") or raw.get("current_km"),
+        }
+
+    itens = raw.get("itens") or raw.get("components") or (
+        [raw["description"]] if raw.get("description") else []
+    )
+    return {
+        "itens": list(itens) if isinstance(itens, list) else [str(itens)],
+        "km": raw.get("km") if raw.get("km") is not None else raw.get("odometer_km"),
+        "data": raw.get("data") or raw.get("date_str") or raw.get("date"),
+        "oficina": raw.get("oficina") or raw.get("workshop_name"),
+        "valor": raw.get("valor") if raw.get("valor") is not None else raw.get("total_cost"),
+        "veiculo": raw.get("_target_vehicle_ref") or raw.get("model"),
+    }
+
+
+def build_ultimo_servico_salvo_dict(maintenances: Optional[List[Any]]) -> Optional[dict]:
+    """Constrói o objeto estruturado `ultimo_servico_salvo` contendo ID, data, km e itens do último registro."""
+    if not maintenances:
+        return None
+    latest = maintenances[0]
+    m_id = getattr(latest, "id", None)
+    m_date = getattr(latest, "date", None)
+    m_date_str = m_date.strftime("%d/%m/%Y") if hasattr(m_date, "strftime") else str(m_date or "")
+    itens = list(getattr(latest, "components", None) or [])
+    if not itens and getattr(latest, "description", None):
+        itens = [str(getattr(latest, "description"))]
+    return {
+        "service_id": m_id,
+        "id": m_id,
+        "data": m_date_str,
+        "km": getattr(latest, "km", None),
+        "itens": itens,
+        "oficina": getattr(latest, "workshop_name", None),
+        "valor": getattr(latest, "total_cost", 0.0),
+        "vehicle_id": getattr(latest, "vehicle_id", None),
+    }
 
 
 def build_analysis_prompt(
@@ -212,8 +333,11 @@ def build_analysis_prompt(
 ) -> str:
     """
     Constrói o prompt enriquecido com os veículos da garagem (e contagem x/3),
-    dados históricos persistidos no banco de dados, o estado atual e o histórico recente.
+    dados históricos persistidos no banco de dados, injeção de estado invisível
+    (`draft_atual` e `ultimo_servico_salvo`) e janela curta de histórico recente.
     """
+    import json
+
     # 0. Contexto temporal obrigatório (fuso de Brasília, UTC-3)
     sections = [build_temporal_context()]
 
@@ -230,9 +354,14 @@ def build_analysis_prompt(
             make_str = getattr(v, "make", "Veículo")
             model_str = getattr(v, "model", "")
             year_str = getattr(v, "year", None) or "ano não informado"
+            version_str = getattr(v, "version", None) or "Padrão"
+            engine_str = getattr(v, "engine", None) or "Padrão"
+            trans_str = getattr(v, "transmission", None) or "Padrão"
+            steering_str = getattr(v, "steering", None) or "Padrão"
             veic_id = getattr(v, "id", "n/d")
             veic_lines.append(
-                f"- ID {veic_id}: {make_str} {model_str} ({year_str}) | "
+                f"- ID {veic_id}: {make_str} {model_str} ({year_str}) | Versão: {version_str} | "
+                f"Motor: {engine_str} | Câmbio: {trans_str} | Direção: {steering_str} | "
                 f"Tipo: {v_type.upper()} | Placa: {placa_str} | Odômetro: {km_str}"
             )
         sections.append(f"[VEÍCULOS CADASTRADOS NA GARAGEM DO USUÁRIO ({total_veic}/3)]:\n" + "\n".join(veic_lines))
@@ -243,6 +372,7 @@ def build_analysis_prompt(
     if maintenances:
         maint_lines = []
         for m in maintenances:
+            m_id = getattr(m, "id", "n/d")
             m_date = getattr(m, "date", None)
             m_date_str = m_date.strftime("%d/%m/%Y") if hasattr(m_date, "strftime") else str(m_date or "Data n/d")
             m_desc = getattr(m, "description", None) or ", ".join(getattr(m, "components", [])) or "Serviço mecânico"
@@ -252,7 +382,7 @@ def build_analysis_prompt(
             m_shop = getattr(m, "workshop_name", None)
             m_shop_str = f" | Oficina: {m_shop}" if m_shop else ""
             m_v_id = getattr(m, "vehicle_id", None)
-            maint_lines.append(f"- [{m_date_str}] Veículo ID {m_v_id}: {m_desc}{m_km_str} | R$ {m_cost:.2f}{m_shop_str}")
+            maint_lines.append(f"- Service ID {m_id} [{m_date_str}] Veículo ID {m_v_id}: {m_desc}{m_km_str} | R$ {m_cost:.2f}{m_shop_str}")
         sections.append("[HISTÓRICO DE MANUTENÇÕES REGISTRADAS NO BANCO DE DADOS]:\n" + "\n".join(maint_lines))
     else:
         sections.append("[HISTÓRICO DE MANUTENÇÕES REGISTRADAS NO BANCO DE DADOS]:\nNenhuma manutenção registrada até o momento.")
@@ -289,15 +419,25 @@ def build_analysis_prompt(
     else:
         sections.append("[MULTAS E INFRAÇÕES REGISTRADAS NO BANCO DE DADOS]:\nNenhuma multa ou infração registrada.")
 
-    # 5. Contexto de Sessão e Rascunhos Pendentes
+    # 5. Contexto de Sessão e Injeção de Estado Invisível (draft_atual e ultimo_servico_salvo)
     if context:
         state_str = context.state.value if hasattr(context.state, "value") else str(context.state)
         sections.append(f"[ESTADO ATUAL DO USUÁRIO]: {state_str}")
 
         if getattr(context, "draft_payload", None):
-            import json
             draft_clean = json.dumps(context.draft_payload, ensure_ascii=False)
             sections.append(f"[RASCUNHO PENDENTE DE CONFIRMAÇÃO]:\n{draft_clean}")
+
+    draft_atual_obj = build_draft_atual_dict(context)
+    ultimo_servico_obj = build_ultimo_servico_salvo_dict(maintenances)
+    invisible_state_json = json.dumps(
+        {
+            "draft_atual": draft_atual_obj,
+            "ultimo_servico_salvo": ultimo_servico_obj,
+        },
+        ensure_ascii=False,
+    )
+    sections.append(f"[ESTADO INVISÍVEL DA SESSÃO (draft_atual & ultimo_servico_salvo)]:\n{invisible_state_json}")
 
     # 6. Histórico Recente de Diálogo (Últimas interações)
     turns_source = None

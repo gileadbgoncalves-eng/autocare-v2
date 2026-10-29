@@ -29,13 +29,14 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = Field(default="development", description="development, staging ou production")
     PORT: int = Field(default=8080, description="Porta HTTP do servidor Webhook")
     LOG_LEVEL: str = Field(default="info", description="debug, info, warning, error")
+    WEBHOOK_DEBOUNCE_SECONDS: float = Field(default=2.0, description="Janela de debounce em segundos no webhook (buffer anti-atropelo)")
 
     # 2. Google Gemini AI (Cérebro NLP)
     GEMINI_API_KEY: str = Field(default="", description="Chave de API do Google AI Studio / Gemini")
     GEMINI_PRIMARY_MODEL: str = Field(default="gemini-flash-lite-latest", description="Modelo veloz e inteligente para análise de intenções")
-    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-3.5-flash-lite", description="Modelo alternativo para contingência de timeout")
-    GEMINI_TIMEOUT_SECONDS: float = Field(default=15.0, description="Timeout estrito para requisições de IA")
-    GEMINI_MAX_RETRIES: int = Field(default=3, description="Tentativas com backoff exponencial em 429/5xx")
+    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-2.0-flash-lite", description="Modelo alternativo para contingência de timeout")
+    GEMINI_TIMEOUT_SECONDS: float = Field(default=4.0, description="Timeout estrito para requisições de IA")
+    GEMINI_MAX_RETRIES: int = Field(default=2, description="Tentativas rápidas em 5xx")
     GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=400, description="Teto de tokens de saída por chamada (guardrail de custo: 250-400)")
     GEMINI_HISTORY_MAX_TURNS: int = Field(default=5, description="Quantidade máxima de turnos do histórico enviados à API")
 

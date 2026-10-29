@@ -118,10 +118,13 @@ async def test_criar_veiculo_placa_valida_mercosul_retorna_201(proprietario_test
     Deve aceitar placas válidas no padrão Mercosul em minúsculas ('bra2e19'),
     sanitizando e normalizando para 'BRA2E19' com status 201 Created.
     """
+    import random
+    import string
+    prefix = "".join(random.choices(string.ascii_lowercase, k=3))
     dig1 = random.randint(1, 9)
     dig2 = random.randint(10, 99)
-    placa_mercosul_input = f"bra{dig1}e{dig2}"
-    placa_mercosul_esperada = f"BRA{dig1}E{dig2}"
+    placa_mercosul_input = f"{prefix}{dig1}e{dig2}"
+    placa_mercosul_esperada = f"{prefix.upper()}{dig1}E{dig2}"
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

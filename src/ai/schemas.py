@@ -4,7 +4,7 @@ Contratos estritos tipados em Pydantic v2 utilizados no response_schema do Googl
 Garante que a resposta da IA venha sempre formatada em JSON previsível e 100% validada.
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.domain.enums import (
@@ -240,6 +240,64 @@ class ActionDraft(BaseModel):
         return self
 
 
+class ToolCallAction(BaseModel):
+    """
+    Estrutura de Function Calling / Ação Estruturada decidida pela IA (Arquitetura AI-First).
+    Suporta as 4 operações centrais de manutenção e histórico:
+    - upsert_draft(itens, km, data, oficina, valor)
+    - confirm_and_save_draft()
+    - update_last_saved_service(service_id, itens, km, data, oficina, valor)
+    - get_service_history()
+    """
+    name: Literal[
+        "upsert_draft",
+        "confirm_and_save_draft",
+        "update_last_saved_service",
+        "get_service_history",
+        "patch_vehicle_profile",
+    ] = Field(..., description="Nome exato da função a ser executada pelo backend")
+    target_vehicle_ref: Optional[str] = Field(
+        default=None,
+        description="Referência ao veículo alvo se aplicável (ex: 'Palio', 'Civic', placa)"
+    )
+    service_id: Optional[int] = Field(
+        default=None,
+        description="ID do serviço salvo no banco (usado em update_last_saved_service a partir de ultimo_servico_salvo)"
+    )
+    itens: Optional[List[str]] = Field(
+        default=None,
+        description="Lista completa de itens/peças/serviços (mesclada cumulativamente em upsert_draft ou atualizada em update_last_saved_service)"
+    )
+    km: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Quilometragem do veículo no momento do serviço ou para atualização de hodômetro"
+    )
+    data: Optional[str] = Field(
+        default=None,
+        description="Data do serviço no formato DD/MM/AAAA (apenas se informada explicitamente ou mantida do estado)"
+    )
+    oficina: Optional[str] = Field(
+        default=None,
+        description="Nome da oficina ou mecânico onde o serviço foi realizado"
+    )
+    valor: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Valor financeiro total pago pelo serviço em reais (R$)"
+    )
+
+    @field_validator("oficina", mode="before")
+    @classmethod
+    def validate_tool_oficina(cls, v: Optional[str]) -> Optional[str]:
+        return MaintenanceDraft.validate_workshop_name(v)
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def normalize_tool_data(cls, v: Optional[str]) -> Optional[str]:
+        return MaintenanceDraft.normalize_date_str(v)
+
+
 class GeminiAnalysisResponse(BaseModel):
     """
     Contrato Raiz de Structured Output do Google Gemini.
@@ -268,6 +326,16 @@ class GeminiAnalysisResponse(BaseModel):
         description="Justificativa técnica resumida para fins de observabilidade e auditoria"
     )
 
+    # Function Calling / Ação Estruturada (Arquitetura AI-First)
+    tool_call: Optional[ToolCallAction] = Field(
+        default=None,
+        description="Ação estruturada / Function Calling primária decidida pela IA: upsert_draft, confirm_and_save_draft, update_last_saved_service, get_service_history ou patch_vehicle_profile"
+    )
+    tool_calls: List[ToolCallAction] = Field(
+        default_factory=list,
+        description="Lista de ações estruturadas / Function Calling decididas pela IA (para execução múltipla em lote / intenções compostas)"
+    )
+
     # Modelos auxiliares opcionais tipados para facilitar serialização e acesso
     vehicle: Optional[VehicleDraft] = Field(default=None, description="Detalhes se intent for REGISTER_VEHICLE")
     maintenance: Optional[MaintenanceDraft] = Field(default=None, description="Detalhes se intent for RECORD_MAINTENANCE")
@@ -277,6 +345,44 @@ class GeminiAnalysisResponse(BaseModel):
         default_factory=list,
         description="Lista de ações estruturadas quando a mensagem contiver múltiplas intenções ou múltiplos veículos"
     )
+
+    @model_validator(mode="after")
+    def sync_tool_call_and_intent(self) -> "GeminiAnalysisResponse":
+        """Sincroniza tool_call e tool_calls (Function Calling AI-First) com intent e modelos auxiliares."""
+        if self.tool_calls and not self.tool_call:
+            self.tool_call = self.tool_calls[0]
+        elif self.tool_call and not self.tool_calls:
+            self.tool_calls = [self.tool_call]
+
+        if self.tool_call:
+            tc = self.tool_call
+            if tc.name == "upsert_draft":
+                if self.intent in (IntentType.UNKNOWN, IntentType.UPSERT_DRAFT):
+                    self.intent = IntentType.RECORD_MAINTENANCE
+                self.is_critical_action = True
+                if not self.maintenance and (tc.itens or tc.km is not None or tc.data or tc.oficina or tc.valor is not None):
+                    self.maintenance = MaintenanceDraft(
+                        components=list(tc.itens or []),
+                        service_summary=", ".join(tc.itens) if tc.itens else None,
+                        odometer_km=tc.km,
+                        date_str=tc.data,
+                        workshop_name=tc.oficina,
+                        total_cost=tc.valor,
+                    )
+            elif tc.name == "confirm_and_save_draft":
+                self.intent = IntentType.CONFIRM_ACTION
+                self.is_critical_action = False
+            elif tc.name == "update_last_saved_service":
+                self.intent = IntentType.UPDATE_LAST_SAVED_SERVICE
+                self.is_critical_action = False
+            elif tc.name == "get_service_history":
+                self.intent = IntentType.QUERY_HISTORY
+                self.is_critical_action = False
+            elif tc.name == "patch_vehicle_profile":
+                if self.intent in (IntentType.UNKNOWN, IntentType.RECORD_MAINTENANCE):
+                    self.intent = IntentType.UPDATE_ODOMETER
+                self.is_critical_action = False
+        return self
 
 
 # Alias para retrocompatibilidade

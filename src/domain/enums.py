@@ -31,8 +31,10 @@ class IntentType(str, Enum):
     REGISTER_FINE = "register_fine"
     RESET_GARAGE = "reset_garage"
 
-    # Atualizações Diretas
+    # Atualizações Diretas & Function Calling AI-First
     UPDATE_ODOMETER = "update_odometer"
+    UPSERT_DRAFT = "upsert_draft"
+    UPDATE_LAST_SAVED_SERVICE = "update_last_saved_service"
 
     # Consultas Informativas (Somente Leitura)
     QUERY_HISTORY = "query_history"
