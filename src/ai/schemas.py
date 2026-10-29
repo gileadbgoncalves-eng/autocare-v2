@@ -4,7 +4,7 @@ Contratos estritos tipados em Pydantic v2 utilizados no response_schema do Googl
 Garante que a resposta da IA venha sempre formatada em JSON previsível e 100% validada.
 """
 
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.domain.enums import (
@@ -260,7 +260,7 @@ class ToolCallAction(BaseModel):
         default=None,
         description="Referência ao veículo alvo se aplicável (ex: 'Palio', 'Civic', placa)"
     )
-    service_id: Optional[int] = Field(
+    service_id: Optional[Union[int, str]] = Field(
         default=None,
         description="ID do serviço salvo no banco (usado em update_last_saved_service a partir de ultimo_servico_salvo)"
     )

@@ -286,3 +286,146 @@ async def test_etapa2_get_service_history_pure_query_only():
         tool_call=ToolCallAction(name="get_service_history"),
     )
     assert resp.intent.value == "query_history"
+
+
+@pytest.mark.asyncio
+async def test_upsert_draft_deep_merge_preserves_unmentioned_fields():
+    """
+    CORREÇÃO CRÍTICA 1: Deep Merge em upsert_draft
+    Ao receber um item adicional durante AWAITING_MAINTENANCE_CONFIRM,
+    os novos itens são adicionados (appended) e os campos km, data, oficina e valor
+    já existentes no rascunho são estritamente preservados (não zerados e data não vira hoje).
+    """
+    service = ConversationService()
+    user_id = "5511999998888"
+    ctx = service.get_context(user_id)
+    ctx.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+    ctx.draft_payload = {
+        "itens": ["óleo do motor"],
+        "components": ["óleo do motor"],
+        "km": 42000,
+        "odometer_km": 42000,
+        "data": "15/09/2026",
+        "date_str": "15/09/2026",
+        "oficina": "Oficina do Zé",
+        "workshop_name": "Oficina do Zé",
+        "valor": 250.0,
+        "total_cost": 250.0,
+        "_target_vehicle_ref": "Palio",
+    }
+
+    # Simula IA retornando upsert_draft apenas com o item novo
+    mock_analysis = GeminiAnalysisResponse(
+        intent="record_maintenance",
+        confidence=ConfidenceLevel.HIGH,
+        is_critical_action=True,
+        reply_message="Atualizando rascunho",
+        tool_call=ToolCallAction(name="upsert_draft", itens=["filtro de combustível"]),
+    )
+
+    class MockGemini:
+        is_available = lambda self: True
+        async def analyze_message(self, *args, **kwargs):
+            return mock_analysis
+
+    service.gemini = MockGemini()
+
+    res = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="também troquei filtro de combustível",
+        vehicles=[],
+        maintenances=[],
+    )
+
+    assert res["state"] == ConversationState.AWAITING_MAINTENANCE_CONFIRM.value
+    draft = ctx.draft_payload
+    assert draft is not None
+    # Verifica que itens foram mesclados
+    assert "óleo do motor" in draft["itens"]
+    assert "filtro de combustível" in draft["itens"]
+    # Verifica que km foi preservado (não virou nulo nem 0)
+    assert draft["km"] == 42000
+    assert draft["odometer_km"] == 42000
+    # Verifica que data foi preservada (não virou hoje)
+    assert draft["data"] == "15/09/2026"
+    assert draft["date_str"] == "15/09/2026"
+    # Verifica que oficina e valor foram preservados
+    assert draft["oficina"] == "Oficina do Zé"
+    assert draft["valor"] == 250.0
+    # Verifica que o card apresenta todos os dados preservados
+    assert "42.000 km" in res["reply"]
+    assert "15/09/2026" in res["reply"]
+    assert "Oficina do Zé" in res["reply"]
+    assert "250,00" in res["reply"]
+
+
+@pytest.mark.asyncio
+async def test_edit_last_saved_service_anti_hallucination_and_routing():
+    """
+    CORREÇÃO CRÍTICA 2: Roteamento de Edição e Anti-Alucinação
+    Ao receber 'quero corrigir o km desse último serviço', o sistema DEVE acionar a condução
+    ativa de update_last_saved_service e NUNCA alucinar upsert_draft com 'Revisão geral periódica'.
+    """
+    service = ConversationService()
+    user_id = "5511999997777"
+    ctx = service.get_context(user_id)
+    ctx.state = ConversationState.NORMAL
+    ctx.draft_payload = None
+
+    class SavedMaint:
+        id = 205
+        date = datetime(2026, 8, 15, 10, 0, 0)
+        km = 140000
+        odometro_registro = 140000
+        components = ["troca de óleo"]
+        description = "troca de óleo"
+        total_cost = 200.0
+        status = "active"
+        workshop_name = "AutoFix"
+
+    # Mesmo se o LLM alucinasse um upsert_draft com "Revisão geral periódica", o sistema não deve aceitar
+    hallucinated_analysis = GeminiAnalysisResponse(
+        intent="record_maintenance",
+        confidence=ConfidenceLevel.HIGH,
+        is_critical_action=True,
+        reply_message="Vou registrar a Revisão geral periódica",
+        tool_call=ToolCallAction(name="upsert_draft", itens=["Revisão geral periódica"]),
+    )
+
+    class MockGemini:
+        is_available = lambda self: True
+        async def analyze_message(self, *args, **kwargs):
+            return hallucinated_analysis
+
+    service.gemini = MockGemini()
+
+    # Turno 1: Usuário pede para corrigir o km do último serviço
+    res1 = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="quero corrigir o km desse último serviço",
+        vehicles=[],
+        maintenances=[SavedMaint()],
+    )
+
+    # Verifica que NÃO criou rascunho de manutenção com alucinação
+    assert ctx.draft_payload is None
+    assert "Revisão geral periódica" not in res1["reply"]
+    assert "revisão geral" not in res1["reply"].lower()
+    # Verifica que perguntou ativamente pelo novo km consultando o último serviço
+    assert res1["action_type"] == "awaiting_edit_value"
+    assert "Sem problemas! A quilometragem atual está registrada como 140.000 km. Qual é a quilometragem correta?" in res1["reply"]
+    assert ctx.pending_edit_field == "km"
+    assert ctx.pending_edit_service_id == 205
+
+    # Turno 2: Usuário informa a nova quilometragem
+    res2 = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="145.000 km",
+        vehicles=[],
+        maintenances=[SavedMaint()],
+    )
+    assert res2["action_type"] == "update_last_saved_service"
+    assert res2["committed_data"]["service_id"] == 205
+    assert res2["committed_data"]["km"] == 145000
+    assert "145.000 km" in res2["reply"]
+    assert ctx.pending_edit_field is None

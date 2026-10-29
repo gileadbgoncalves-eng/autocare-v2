@@ -208,17 +208,17 @@ def parse_km_value(text: str) -> Optional[int]:
 def parse_cost_value(text: str) -> Optional[float]:
     """Extrai valor financeiro em reais."""
     tl = (text or "").lower()
-    m_cost = re.search(r"(?:r\$\s*|reais\s*|por\s*|valor\s*(?:de\s*)?|gastei\s*|custou\s*)(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2}|\d+)\s*(?:reais|conto)?", tl)
+    m_cost = re.search(r"(?:r\$\s*|reais\s*|por\s*|valor\s*(?:de\s*)?|gastei\s*|custou\s*|morreu\s*(?:em\s*)?|paguei\s*)(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+,\d{2}|\d+)\s*(?:reais|conto)?", tl)
     if m_cost:
         raw = m_cost.group(1).replace(".", "").replace(",", ".")
         try:
             return float(raw)
         except ValueError:
             pass
-    m_simple = re.search(r"\b(\d+(?:,\d{2})?)\s*reais\b", tl)
+    m_simple = re.search(r"\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+(?:,\d{2})?)\s*(?:reais|conto)\b", tl)
     if m_simple:
         try:
-            return float(m_simple.group(1).replace(",", "."))
+            return float(m_simple.group(1).replace(".", "").replace(",", "."))
         except ValueError:
             pass
     return None
@@ -325,7 +325,16 @@ def extract_date_strict(text: str) -> Optional[str]:
 
 
 def extract_workshop_strict(text: str) -> Optional[str]:
-    return clean_workshop_name(text)
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    m = re.search(r"(?:l[aá]\s+no\s+|l[aá]\s+na\s+|na\s+|em\s+|no\s+)?\b([A-Za-zÀ-ÿ0-9\-]+(?:\s+[A-Za-zÀ-ÿ0-9\-]+)?\s+Auto\s+Center)\b", raw, re.I)
+    if m:
+        return clean_workshop_name(m.group(1).strip())
+    m2 = re.search(r"\b(Oficina\s+do\s+[A-Za-zÀ-ÿ0-9\-]+|Auto\s+Center\s+[A-Za-zÀ-ÿ0-9\-]+|Mec[aâ]nica\s+[A-Za-zÀ-ÿ0-9\-]+|Concession[aá]ria\s+[A-Za-zÀ-ÿ0-9\-]+)\b", raw, re.I)
+    if m2:
+        return clean_workshop_name(m2.group(1).strip())
+    return None
 
 
 def is_vague_service_initiation(text: str) -> Optional[str]:
@@ -348,14 +357,20 @@ def is_edit_last_service_intent(text: str, context: Optional[Any] = None) -> boo
     tl = (text or "").lower()
     if context and getattr(context, "pending_edit_field", None):
         return True
+
+    # Consultas e perguntas nunca são comandos de edição
+    if re.search(r"\b(qual|quando|quanto|quantos|o que|quais|ver|mostrar|listar|consulta|hist[oó]rico)\b", tl):
+        return False
+
     patterns = [
-        r"\b(alterar|mudar|corrigir|editar|atualizar|adicionar|incluir)\b.*\b(?:[uú]ltim[oa]\s+)?(?:servi[çc]o|registro|manuten[çc][ãa]o)\b",
-        r"\b(?:no|do|na|da)\s+(?:[uú]ltim[oa]\s+)(?:servi[çc]o|registro|manuten[çc][ãa]o)\b",
-        r"\b(?:[uú]ltim[oa]\s+)(?:servi[çc]o|registro|manuten[çc][ãa]o)\b",
-        r"\berrei\s+(?:a\s+data|o\s+valor|o\s+km|os\s+itens|a\s+oficina)\b",
-        r"\bquero\s+(?:alterar|mudar|editar|adicionar)\s+(?:no\s+|o\s+)?[uú]ltimo\b",
+        r"\b(alterar|mudar|corrigir|editar|atualizar|retificar|arrumar|consertar)\b.*\b(?:[uú]ltim[oa]\s+)?(?:servi[çc]o|registro|manuten[çc][ãa]o)\b",
+        r"\b(?:quero|preciso|gostaria de)\s+(?:alterar|mudar|editar|corrigir|atualizar|arrumar)\b.*\b(?:[uú]ltim[oa]\s+)?(?:servi[çc]o|registro|manuten[çc][ãa]o|deste|desse)\b",
+        r"\berrei\s+(?:a\s+data|o\s+valor|o\s+km|os\s+itens|a\s+oficina|o\s+preço)\b",
+        r"\b(corrigir|alterar|mudar|editar)\s+(?:o\s+km|o\s+valor|a\s+data|os\s+itens|a\s+oficina)\s+(?:d[eo]ss?e\s+)?(?:[uú]ltimo\b)?",
+        r"\b(adicionar|incluir)\b.*\b(?:no|ao)\s+(?:[uú]ltim[oa]\s+)?(?:servi[çc]o|registro|manuten[çc][ãa]o)\b",
     ]
     return any(re.search(p, tl) for p in patterns)
+
 
 
 # =============================================================================
@@ -655,13 +670,31 @@ class ConversationService:
             reply = analysis.reply_message
             return {"reply": reply, "action_type": "async_superseded_completed", "state": context.state.value}
 
-        # 5.1 Execução de Tool Call Estruturada da IA
+        # 5.1 Edição do Último Serviço Salvo (prioritário sobre qualquer alucinação de upsert_draft)
         tool_calls_to_run = []
         if analysis.tool_calls:
             tool_calls_to_run = list(analysis.tool_calls)
         elif analysis.tool_call is not None:
             tool_calls_to_run = [analysis.tool_call]
 
+        is_edit_service = (
+            analysis.intent == IntentType.UPDATE_LAST_SAVED_SERVICE
+            or is_edit_last_service_intent(clean_text, context)
+            or any(getattr(tc, "name", None) == "update_last_saved_service" for tc in tool_calls_to_run)
+        )
+        if is_edit_service:
+            edit_res = await self._handle_edit_last_saved_service(
+                context=context,
+                clean_text=clean_text,
+                analysis=analysis,
+                maintenances=maintenances,
+                vehicles=vehicles,
+            )
+            self._record_assistant_turn(context, edit_res["reply"])
+            self.update_context(context)
+            return edit_res
+
+        # 5.2 Execução de Tool Call Estruturada da IA
         if tool_calls_to_run:
             tc_res = await self._execute_ai_tool_calls(
                 context=context,
@@ -677,19 +710,6 @@ class ConversationService:
                 self._record_assistant_turn(context, tc_res["reply"])
                 self.update_context(context)
                 return tc_res
-
-        # 5.2 Edição do Último Serviço Salvo
-        if analysis.intent == IntentType.UPDATE_LAST_SAVED_SERVICE or is_edit_last_service_intent(clean_text, context):
-            edit_res = await self._handle_edit_last_saved_service(
-                context=context,
-                clean_text=clean_text,
-                analysis=analysis,
-                maintenances=maintenances,
-                vehicles=vehicles,
-            )
-            self._record_assistant_turn(context, edit_res["reply"])
-            self.update_context(context)
-            return edit_res
 
         # 5.3 Consulta de Histórico de Serviços
         if analysis.intent == IntentType.QUERY_HISTORY:
@@ -907,6 +927,16 @@ class ConversationService:
     ) -> Dict[str, Any]:
         """Formata card enxuto e proativo de confirmação com base na entidade identificada."""
         intent = analysis.intent
+        if intent in (IntentType.RECORD_MAINTENANCE, IntentType.UPSERT_DRAFT):
+            return self._upsert_maintenance_draft(
+                context=context,
+                analysis=analysis,
+                clean_text=clean_text or "",
+                vehicles=vehicles,
+                matched_veh=matched_veh,
+                discrepancy_warning=discrepancy_warning,
+            )
+
         state_map = {
             IntentType.REGISTER_VEHICLE: ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM,
             IntentType.RECORD_MAINTENANCE: ConversationState.AWAITING_MAINTENANCE_CONFIRM,
@@ -917,7 +947,7 @@ class ConversationService:
         }
         context.state = state_map.get(intent, ConversationState.AWAITING_MAINTENANCE_CONFIRM)
 
-        existing_draft = dict(context.draft_payload) if (isinstance(context.draft_payload, dict) and context.state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM) else {}
+        existing_draft = dict(context.draft_payload) if isinstance(context.draft_payload, dict) else {}
 
         placeholder_strings = {
             "a cadastrar", "padrao", "padrão", "desconhecido", "none", "null",
@@ -1097,10 +1127,33 @@ class ConversationService:
             if need_reacquire:
                 await lock.acquire()
 
-        # Se a IA indicou upsert_draft ou o usuário adicionou itens cumulativamente
-        is_maint_draft = (context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM and context.draft_payload and not context.draft_payload.get("_is_multi_action"))
+        tool_calls_list = []
+        if analysis.tool_calls:
+            tool_calls_list.extend(analysis.tool_calls)
+        elif analysis.tool_call is not None:
+            tool_calls_list.append(analysis.tool_call)
+
+        # 4.1 Se for comando de edição do último serviço salvo
+        is_edit_service = (
+            analysis.intent == IntentType.UPDATE_LAST_SAVED_SERVICE
+            or is_edit_last_service_intent(clean_text, context)
+            or any(getattr(tc, "name", None) == "update_last_saved_service" for tc in tool_calls_list)
+        )
+        if is_edit_service:
+            return await self._handle_edit_last_saved_service(
+                context=context,
+                clean_text=clean_text,
+                analysis=analysis,
+                maintenances=maintenances,
+                vehicles=vehicles,
+            )
+
+        # 4.2 Se a IA indicou upsert_draft ou o usuário adicionou itens cumulativamente
+        is_maint_draft = (context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM and isinstance(context.draft_payload, dict) and not context.draft_payload.get("_is_multi_action"))
         if is_maint_draft:
-            if (analysis.tool_call and analysis.tool_call.name == "upsert_draft") or analysis.intent == IntentType.UPSERT_DRAFT or any(k in text_lower for k in ("também", "tambem", "adiciona", "inclui", "mais", "valor", "data")):
+            has_upsert_tc = any(getattr(tc, "name", None) == "upsert_draft" for tc in tool_calls_list)
+            is_cumulative_text = any(k in text_lower for k in ("também", "tambem", "adiciona", "inclui", "mais", "valor", "data", "troquei", "coloquei", "filtro", "óleo", "oleo", "peça", "peca")) or bool(extract_maintenance_items_strict(clean_text))
+            if has_upsert_tc or analysis.intent in (IntentType.UPSERT_DRAFT, IntentType.RECORD_MAINTENANCE) or is_cumulative_text:
                 return self._upsert_maintenance_draft(context=context, analysis=analysis, clean_text=clean_text, vehicles=vehicles, matched_veh=matched_veh, discrepancy_warning=discrepancy_warning)
 
         # Atualização cumulativa de ficha técnica no cadastro de veículo (PATCH ATÔMICO)
@@ -1191,7 +1244,8 @@ class ConversationService:
             v_id = getattr(matched_veh, "id", None)
             veh_maints = [m for m in (maintenances or []) if getattr(m, "vehicle_id", None) == v_id and getattr(m, "status", "active") != "cancelled"]
             if veh_maints:
-                last_m = veh_maints[-1]
+                veh_maints.sort(key=lambda m: (str(getattr(m, "date", "") or ""), int(getattr(m, "id", 0) or 0)), reverse=True)
+                last_m = veh_maints[0]
                 desc = getattr(last_m, "description", None) or getattr(last_m, "descricao", "Manutenção")
                 cost = float(getattr(last_m, "total_cost", 0.0) or getattr(last_m, "custo", 0.0) or 0.0)
                 ans = f"🚗 No seu *{v_model}*, a última manutenção registrada foi *{desc}* (R$ {cost:.2f}).".replace(".", ",")
@@ -1281,6 +1335,11 @@ class ConversationService:
                 context.draft_payload = None
 
             elif getattr(tc, "name", None) == "upsert_draft":
+                if is_edit_last_service_intent(clean_text, context):
+                    res = await self._handle_edit_last_saved_service(context=context, clean_text=clean_text, analysis=analysis, maintenances=maintenances, vehicles=vehicles)
+                    if committed_odometer:
+                        res["committed_data"] = {**res.get("committed_data", {}), **committed_odometer}
+                    return res
                 if context.state == ConversationState.NORMAL and is_vague_service_initiation(clean_text) and not getattr(tc, "itens", None):
                     return {"reply": "Beleza! Me conta qual serviço você fez, e se lembrar, a data e a quilometragem.", "action_type": "clarification_needed", "state": ConversationState.NORMAL.value, "details": {}}
                 res = self._upsert_maintenance_draft(context=context, analysis=analysis, clean_text=clean_text, vehicles=vehicles, matched_veh=matched_veh, discrepancy_warning=discrepancy_warning)
@@ -1354,65 +1413,154 @@ class ConversationService:
         matched_veh: Optional[Any] = None,
         discrepancy_warning: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Cria ou atualiza cumulativamente o rascunho de manutenção aberto."""
+        """Cria ou atualiza cumulativamente o rascunho de manutenção aberto via Deep Merge."""
         existing_draft = dict(context.draft_payload) if (
-            context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM
-            and isinstance(context.draft_payload, dict)
+            isinstance(context.draft_payload, dict)
             and not context.draft_payload.get("_is_multi_action")
         ) else {}
 
         is_updating = bool(existing_draft)
-        tc = analysis.tool_call
+
+        tool_calls_list = []
+        if analysis.tool_calls:
+            tool_calls_list.extend(analysis.tool_calls)
+        elif analysis.tool_call is not None:
+            tool_calls_list.append(analysis.tool_call)
+
         entities = dict(analysis.extracted_entities or {})
         maint_obj = getattr(analysis, "maintenance", None)
         if maint_obj:
             entities.update(maint_obj.model_dump(exclude_none=True))
 
-        prev_items = list(existing_draft.get("itens") or existing_draft.get("components") or [])
-        new_items = []
-        if tc and tc.itens:
-            new_items.extend(tc.itens)
-        elif entities.get("components"):
-            new_items.extend(entities["components"])
+        # 1. Itens anteriores (recupera de itens, components ou description)
+        prev_items: List[str] = []
+        raw_prev = existing_draft.get("itens") or existing_draft.get("components")
+        if isinstance(raw_prev, list):
+            prev_items = [str(i).strip() for i in raw_prev if str(i).strip()]
+        elif isinstance(raw_prev, str) and raw_prev.strip():
+            prev_items = [raw_prev.strip()]
+
+        if not prev_items and existing_draft.get("description"):
+            desc_str = str(existing_draft.get("description")).strip()
+            extracted_from_desc = extract_maintenance_items_strict(desc_str)
+            if extracted_from_desc:
+                prev_items = extracted_from_desc
+            elif desc_str.lower() not in ("manutenção realizada", "manutenção", "serviço"):
+                prev_items = [desc_str]
+
+        # 2. Novos itens (de tool_calls, entities ou texto)
+        new_items: List[str] = []
+        for tc_item in tool_calls_list:
+            if getattr(tc_item, "itens", None):
+                tc_it = tc_item.itens
+                if isinstance(tc_it, list):
+                    new_items.extend([str(i).strip() for i in tc_it if str(i).strip()])
+                elif isinstance(tc_it, str) and tc_it.strip():
+                    new_items.append(tc_it.strip())
+
+        if entities.get("components"):
+            c = entities["components"]
+            if isinstance(c, list):
+                new_items.extend([str(i).strip() for i in c if str(i).strip()])
+            elif isinstance(c, str) and c.strip():
+                new_items.append(c.strip())
+        elif entities.get("itens"):
+            it = entities["itens"]
+            if isinstance(it, list):
+                new_items.extend([str(i).strip() for i in it if str(i).strip()])
+            elif isinstance(it, str) and it.strip():
+                new_items.append(it.strip())
 
         strict_items = extract_maintenance_items_strict(clean_text)
         if strict_items:
             new_items = merge_maintenance_items(new_items, strict_items)
 
         merged_items = merge_maintenance_items(prev_items, new_items)
+        if not merged_items and prev_items:
+            merged_items = prev_items
 
-        km_val = (
-            (tc.km if tc and tc.km is not None else None)
-            or parse_km_value(clean_text)
-            or entities.get("km")
-            or existing_draft.get("km")
-        )
-        date_val = (
-            (tc.data if tc and tc.data else None)
-            or extract_date_strict(clean_text)
-            or entities.get("data")
-            or existing_draft.get("data")
-        )
-        oficina_val = (
-            (tc.oficina if tc and tc.oficina else None)
-            or extract_workshop_strict(clean_text)
-            or entities.get("workshop_name")
-            or existing_draft.get("workshop_name")
-        )
-        new_cost = (
-            (tc.valor if tc and tc.valor is not None else None)
-            or parse_cost_value(clean_text)
-            or entities.get("total_cost")
-        )
-        prev_cost = existing_draft.get("total_cost") or existing_draft.get("valor")
+        # 3. Quilometragem (Deep Merge: preserva KM existente se não fornecido)
+        new_km = None
+        for tc_item in tool_calls_list:
+            if getattr(tc_item, "km", None) is not None:
+                new_km = tc_item.km
+                break
+        if new_km is None and entities.get("km") is not None:
+            new_km = entities.get("km")
+        if new_km is None and entities.get("odometer_km") is not None:
+            new_km = entities.get("odometer_km")
+        if new_km is None and maint_obj and getattr(maint_obj, "odometer_km", None) is not None:
+            new_km = maint_obj.odometer_km
+        if new_km is None:
+            new_km = parse_km_value(clean_text)
+
+        prev_km = existing_draft.get("km") if existing_draft.get("km") is not None else existing_draft.get("odometer_km")
+        final_km = new_km if new_km is not None else prev_km
+
+        # 4. Data (Deep Merge: preserva Data existente se o usuário não citou nova data)
+        new_data = None
+        for tc_item in tool_calls_list:
+            if getattr(tc_item, "data", None):
+                new_data = tc_item.data
+                break
+        if not new_data and entities.get("data"):
+            new_data = entities.get("data")
+        if not new_data and entities.get("date_str"):
+            new_data = entities.get("date_str")
+        if not new_data and maint_obj and getattr(maint_obj, "date_str", None):
+            new_data = maint_obj.date_str
+        if not new_data:
+            new_data = extract_date_strict(clean_text)
+
+        prev_data = existing_draft.get("data") or existing_draft.get("date_str") or existing_draft.get("date")
+        has_user_date = bool(extract_date_strict(clean_text)) or "hoje" in clean_text.lower() or "ontem" in clean_text.lower()
+        if is_updating and prev_data and not has_user_date:
+            final_data = prev_data
+        else:
+            final_data = new_data if new_data else prev_data
+
+        # 5. Oficina (Deep Merge: preserva Oficina existente se não fornecida)
+        new_oficina = None
+        for tc_item in tool_calls_list:
+            if getattr(tc_item, "oficina", None):
+                new_oficina = tc_item.oficina
+                break
+        if not new_oficina and entities.get("workshop_name"):
+            new_oficina = entities.get("workshop_name")
+        if not new_oficina and entities.get("oficina"):
+            new_oficina = entities.get("oficina")
+        if not new_oficina and maint_obj and getattr(maint_obj, "workshop_name", None):
+            new_oficina = maint_obj.workshop_name
+        if not new_oficina:
+            new_oficina = extract_workshop_strict(clean_text)
+
+        prev_oficina = existing_draft.get("oficina") or existing_draft.get("workshop_name")
+        final_oficina = new_oficina if new_oficina else prev_oficina
+
+        # 6. Valor / Custo (Deep Merge: soma se cumulativo, ou substitui/preserva)
+        new_cost = None
+        for tc_item in tool_calls_list:
+            if getattr(tc_item, "valor", None) is not None:
+                new_cost = tc_item.valor
+                break
+        if new_cost is None and entities.get("total_cost") is not None:
+            new_cost = entities.get("total_cost")
+        if new_cost is None and entities.get("valor") is not None:
+            new_cost = entities.get("valor")
+        if new_cost is None and maint_obj and getattr(maint_obj, "total_cost", None) is not None:
+            new_cost = maint_obj.total_cost
+        if new_cost is None:
+            new_cost = parse_cost_value(clean_text)
+
+        prev_cost = existing_draft.get("valor") if existing_draft.get("valor") is not None else existing_draft.get("total_cost")
         if is_updating and new_cost is not None and prev_cost is not None:
             tl = clean_text.lower()
             if any(k in tl for k in ("também", "tambem", "mais", "adiciona", "inclui")):
-                valor_val = float(prev_cost) + float(new_cost)
+                final_cost = float(prev_cost) + float(new_cost)
             else:
-                valor_val = float(new_cost)
+                final_cost = float(new_cost)
         else:
-            valor_val = new_cost if new_cost is not None else prev_cost
+            final_cost = new_cost if new_cost is not None else prev_cost
 
         target_veh_ref = (
             existing_draft.get("_target_vehicle_ref")
@@ -1424,15 +1572,16 @@ class ConversationService:
             **existing_draft,
             "itens": merged_items,
             "components": merged_items,
-            "description": ", ".join(merged_items) if merged_items else "Manutenção realizada",
-            "km": km_val,
-            "odometer_km": km_val,
-            "data": date_val,
-            "date_str": date_val,
-            "oficina": oficina_val,
-            "workshop_name": oficina_val,
-            "valor": valor_val,
-            "total_cost": valor_val if valor_val is not None else 0.0,
+            "description": ", ".join(merged_items) if merged_items else (existing_draft.get("description") or "Manutenção realizada"),
+            "km": final_km,
+            "odometer_km": final_km,
+            "data": final_data,
+            "date_str": final_data,
+            "date": final_data,
+            "oficina": final_oficina,
+            "workshop_name": final_oficina,
+            "valor": final_cost,
+            "total_cost": final_cost if final_cost is not None else 0.0,
             "_target_vehicle_ref": target_veh_ref,
         }
         if discrepancy_warning:
@@ -1442,19 +1591,31 @@ class ConversationService:
         context.draft_payload = updated_payload
         context.draft_updated_at = self._utcnow()
 
+        # Verificação de retrocesso de hodômetro para manutenção
+        target_veh = matched_veh or (vehicles[0] if vehicles else None)
+        if target_veh and final_km is not None:
+            curr_km = getattr(target_veh, "current_km", None) or getattr(target_veh, "quilometragem", None)
+            if curr_km and final_km < curr_km:
+                updated_payload["_is_odometer_rollback"] = True
+                reply = f"⚠️ Identifiquei que a quilometragem informada ({int(final_km):,} km) é menor que a registrada anteriormente ({int(curr_km):,} km). Foi um erro de digitação? (Responda se deseja cancelar ou confirmar)".replace(",", ".")
+                if discrepancy_warning:
+                    reply = f"⚠️ {discrepancy_warning}\n\n" + reply
+                return {"reply": reply, "action_type": "awaiting_confirmation", "state": context.state.value, "draft": updated_payload}
+
         header = "🔄 *Rascunho atualizado! Confira como ficou o resumo da manutenção:*" if is_updating else "🔧 *Resumo da manutenção para confirmação:*"
         lines = [header]
         if target_veh_ref:
             lines.append(f"• *Veículo:* {target_veh_ref}")
         lines.append(f"• *Itens/Serviços:* {', '.join(merged_items) if merged_items else updated_payload['description']}")
-        if km_val is not None:
-            lines.append(f"• *Quilometragem:* {int(km_val):,} km".replace(",", "."))
-        if date_val:
-            lines.append(f"• *Data:* {date_val}")
-        if oficina_val:
-            lines.append(f"• *Oficina:* {oficina_val}")
-        if valor_val is not None and float(valor_val) > 0:
-            lines.append(f"• *Valor:* R$ {float(valor_val):.2f}".replace(".", ","))
+        if final_km is not None:
+            lines.append(f"• *Quilometragem:* {int(final_km):,} km".replace(",", "."))
+        if final_data:
+            lines.append(f"• *Data:* {final_data}")
+        if final_oficina:
+            lines.append(f"• *Oficina:* {final_oficina}")
+        if final_cost is not None and float(final_cost) > 0:
+            cost_fmt = f"R$ {float(final_cost):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            lines.append(f"• *Valor:* {cost_fmt}")
         lines.append("\n📌 *Posso confirmar e salvar?*")
         reply = "\n".join(lines)
         if discrepancy_warning:
@@ -1510,7 +1671,37 @@ class ConversationService:
         if not active_maints:
             return {"reply": "Não encontrei nenhum serviço salvo recentemente para alterar. Deseja cadastrar uma nova manutenção?", "action_type": "edit_rejected_no_service", "state": context.state.value, "details": {}}
 
-        last_m = active_maints[-1]
+        tc = getattr(analysis, "tool_call", None)
+        tc_service_id = getattr(tc, "service_id", None) if tc else None
+        pending_srv_id = getattr(context, "pending_edit_service_id", None)
+        target_id = tc_service_id or pending_srv_id
+
+        last_m = None
+        if target_id is not None:
+            last_m = next((m for m in active_maints if str(getattr(m, "id", "")) == str(target_id)), None)
+
+        if last_m is None:
+            def sort_key(m):
+                dt = getattr(m, "date", None)
+                ts = 0.0
+                if dt:
+                    if hasattr(dt, "timestamp"):
+                        ts = dt.timestamp()
+                    elif isinstance(dt, str):
+                        try:
+                            ts = datetime.strptime(dt, "%d/%m/%Y").timestamp()
+                        except Exception:
+                            ts = 0.0
+                m_id = getattr(m, "id", 0) or 0
+                try:
+                    m_id_num = int(m_id)
+                except Exception:
+                    m_id_num = 0
+                return (ts, m_id_num)
+
+            sorted_maints = sorted(active_maints, key=sort_key, reverse=True)
+            last_m = sorted_maints[0]
+
         srv_id = getattr(last_m, "id", None)
         text_lower = clean_text.lower()
         prev_components = list(getattr(last_m, "components", []) or [getattr(last_m, "description", "Manutenção")])
@@ -1548,10 +1739,18 @@ class ConversationService:
             context.state = ConversationState.NORMAL
             return {"reply": reply_msg, "action_type": "update_last_saved_service", "state": context.state.value, "committed_data": committed}
 
-        # 2. Cenário B: Correção completa na frase (ex: adicionar item E mudar data)
+        # 2. Cenário B: Correção completa na frase ou via Tool Call
         extracted_items = extract_maintenance_items_strict(clean_text)
         extracted_date = extract_date_strict(clean_text)
-        has_explicit_change = (extracted_items and any(k in text_lower for k in ("adicion", "inclu", "coloc", "troquei"))) or (extracted_date and any(k in text_lower for k in ("mudar", "alterar", "para")))
+        extracted_km = parse_km_value(clean_text)
+        extracted_cost = parse_cost_value(clean_text)
+
+        has_explicit_change = (
+            (extracted_items and any(k in text_lower for k in ("adicion", "inclu", "coloc", "troquei")))
+            or (extracted_date and any(k in text_lower for k in ("mudar", "alterar", "para", "corrigir")))
+            or (extracted_km is not None and any(k in text_lower for k in ("mudar", "alterar", "para", "corrigir", "foi", "com")))
+            or (extracted_cost is not None and any(k in text_lower for k in ("mudar", "alterar", "para", "corrigir", "foi", "custou")))
+        )
         if has_explicit_change:
             committed = {"service_id": srv_id}
             reply_parts = []
@@ -1562,6 +1761,12 @@ class ConversationService:
             if extracted_date:
                 committed["data"] = extracted_date
                 reply_parts.append(f"data alterada para {extracted_date}")
+            if extracted_km is not None:
+                committed["km"] = extracted_km
+                reply_parts.append(f"quilometragem alterada para {extracted_km:,} km".replace(",", "."))
+            if extracted_cost is not None:
+                committed["valor"] = extracted_cost
+                reply_parts.append(f"valor alterado para R$ {extracted_cost:.2f}".replace(".", ","))
             context.state = ConversationState.NORMAL
             reply_msg = f"✅ Último serviço atualizado: {' e '.join(reply_parts)} com sucesso!"
             return {"reply": reply_msg, "action_type": "update_last_saved_service", "state": context.state.value, "committed_data": committed}
@@ -1583,9 +1788,9 @@ class ConversationService:
         if any(k in text_lower for k in ("km", "quilometragem", "odometro")):
             context.pending_edit_service_id = srv_id
             context.pending_edit_field = "km"
-            prev_km = getattr(last_m, "km", None)
+            prev_km = getattr(last_m, "km", None) or getattr(last_m, "odometro_registro", None)
             km_part = f"{prev_km:,} km".replace(",", ".") if prev_km else "não informada"
-            reply = f"Sem problemas! A quilometragem atual está como {km_part}. Qual é o km correto?"
+            reply = f"Sem problemas! A quilometragem atual está registrada como {km_part}. Qual é a quilometragem correta?"
             return {"reply": reply, "action_type": "awaiting_edit_value", "state": context.state.value, "details": {"field": "km", "service_id": srv_id}}
 
         # Caso geral sem campo especificado
