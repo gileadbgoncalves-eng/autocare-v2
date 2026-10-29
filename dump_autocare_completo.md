@@ -1,24 +1,25 @@
-# 🏛️ SYSTEM AUDIT DUMP INTEGRAL - AUTOCARE V2
+# AUDITORIA EXTERNA COMPLETA DO SISTEMA AUTOCARE V2
+# EXPORTAÇÃO INTEGRAL DE CÓDIGO-FONTE (100% COMPLETO, SEM RESUMOS)
 
-> **Documento de Auditoria Arquitetural Externa**
-> Exportação integral, exata e linha por linha dos componentes centrais do AutoCare V2.
-> Nenhum trecho foi omitido, resumido ou modificado.
+Este documento consolida o código-fonte integral, exato e sem omissões dos componentes críticos do AutoCare V2 para auditoria externa.
 
-## 📑 Sumário dos Arquivos Exportados
-
+## Índice de Arquivos Exportados:
 - [1. ENTRADA DO WHATSAPP (WEBHOOK) (`src/interfaces/api/webhook.py`)](#src-interfaces-api-webhook-py) — **707 linhas** (31.1 KB)
 - [2. ORQUESTRADOR, REGRAS DE NEGÓCIO E FLUXO AI-FIRST (`src/application/services/conversation.py`)](#src-application-services-conversation-py) — **2134 linhas** (114.0 KB)
 - [3. PERSISTÊNCIA E REPOSITÓRIOS DE BANCO DE DADOS (VEÍCULOS E MANUTENÇÕES) (`src/infrastructure/database/repositories.py`)](#src-infrastructure-database-repositories-py) — **770 linhas** (32.6 KB)
-- [4.1 PROMPTS E SYSTEM INSTRUCTION DA IA (`src/ai/prompts.py`)](#src-ai-prompts-py) — **477 linhas** (41.6 KB)
+- [4.1 PROMPTS E SYSTEM INSTRUCTION DA IA (`src/ai/prompts.py`)](#src-ai-prompts-py) — **479 linhas** (41.9 KB)
 - [4.2 SCHEMAS E TOOLS DA IA (`src/ai/schemas.py`)](#src-ai-schemas-py) — **389 linhas** (20.1 KB)
 - [4.3 CLIENTE E INTEGRAÇÃO GEMINI COM FUNCTION CALLING (`src/ai/client.py`)](#src-ai-client-py) — **473 linhas** (22.0 KB)
 
-**Total de Linhas no Dump:** 4950 linhas de código.
-
 ---
 
-# <a id="src-interfaces-api-webhook-py"></a>1. ENTRADA DO WHATSAPP (WEBHOOK)
-
+# =============================================================================
+# ARQUIVO: src/interfaces/api/webhook.py
+# TÍTULO: 1. ENTRADA DO WHATSAPP (WEBHOOK)
+# TOTAL DE LINHAS: 707 | TAMANHO: 31.1 KB
+# =============================================================================
+<a id="src-interfaces-api-webhook-py"></a>
+### 1. ENTRADA DO WHATSAPP (WEBHOOK)
 **Caminho do Arquivo:** `src/interfaces/api/webhook.py`
 
 ```python
@@ -729,12 +730,16 @@ async def receive_webhook(
             return await _process_webhook_pipeline(local_session, uid, msg)
 
     return await message_debouncer.enqueue(user_id, message_text, _runner)
+
 ```
 
----
-
-# <a id="src-application-services-conversation-py"></a>2. ORQUESTRADOR, REGRAS DE NEGÓCIO E FLUXO AI-FIRST
-
+# =============================================================================
+# ARQUIVO: src/application/services/conversation.py
+# TÍTULO: 2. ORQUESTRADOR, REGRAS DE NEGÓCIO E FLUXO AI-FIRST
+# TOTAL DE LINHAS: 2134 | TAMANHO: 114.0 KB
+# =============================================================================
+<a id="src-application-services-conversation-py"></a>
+### 2. ORQUESTRADOR, REGRAS DE NEGÓCIO E FLUXO AI-FIRST
 **Caminho do Arquivo:** `src/application/services/conversation.py`
 
 ```python
@@ -2872,12 +2877,16 @@ class ConversationService:
         except Exception:
             pass
         return None
+
 ```
 
----
-
-# <a id="src-infrastructure-database-repositories-py"></a>3. PERSISTÊNCIA E REPOSITÓRIOS DE BANCO DE DADOS (VEÍCULOS E MANUTENÇÕES)
-
+# =============================================================================
+# ARQUIVO: src/infrastructure/database/repositories.py
+# TÍTULO: 3. PERSISTÊNCIA E REPOSITÓRIOS DE BANCO DE DADOS (VEÍCULOS E MANUTENÇÕES)
+# TOTAL DE LINHAS: 770 | TAMANHO: 32.6 KB
+# =============================================================================
+<a id="src-infrastructure-database-repositories-py"></a>
+### 3. PERSISTÊNCIA E REPOSITÓRIOS DE BANCO DE DADOS (VEÍCULOS E MANUTENÇÕES)
 **Caminho do Arquivo:** `src/infrastructure/database/repositories.py`
 
 ```python
@@ -3651,12 +3660,16 @@ class TrafficFineRepository:
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount > 0
+
 ```
 
----
-
-# <a id="src-ai-prompts-py"></a>4.1 PROMPTS E SYSTEM INSTRUCTION DA IA
-
+# =============================================================================
+# ARQUIVO: src/ai/prompts.py
+# TÍTULO: 4.1 PROMPTS E SYSTEM INSTRUCTION DA IA
+# TOTAL DE LINHAS: 479 | TAMANHO: 41.9 KB
+# =============================================================================
+<a id="src-ai-prompts-py"></a>
+### 4.1 PROMPTS E SYSTEM INSTRUCTION DA IA
 **Caminho do Arquivo:** `src/ai/prompts.py`
 
 ```python
@@ -3878,8 +3891,10 @@ Se o usuário enviar instruções ou ações para mais de um veículo ou múltip
 [14. ARQUITETURA AI-FIRST: ESTRUTURAÇÃO DE AÇÕES / FUNCTION CALLING (`tool_call` e `tool_calls`)]
 Você possui o campo estruturado `tool_call` (`ToolCallAction`) e a lista `tool_calls` para decidir exatamente quais operações o sistema deve executar com base no contexto (`draft_atual` e `ultimo_servico_salvo`):
 1. `upsert_draft(itens, km, data, oficina, valor)`:
-   - *Quando usar:* Cria ou atualiza o rascunho de manutenção em aberto (`intent = RECORD_MAINTENANCE`, `is_critical_action = true`).
-   - *Regra de Ouro (Deep Merge):* Se já existir um `draft_atual` aguardando confirmação e o usuário disser *"ah, também troquei o filtro de combustível"*, você DEVE chamar `upsert_draft` **mesclando** os novos itens com os já existentes no `draft_atual`. Se a nova chamada não trouxer km, data, oficina ou valor, preserve rigorosamente os valores anteriores do `draft_atual` (NUNCA substitua por nulo nem redefina data para hoje).
+   - *Quando usar:* Cria ou atualiza o rascunho de manutenção em aberto (`intent = RECORD_MAINTENANCE` ou `intent = UPSERT_DRAFT`, `is_critical_action = true`).
+   - *Instrução Explícita para Adição de Itens:* Se a intenção do usuário for apenas adicionar um item ou peça a um serviço que está aguardando confirmação, NUNCA envie km, data, valor ou oficina na chamada da tool. Envie APENAS a lista de itens novos. O backend manterá os dados anteriores.
+   - *Regra de Ouro (Deep Merge):* Se já existir um `draft_atual` aguardando confirmação e o usuário disser *"ah, também troquei o filtro de combustível"*, você DEVE chamar `upsert_draft` enviando APENAS `itens = ["filtro de combustível"]`. O backend mesclará os novos itens aos anteriores e preservará incondicionalmente km, data, oficina e valor já cadastrados.
+
 2. `confirm_and_save_draft()`:
    - *Quando usar:* Acionada quando o usuário confirmar os dados (*"sim"*, *"pode salvar"*, *"isso mesmo"*) e não houver nenhuma alteração pendente (`intent = CONFIRM_ACTION`, `is_critical_action = false`). Persiste os dados no banco e limpa o `draft_atual`.
 3. `update_last_saved_service(service_id, itens, km, data, oficina, valor)`:
@@ -4137,12 +4152,16 @@ def build_analysis_prompt(
     sections.append("\nAnalise os dados e gere a resposta estritamente conforme o schema estruturado `GeminiAnalysisResponse`:")
 
     return "\n\n".join(sections)
+
 ```
 
----
-
-# <a id="src-ai-schemas-py"></a>4.2 SCHEMAS E TOOLS DA IA
-
+# =============================================================================
+# ARQUIVO: src/ai/schemas.py
+# TÍTULO: 4.2 SCHEMAS E TOOLS DA IA
+# TOTAL DE LINHAS: 389 | TAMANHO: 20.1 KB
+# =============================================================================
+<a id="src-ai-schemas-py"></a>
+### 4.2 SCHEMAS E TOOLS DA IA
 **Caminho do Arquivo:** `src/ai/schemas.py`
 
 ```python
@@ -4535,12 +4554,16 @@ class GeminiAnalysisResponse(BaseModel):
 
 # Alias para retrocompatibilidade
 GeminiNLPResult = GeminiAnalysisResponse
+
 ```
 
----
-
-# <a id="src-ai-client-py"></a>4.3 CLIENTE E INTEGRAÇÃO GEMINI COM FUNCTION CALLING
-
+# =============================================================================
+# ARQUIVO: src/ai/client.py
+# TÍTULO: 4.3 CLIENTE E INTEGRAÇÃO GEMINI COM FUNCTION CALLING
+# TOTAL DE LINHAS: 473 | TAMANHO: 22.0 KB
+# =============================================================================
+<a id="src-ai-client-py"></a>
+### 4.3 CLIENTE E INTEGRAÇÃO GEMINI COM FUNCTION CALLING
 **Caminho do Arquivo:** `src/ai/client.py`
 
 ```python
@@ -5017,7 +5040,5 @@ class GeminiClient:
             reply_message="⚙️ A chave GEMINI_API_KEY não está configurada nas variáveis de ambiente.",
             reasoning="Chave ausente"
         )
+
 ```
-
----
-
