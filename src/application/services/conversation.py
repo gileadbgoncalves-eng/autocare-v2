@@ -1060,7 +1060,29 @@ class ConversationService:
         discrepancy_warning: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Processa a mensagem do usuário quando há um rascunho aguardando confirmação."""
-        nlp_classification = await self.classify_confirmation(clean_text, context)
+        # ORDEM 2: Proibição Absoluta de Salvamento quando há Dados Novos no Turno
+        addition_patterns = [
+            r"\b(esqueci|tamb[eé]m|adicione|adiciona|inclui|inclua|troquei|trocou|troca|coloquei|colocou|faltou|al[eé]m|mais|outro|outra|nesse\s+dia|naquele\s+dia|no\s+mesmo\s+dia)\b",
+            r"\b(correia|filtro|[oó]leo|pastilha|vela|pneu|disco|bateria|amortecedor|embreagem|suspens[aã]o|freio|alinhamento|balanceamento)\b",
+        ]
+        has_addition_terms = any(re.search(p, text_lower) for p in addition_patterns)
+        has_new_items = bool(extract_maintenance_items_strict(clean_text))
+        has_new_km = parse_km_value(text_lower) is not None
+        has_new_cost = parse_cost_value(clean_text) is not None
+        has_new_date = bool(extract_date_strict(clean_text)) and not any(k in text_lower for k in ("nesse dia", "naquele dia", "no mesmo dia"))
+        has_new_workshop = bool(extract_workshop_strict(clean_text))
+
+        has_supplementary_data = (
+            has_addition_terms
+            or has_new_items
+            or has_new_km
+            or has_new_cost
+            or has_new_date
+            or has_new_workshop
+        )
+
+        # Se houver dados suplementares, NUNCA executa confirmação direta neste turno
+        nlp_classification = None if has_supplementary_data else await self.classify_confirmation(clean_text, context)
 
         # 1. Recusa ou Cancelamento
         if nlp_classification is False:
@@ -1155,7 +1177,7 @@ class ConversationService:
                 vehicles=vehicles,
             )
 
-        # 4.2 Se a IA indicou upsert_draft (decisão 100% via IA / Tool Call, sem regex local)
+        # 4.2 Se a IA indicou upsert_draft ou se há dados suplementares para rascunho de manutenção
         is_maint_draft = (
             context.state == ConversationState.AWAITING_MAINTENANCE_CONFIRM
             and isinstance(context.draft_payload, dict)
@@ -1163,7 +1185,9 @@ class ConversationService:
         )
         if is_maint_draft:
             has_upsert_tc = any(getattr(tc, "name", None) == "upsert_draft" for tc in tool_calls_list)
-            if has_upsert_tc or analysis.intent in (IntentType.UPSERT_DRAFT, IntentType.RECORD_MAINTENANCE):
+            # ORDEM 2: Sempre que o usuário estiver em AWAITING_MAINTENANCE_CONFIRM e enviar informações complementares,
+            # force obrigatoriamente a chamada de self._upsert_maintenance_draft(...)
+            if has_upsert_tc or has_supplementary_data or analysis.intent in (IntentType.UPSERT_DRAFT, IntentType.RECORD_MAINTENANCE):
                 return self._upsert_maintenance_draft(
                     context=context,
                     analysis=analysis,
@@ -1506,6 +1530,8 @@ class ConversationService:
         prev_km = existing_draft.get("km") if existing_draft.get("km") is not None else existing_draft.get("odometer_km")
         if is_updating:
             final_km = new_km if new_km is not None else prev_km
+            if final_km is None and prev_km is not None:
+                final_km = prev_km
         else:
             final_km = new_km if new_km is not None else parse_km_value(clean_text)
 
@@ -1522,9 +1548,16 @@ class ConversationService:
         if not new_data and maint_obj and getattr(maint_obj, "date_str", None):
             new_data = maint_obj.date_str
 
+        # "nesse dia" ou "naquele dia" significa estritamente MANTER a data anterior do rascunho
+        is_same_day_ref = any(k in clean_text.lower() for k in ("nesse dia", "naquele dia", "no mesmo dia", "mesmo dia"))
+        if is_same_day_ref or (new_data and any(k in str(new_data).lower() for k in ("nesse dia", "naquele dia", "mesmo dia"))):
+            new_data = None
+
         prev_data = existing_draft.get("data") or existing_draft.get("date_str") or existing_draft.get("date")
         if is_updating:
-            final_data = new_data if new_data else prev_data
+            final_data = new_data if (new_data and not is_same_day_ref) else prev_data
+            if not final_data and prev_data:
+                final_data = prev_data
         else:
             final_data = new_data or extract_date_strict(clean_text) or datetime.now().strftime("%d/%m/%Y")
 
@@ -1994,6 +2027,22 @@ class ConversationService:
                     "target_vehicle_ref": v_name,
                     "description": f"Atualização de hodômetro do {v_name} para {km_fmt}" if v_name else f"Atualização de hodômetro para {km_fmt}",
                 })
+
+        # Se houver ação de manutenção e ação de hodômetro para o mesmo veículo:
+        # O hodômetro pertence à manutenção e NÃO deve criar uma ação isolada redundante.
+        maint_acts = [a for a in actions if a.get("intent") == IntentType.RECORD_MAINTENANCE.value]
+        odo_acts = [a for a in actions if a.get("intent") == IntentType.UPDATE_ODOMETER.value]
+        if maint_acts and odo_acts:
+            for odo in list(odo_acts):
+                matched_maint = next((m for m in maint_acts if m.get("target_vehicle_ref") == odo.get("target_vehicle_ref")), None)
+                if matched_maint:
+                    matched_maint["km"] = odo.get("km")
+                    matched_maint["odometer_km"] = odo.get("odometer_km")
+                    actions.remove(odo)
+
+        if len(actions) < 2:
+            return []
+
         return actions
 
     def _resolve_vehicle(self, text: str, vehicles: Optional[List[Any]]) -> Tuple[Optional[Any], Optional[str]]:

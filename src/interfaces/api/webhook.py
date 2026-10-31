@@ -297,22 +297,56 @@ def _parse_due_datetime(raw_dt: Any, date_str: Optional[str] = None, explicit_ti
 
 
 def _parse_maintenance_date(raw_date: Any, default_date: date) -> date:
-    """Extrai objeto date válido para registros de manutenção."""
+    """Extrai objeto date válido para registros de manutenção, com suporte a DD/MM/YYYY, ISO YYYY-MM-DD e variações."""
     if isinstance(raw_date, datetime):
         return raw_date.date()
-    if hasattr(raw_date, "year") and hasattr(raw_date, "month") and hasattr(raw_date, "day"):
+    if isinstance(raw_date, date):
         return raw_date
-    if isinstance(raw_date, str) and raw_date.strip():
-        m_br = re.match(r"^(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?$", raw_date.strip())
-        if m_br:
-            d_i, m_i = int(m_br.group(1)), int(m_br.group(2))
-            y_i = int(m_br.group(3)) if m_br.group(3) else default_date.year
-            if y_i < 100:
-                y_i += 2000
+    if not raw_date or not isinstance(raw_date, str):
+        return default_date
+
+    s = raw_date.strip()
+
+    # 1. Formato ISO: YYYY-MM-DD
+    m_iso = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", s)
+    if m_iso:
+        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        try:
+            return date(y, m, d)
+        except ValueError:
+            pass
+
+    # 2. Formato Brasileiro: DD/MM/YYYY ou DD-MM-YYYY
+    m_br = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b", s)
+    if m_br:
+        d, m, y = int(m_br.group(1)), int(m_br.group(2)), int(m_br.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            return date(y, m, d)
+        except ValueError:
+            pass
+
+    # 3. Formato textual em português: ex: 15 de fevereiro de 2026
+    months_map = {
+        "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+        "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+        "outubro": 10, "novembro": 11, "dezembro": 12,
+        "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+        "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+    }
+    m_txt = re.search(r"(?:dia\s+)?(\d{1,2})\s+de\s+([a-zA-ZçÇ]+)(?:\s+de\s+(\d{4}))?", s, re.IGNORECASE)
+    if m_txt:
+        d_val = int(m_txt.group(1))
+        m_name = m_txt.group(2).lower()
+        y_val = int(m_txt.group(3)) if m_txt.group(3) else default_date.year
+        m_num = months_map.get(m_name)
+        if m_num and 1 <= d_val <= 31:
             try:
-                return datetime(y_i, m_i, d_i).date()
+                return date(y_val, m_num, d_val)
             except ValueError:
                 pass
+
     return default_date
 
 
@@ -684,8 +718,23 @@ async def _process_webhook_pipeline(
     }
 
 
+@router.get("/webhook", status_code=status.HTTP_200_OK)
+@router.get("/webhook/whatsapp", status_code=status.HTTP_200_OK)
+@router.get("/zapi", status_code=status.HTTP_200_OK)
+@router.get("/evolution", status_code=status.HTTP_200_OK)
+async def webhook_health_or_challenge() -> Dict[str, str]:
+    """Validação de integridade e handshake HTTP para gateways de webhook."""
+    return {"status": "ok", "service": "AutoCare V2 Webhook", "provider": settings.PROVIDER}
+
+
 @router.post("/webhook", status_code=status.HTTP_200_OK)
 @router.post("/webhook/whatsapp", status_code=status.HTTP_200_OK)
+@router.post("/zapi", status_code=status.HTTP_200_OK)
+@router.post("/webhook/zapi", status_code=status.HTTP_200_OK)
+@router.post("/evolution", status_code=status.HTTP_200_OK)
+@router.post("/webhook/evolution", status_code=status.HTTP_200_OK)
+@router.post("/messages-upsert", status_code=status.HTTP_200_OK)
+@router.post("/webhook/messages-upsert", status_code=status.HTTP_200_OK)
 async def receive_webhook(
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_async_session),

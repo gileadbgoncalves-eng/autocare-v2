@@ -26,6 +26,7 @@ RUN pip install --upgrade pip && \
 
 # Copia o código-fonte da aplicação
 COPY src/ ./src
+COPY main.py .
 COPY run_v2_tests.py .
 
 # Cria usuário não-root por segurança (Clean Architecture & DevSecOps)
@@ -41,4 +42,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Comando padrão para inicialização do servidor Uvicorn
-CMD ["uvicorn", "src.interfaces.app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

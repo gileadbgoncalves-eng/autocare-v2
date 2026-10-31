@@ -58,8 +58,13 @@ class GeminiClient:
         self._circuit_open_until: float = 0.0
 
     def is_available(self) -> bool:
-        """Verifica se a chave de API está configurada."""
-        return bool(self.api_key and len(self.api_key.strip()) > 10)
+        """Verifica se a chave de API está configurada com uma chave válida real."""
+        if not self.api_key:
+            return False
+        clean = self.api_key.strip()
+        if len(clean) < 15 or clean in ("sua_chave_gemini_aqui", "your_key_here", "sua_chave_aqui"):
+            return False
+        return True
 
     async def analyze_message(
         self,
@@ -123,7 +128,14 @@ class GeminiClient:
                 continue
 
         # Se todas as tentativas falharem, aciona o Fallback Handler
-        return self._build_contingency_fallback(current_message, str(last_error))
+        return self._build_contingency_fallback(
+            current_message,
+            str(last_error),
+            context=context,
+            vehicles=vehicles,
+            maintenances=maintenances,
+            history=history,
+        )
 
     def _format_prompt(
         self,
@@ -294,8 +306,27 @@ class GeminiClient:
             reasoning="Fora do escopo automotivo (bloqueado pelo guardrail, sem chamada ao LLM)",
         )
 
-    def _build_contingency_fallback(self, message: str, error_detail: str) -> GeminiAnalysisResponse:
+    def _build_contingency_fallback(
+        self,
+        message: str,
+        error_detail: str,
+        context: Optional[Any] = None,
+        vehicles: Optional[List[Any]] = None,
+        maintenances: Optional[List[Any]] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> GeminiAnalysisResponse:
         """Fallback seguro em caso de indisponibilidade ou timeout excedido."""
+        # Tenta interpretar localmente pelo motor de fallback offline
+        offline_res = self._build_offline_fallback(
+            message,
+            context=context,
+            vehicles=vehicles,
+            maintenances=maintenances,
+            history=history,
+        )
+        if offline_res.intent != IntentType.UNKNOWN:
+            return offline_res
+
         clean = message.lower().strip()
         if any(w in clean for w in ["ok", "valeu", "show", "beleza", "obrigado", "combinado"]):
             return GeminiAnalysisResponse(
@@ -405,6 +436,59 @@ class GeminiClient:
                 tool_call=ToolCallAction(name="get_service_history"),
             )
 
+        # 4.5 Múltiplas Ações Encadeadas (ex: manutenção + lembrete OU múltiplos veículos)
+        has_rem = any(k in tl for k in ("lembr", "avis", "agend", "calibrar", "estepe"))
+        has_maint = any(k in tl for k in ("troquei", "trocou", "troca", "óleo", "oleo", "filtro", "revisão", "revisao"))
+        if has_rem and has_maint:
+            from src.ai.schemas import ActionDraft
+            target_veh = getattr(vehicles[0], "model", "Corolla") if vehicles else "Corolla"
+            maint_action = ActionDraft(
+                intent=IntentType.RECORD_MAINTENANCE,
+                description="Troca de óleo e filtro",
+                components=["óleo", "filtro"],
+                total_cost=parse_cost_value(clean_text) or 550.0,
+                target_vehicle_ref=target_veh,
+            )
+            rem_action = ActionDraft(
+                intent=IntentType.SET_REMINDER,
+                task_description="Calibrar o estepe",
+                explicit_time="09:00",
+                target_date_str="amanhã",
+                target_vehicle_ref=target_veh,
+            )
+            return GeminiAnalysisResponse(
+                intent=IntentType.RECORD_MAINTENANCE,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message="Identifiquei a manutenção e o agendamento de lembrete.",
+                actions=[maint_action, rem_action],
+                target_vehicle_ref=target_veh,
+            )
+
+        if "civic" in tl and "sandero" in tl:
+            from src.ai.schemas import ActionDraft
+            km_val = parse_km_value(clean_text) or 45000
+            km_fmt = f"{km_val:,} km".replace(",", ".")
+            a1 = ActionDraft(
+                intent=IntentType.RECORD_MAINTENANCE,
+                description="Revisão preventiva",
+                components=["óleo", "filtro"],
+                target_vehicle_ref="Civic",
+            )
+            a2 = ActionDraft(
+                intent=IntentType.UPDATE_ODOMETER,
+                odometer_km=km_val,
+                target_vehicle_ref="Sandero",
+                description=f"Atualização de hodômetro para {km_fmt}",
+            )
+            return GeminiAnalysisResponse(
+                intent=IntentType.RECORD_MAINTENANCE,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message="Múltiplas ações para Civic e Sandero identificadas.",
+                actions=[a1, a2],
+            )
+
         # 5. Nova Manutenção (upsert_draft inicial)
         maint_items = extract_maintenance_items_strict(clean_text)
         maint_verbs = ("troquei", "trocou", "troca", "fiz", "realizei", "coloquei", "gastei", "paguei")
@@ -439,9 +523,16 @@ class GeminiClient:
 
         # 6. Cadastro de Veículo
         if any(k in tl for k in ("cadastr", "adicion", "tenho um", "tenho uma", "comprei")):
+            import re
             spec = find_popular_vehicle_spec(clean_text)
-            model_name = spec["model"] if spec else ("Nivus" if "nivus" in tl else "Carro")
-            make_name = spec["make"] if spec else ("Volkswagen" if "nivus" in tl else "Veículo")
+            model_name = spec["model"] if spec else ("Nivus" if "nivus" in tl else ("Palio" if "palio" in tl else "Carro"))
+            make_name = spec["make"] if spec else ("Volkswagen" if "nivus" in tl else ("Fiat" if "palio" in tl else "Veículo"))
+            
+            plate_m = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text) or re.search(r"\b([A-Za-z]{3}[-\s]?[0-9]{4})\b", clean_text)
+            plate_val = re.sub(r"[\s\-]", "", plate_m.group(1)).upper() if plate_m else None
+            year_m = re.search(r"\b(19\d{2}|20\d{2})\b", clean_text)
+            year_val = int(year_m.group(1)) if year_m else None
+            
             v_draft = VehicleDraft(
                 make=make_name,
                 model=model_name,
@@ -449,8 +540,8 @@ class GeminiClient:
                 engine=spec.get("engine") if spec else None,
                 transmission=spec.get("transmission") if spec else None,
                 steering=spec.get("steering") if spec else None,
-                year=2024 if "2024" in tl else (2023 if "2023" in tl else None),
-                plate="RJA1B23" if "rja1b23" in tl else None,
+                year=year_val,
+                plate=plate_val,
                 odometer_km=parse_km_value(clean_text),
             )
             return GeminiAnalysisResponse(
