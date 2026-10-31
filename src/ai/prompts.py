@@ -33,7 +33,6 @@ Seus campos principais são:
 - reply_message: Texto da resposta humanizada e amigável a ser entregue diretamente no WhatsApp do usuário
 - reasoning: Justificativa técnica concisa do porquê desta intenção e entidades extraídas
 - vehicle / maintenance / reminder / fine: Objetos específicos preenchidos com os dados estruturados extraídos da mensagem
-- extracted_entities: Dicionário complementar com os parâmetros capturados
 - target_vehicle_ref: Identificador, placa ou referência do veículo alvo da ação quando aplicável
 
 [2. CLASSIFICAÇÃO RIGOROSA DE INTENÇÕES (IntentType)]

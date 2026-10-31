@@ -5,7 +5,7 @@ fazendo a ponte bidirecional entre os modelos ORM e as entidades puras Pydantic.
 """
 
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, delete, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +35,18 @@ from .models import (
 )
 
 
+def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    B4 (M6): Normaliza timestamps lidos do banco (colunas DateTime naive gravadas em UTC
+    no SQLite/Postgres) para `datetime` UTC-aware (`tzinfo=timezone.utc`).
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 class UserRepository:
     """Repositório de persistência para condutores/usuários."""
 
@@ -54,7 +66,7 @@ class UserRepository:
             id=model.id,
             name=model.name,
             preferences=prefs,
-            created_at=model.created_at,
+            created_at=_ensure_utc(model.created_at),
         )
 
     async def get_by_id(self, user_id: str) -> Optional[User]:
@@ -167,7 +179,7 @@ class VehicleRepository:
             fuel_type=FuelType(model.fuel_type) if model.fuel_type else FuelType.FLEX,
             usage_profile=UsageProfile(model.usage_profile) if model.usage_profile else UsageProfile.CONVENCIONAL,
             current_km=model.current_km,
-            created_at=model.created_at,
+            created_at=_ensure_utc(model.created_at),
         )
 
     async def get_by_id(self, vehicle_id: int) -> Optional[Vehicle]:
@@ -237,7 +249,7 @@ class VehicleRepository:
         matched.sort(key=lambda x: x[1], reverse=True)
         return [item[0] for item in matched]
 
-    async def save(self, vehicle: Vehicle) -> Vehicle:
+    async def save(self, vehicle: Vehicle, commit: bool = True) -> Vehicle:
         """Insere ou atualiza os dados cadastrais do veículo."""
         if vehicle.id:
             stmt = select(VehicleModel).where(VehicleModel.id == vehicle.id)
@@ -256,7 +268,10 @@ class VehicleRepository:
                 model.fuel_type = vehicle.fuel_type.value
                 model.usage_profile = vehicle.usage_profile.value
                 model.current_km = vehicle.current_km
-                await self.session.commit()
+                await self.session.flush()
+                await self.session.refresh(model)
+                if commit:
+                    await self.session.commit()
                 return self._to_entity(model)
 
         new_model = VehicleModel(
@@ -276,15 +291,17 @@ class VehicleRepository:
             created_at=vehicle.created_at,
         )
         self.session.add(new_model)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(new_model)
+        if commit:
+            await self.session.commit()
         return self._to_entity(new_model)
 
-    async def add_vehicle(self, vehicle: Vehicle) -> Vehicle:
+    async def add_vehicle(self, vehicle: Vehicle, commit: bool = True) -> Vehicle:
         """Alias para save (inserção/persistência de veículo)."""
-        return await self.save(vehicle)
+        return await self.save(vehicle, commit=commit)
 
-    async def patch_vehicle_profile(self, vehicle_id: int, **fields) -> Optional[Vehicle]:
+    async def patch_vehicle_profile(self, vehicle_id: int, commit: bool = True, **fields) -> Optional[Vehicle]:
         """
         Atualiza de forma atômica e seletiva (PATCH) a ficha técnica de um veículo existente.
         Campos com valores nulos, vazios ou placeholders genéricos nunca sobrescrevem
@@ -353,11 +370,17 @@ class VehicleRepository:
                 elif str(val) in [e.value for e in UsageProfile]:
                     model.usage_profile = str(val)
 
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(model)
+        if commit:
+            await self.session.commit()
         return self._to_entity(model)
 
-    async def update_km(self, vehicle_id: int, km: int) -> Optional[Vehicle]:
+    async def update_specs(self, vehicle_id: int, commit: bool = True, **fields) -> Optional[Vehicle]:
+        """Alias para patch_vehicle_profile com suporte a controle transacional (A3)."""
+        return await self.patch_vehicle_profile(vehicle_id, commit=commit, **fields)
+
+    async def update_km(self, vehicle_id: int, km: int, commit: bool = True) -> Optional[Vehicle]:
         """Atualiza a quilometragem atual do veículo de forma atômica."""
         stmt = select(VehicleModel).where(VehicleModel.id == vehicle_id)
         result = await self.session.execute(stmt)
@@ -368,8 +391,10 @@ class VehicleRepository:
         # Só atualiza se o novo KM for maior ou igual (proteção contra regressão de odômetro)
         if model.current_km is None or km >= model.current_km:
             model.current_km = km
-            await self.session.commit()
+            await self.session.flush()
             await self.session.refresh(model)
+            if commit:
+                await self.session.commit()
 
         return self._to_entity(model)
 
@@ -406,7 +431,7 @@ class MaintenanceRepository:
             warranty_months=model.warranty_months,
             invoice_photo_url=model.invoice_photo_url,
             status=model.status or RecordStatus.ACTIVE.value,
-            created_at=model.created_at,
+            created_at=_ensure_utc(model.created_at),
         )
 
     async def get_by_id(self, record_id: int) -> Optional[MaintenanceRecord]:
@@ -416,7 +441,7 @@ class MaintenanceRepository:
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
 
-    async def add_maintenance_record(self, record: MaintenanceRecord) -> MaintenanceRecord:
+    async def add_maintenance_record(self, record: MaintenanceRecord, commit: bool = True) -> MaintenanceRecord:
         """Persiste um novo registro de manutenção e atualiza o KM do veículo se aplicável."""
         new_model = MaintenanceRecordModel(
             vehicle_id=record.vehicle_id,
@@ -445,13 +470,19 @@ class MaintenanceRepository:
             if veh and (veh.current_km is None or record.km > veh.current_km):
                 veh.current_km = record.km
 
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(new_model)
+        if commit:
+            await self.session.commit()
         return self._to_entity(new_model)
 
-    async def add_record(self, record: MaintenanceRecord) -> MaintenanceRecord:
+    async def add_record(self, record: MaintenanceRecord, commit: bool = True) -> MaintenanceRecord:
         """Alias para add_maintenance_record."""
-        return await self.add_maintenance_record(record)
+        return await self.add_maintenance_record(record, commit=commit)
+
+    async def add_maintenance(self, record: MaintenanceRecord, commit: bool = True) -> MaintenanceRecord:
+        """Alias canônico para add_maintenance_record (A3)."""
+        return await self.add_maintenance_record(record, commit=commit)
 
     async def get_by_vehicle_id(self, vehicle_id: int, limit: int = 50) -> List[MaintenanceRecord]:
         """Retorna histórico cronológico decrescente de manutenções de um veículo."""
@@ -583,15 +614,40 @@ class ReminderRepository:
             user_id=model.user_id,
             vehicle_id=model.vehicle_id,
             description=model.description,
-            due_datetime=model.due_datetime,
-            data_hora_agendada=model.data_hora_agendada,
+            due_datetime=_ensure_utc(model.due_datetime),
+            data_hora_agendada=_ensure_utc(model.data_hora_agendada),
             due_km=model.due_km,
-            recurrence=ReminderRecurrence(model.recurrence) if model.recurrence in [e.value for e in ReminderRecurrence] else ReminderRecurrence.ONCE,
-            status=ReminderStatus(model.status) if model.status in [e.value for e in ReminderStatus] else ReminderStatus.PENDING,
-            created_at=model.created_at,
+            recurrence=ReminderRepository._coerce_enum(ReminderRecurrence, model.recurrence, ReminderRecurrence.ONCE),
+            status=ReminderRepository._coerce_enum(ReminderStatus, model.status, ReminderStatus.PENDING),
+            created_at=_ensure_utc(model.created_at),
         )
 
-    async def add_reminder(self, reminder: Reminder) -> Reminder:
+    @staticmethod
+    def _coerce_enum(enum_cls, raw, default):
+        """
+        B1 (C5): Converte `raw` (None | Enum | str em qualquer caixa) para membro do Enum,
+        tentando tanto o `.value` minúsculo quanto o nome do membro em MAIÚSCULAS.
+        Nunca levanta: valores desconhecidos caem no `default` (B8/B10).
+        """
+        if raw is None:
+            return default
+        if isinstance(raw, enum_cls):
+            return raw
+        clean = str(raw).strip()
+        if not clean:
+            return default
+        try:
+            return enum_cls(clean.lower())
+        except (ValueError, TypeError):
+            pass
+        try:
+            return enum_cls[clean.upper()]
+        except (KeyError, TypeError):
+            return default
+
+    async def add_reminder(self, reminder: Reminder, commit: bool = True) -> Reminder:
+        recurrence = self._coerce_enum(ReminderRecurrence, reminder.recurrence, ReminderRecurrence.ONCE)
+        status_val = self._coerce_enum(ReminderStatus, reminder.status, ReminderStatus.PENDING)
         new_model = ReminderModel(
             user_id=reminder.user_id,
             vehicle_id=reminder.vehicle_id,
@@ -599,13 +655,15 @@ class ReminderRepository:
             due_datetime=reminder.due_datetime,
             data_hora_agendada=reminder.data_hora_agendada,
             due_km=reminder.due_km,
-            recurrence=reminder.recurrence.value if hasattr(reminder.recurrence, "value") else str(reminder.recurrence),
-            status=reminder.status.value if hasattr(reminder.status, "value") else str(reminder.status),
+            recurrence=recurrence.value,
+            status=status_val.value,
             created_at=reminder.created_at,
         )
         self.session.add(new_model)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(new_model)
+        if commit:
+            await self.session.commit()
         return self._to_entity(new_model)
 
     async def get_by_user_id(self, user_id: str, include_cancelled: bool = False) -> List[Reminder]:
@@ -641,8 +699,22 @@ class ReminderRepository:
         return result.rowcount > 0
 
 
+# B3 (A10) - Decisão de Produto:
+# `UNDO_WINDOW_MINUTES = 5` (janela de arrependimento imediato PÓS-commit para soft-delete) é
+# intencionalmente menor que `DRAFT_TTL_MINUTES = 30` (tempo que um rascunho AINDA NÃO SALVO
+# permanece aberto em `ConversationService`). Para correções após 5 minutos do commit, o usuário
+# utiliza a tool estruturada `update_last_saved_service`.
 UNDO_WINDOW_MINUTES = 5
 UNDO_BATCH_TOLERANCE_SECONDS = 10
+
+
+def _to_utc_naive(dt_val: Optional[datetime]) -> datetime:
+    from datetime import timezone
+    if dt_val is None:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+    if dt_val.tzinfo is not None:
+        return dt_val.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt_val
 
 
 async def soft_delete_last_user_record(
@@ -660,7 +732,7 @@ async def soft_delete_last_user_record(
     desfazer não deixe metade de uma intenção mista persistida.
     Os timestamps `created_at` são gravados em UTC, por isso `now` também é UTC.
     """
-    ref_now = now or datetime.utcnow()
+    ref_now = _to_utc_naive(now)
     cutoff = ref_now - timedelta(minutes=window_minutes)
 
     m_stmt = (
@@ -685,18 +757,18 @@ async def soft_delete_last_user_record(
     rems = list((await session.execute(r_stmt)).scalars().all())
 
     result = {"maintenance_ids": [], "reminder_ids": []}
-    all_ts = [m.created_at for m in maints] + [r.created_at for r in rems]
+    all_ts = [_to_utc_naive(m.created_at) for m in maints] + [_to_utc_naive(r.created_at) for r in rems]
     if not all_ts:
         return result
 
     anchor = max(all_ts)
     batch_floor = anchor - timedelta(seconds=UNDO_BATCH_TOLERANCE_SECONDS)
     for m in maints:
-        if m.created_at >= batch_floor:
+        if _to_utc_naive(m.created_at) >= batch_floor:
             m.status = RecordStatus.CANCELLED.value
             result["maintenance_ids"].append(m.id)
     for r in rems:
-        if r.created_at >= batch_floor:
+        if _to_utc_naive(r.created_at) >= batch_floor:
             r.status = ReminderStatus.CANCELLED.value
             result["reminder_ids"].append(r.id)
 
@@ -724,10 +796,10 @@ class TrafficFineRepository:
             infraction_date=model.infraction_date,
             due_date=model.due_date,
             status=FineStatus(model.status) if model.status in [e.value for e in FineStatus] else FineStatus.NOTIFICADA,
-            created_at=model.created_at,
+            created_at=_ensure_utc(model.created_at),
         )
 
-    async def add_fine(self, fine: TrafficFine) -> TrafficFine:
+    async def add_fine(self, fine: TrafficFine, commit: bool = True) -> TrafficFine:
         new_model = TrafficFineModel(
             vehicle_id=fine.vehicle_id,
             description=fine.description,
@@ -742,8 +814,10 @@ class TrafficFineRepository:
             created_at=fine.created_at,
         )
         self.session.add(new_model)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(new_model)
+        if commit:
+            await self.session.commit()
         return self._to_entity(new_model)
 
     async def get_by_user_id(self, user_id: str) -> List[TrafficFine]:
@@ -768,3 +842,7 @@ class TrafficFineRepository:
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount > 0
+
+
+FineRepository = TrafficFineRepository
+

@@ -6,20 +6,51 @@ timeout estrito de 5s, exponential backoff com jitter para 429/5xx e fallback se
 
 import json
 import asyncio
+import hashlib
+import logging
 import random
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Dict, Any
 
 from src.config.settings import settings
 from src.domain.enums import IntentType, ConfidenceLevel
 from src.ai.schemas import GeminiAnalysisResponse
 from src.ai.prompts import SYSTEM_INSTRUCTION, build_analysis_prompt
+from src.ai.offline_fallback import build_offline_fallback
+from src.infrastructure.http_client import shared_http_client, TIMEOUT_GEMINI_API
+from src.infrastructure.rate_limiter import SlidingWindowRateLimiter
 from src.ai.guardrails import OUT_OF_SCOPE_REPLY, is_out_of_scope, prune_history
+
+logger = logging.getLogger("autocare.ai.client")
 
 # Limites do guardrail de custo para tokens de saída
 MIN_OUTPUT_TOKENS = 250
 MAX_OUTPUT_TOKENS = 400
+
+# Rate limiter dedicado do Gemini compartilhado por user_id (A6 / S4)
+_gemini_rate_limiter = SlidingWindowRateLimiter()
+
+# Executor limitado para fallback urllib (B9 / S6)
+_urllib_executor: Optional[ThreadPoolExecutor] = None
+
+
+def get_urllib_executor() -> ThreadPoolExecutor:
+    """Retorna ou inicializa o ThreadPoolExecutor limitado para chamadas síncronas urllib (B9)."""
+    global _urllib_executor
+    if _urllib_executor is None:
+        _urllib_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini-urllib")
+    return _urllib_executor
+
+
+def shutdown_urllib_executor(wait: bool = False) -> None:
+    """Encerra o ThreadPoolExecutor do fallback urllib no shutdown do lifespan (B9)."""
+    global _urllib_executor
+    if _urllib_executor is not None:
+        _urllib_executor.shutdown(wait=wait)
+        _urllib_executor = None
+
 
 try:
     import httpx
@@ -87,6 +118,19 @@ class GeminiClient:
         if is_out_of_scope(current_message):
             return self._build_out_of_scope_response()
 
+        # Guardrail de Quota (A6 / S4): Rate limit dedicado no GeminiClient ANTES da chamada HTTP
+        gemini_limit = getattr(settings, "GEMINI_RATE_LIMIT_PER_MIN", 20)
+        if getattr(settings, "AUTOCARE_FEATURE_RATE_LIMIT", True) and gemini_limit > 0:
+            if not _gemini_rate_limiter.allow(user_id, gemini_limit):
+                logger.warning("event=rate_limited component=gemini_client user_id=%s limit=%d", user_id, gemini_limit)
+                return GeminiAnalysisResponse(
+                    intent=IntentType.UNKNOWN,
+                    confidence=ConfidenceLevel.LOW,
+                    is_critical_action=False,
+                    reply_message="Muitas mensagens em pouco tempo, aguarde um instante.",
+                    reasoning="Rate limit do Gemini atingido (proteção de quota)",
+                )
+
         if not self.is_available():
             return self._build_offline_fallback(
                 current_message,
@@ -103,8 +147,9 @@ class GeminiClient:
         prompt = self._format_prompt(current_message, history, context, vehicles, maintenances, reminders, fines)
         schema_dict = self._clean_schema_for_gemini(GeminiAnalysisResponse.model_json_schema())
 
-        # Circuit breaker rápido quando a cota/chave retornou erro recentemente (evita bloquear chamadas concorrentes)
-        if _time.monotonic() < getattr(self, "_circuit_open_until", 0.0):
+        # Circuit breaker rápido quando a cota/chave retornou erro recentemente (C3: controlado por feature flag)
+        cb_enabled = getattr(settings, "AUTOCARE_FEATURE_GEMINI_CIRCUIT_BREAKER", True)
+        if cb_enabled and _time.monotonic() < getattr(self, "_circuit_open_until", 0.0):
             return self._build_contingency_fallback(current_message, "Circuit breaker ativo (cota/API indisponível)")
 
         models_to_try = [self.primary_model, self.fallback_model]
@@ -122,7 +167,7 @@ class GeminiClient:
                 last_error = e
                 err_str = str(e)
                 # Se a chave de API estiver sem cota (429) ou erro 4xx, abre circuit breaker curto e não bloqueia
-                if any(code in err_str for code in ("HTTP 429", "HTTP 401", "HTTP 403", "HTTP 400", "HTTP 404")):
+                if cb_enabled and any(code in err_str for code in ("HTTP 429", "HTTP 401", "HTTP 403", "HTTP 400", "HTTP 404")):
                     self._circuit_open_until = _time.monotonic() + 30.0
                     break
                 continue
@@ -189,6 +234,10 @@ class GeminiClient:
                     if k == "properties" and isinstance(v, dict):
                         props = {}
                         for pk, pv in v.items():
+                            # B14: `extracted_entities` é um Dict[str, Any] livre; a REST API do Gemini não
+                            # aceita OBJECT sem `properties` (additionalProperties é descartado). Por isso o campo
+                            # é removido do schema E a instrução foi removida do prompt: os dados estruturados
+                            # vêm dos objetos tipados (vehicle/maintenance/reminder/fine) e do tool_call.
                             if pk == "extracted_entities":
                                 continue
                             props[pk] = resolve(pv)
@@ -242,8 +291,9 @@ class GeminiClient:
         for attempt in range(1, self.max_retries + 1):
             try:
                 if HAS_HTTPX:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
-                        resp = await client.post(url, json=payload, headers=headers)
+                    req_timeout = self.timeout if self.timeout else TIMEOUT_GEMINI_API
+                    async with shared_http_client(req_timeout) as client:
+                        resp = await client.post(url, json=payload, headers=headers, timeout=req_timeout)
                         if resp.status_code == 200:
                             data = resp.json()
                             candidates = data.get("candidates", [])
@@ -256,14 +306,20 @@ class GeminiClient:
                             if attempt < self.max_retries:
                                 await asyncio.sleep(0.15 * attempt)
                                 continue
-                            raise GeminiClientException(f"HTTP {resp.status_code}: {resp.text}")
+                            body_text = resp.text or ""
+                            body_hash = hashlib.sha256(body_text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+                            logger.debug("Gemini error status=%s body_hash=%s body=%s", resp.status_code, body_hash, body_text)
+                            raise GeminiClientException(f"HTTP {resp.status_code}: <body len={len(body_text)}>")
                         else:
-                            # Fail-fast para 400, 401, 403, 404 e 429 (evita travar a requisição em sleep longo)
-                            raise GeminiClientException(f"HTTP {resp.status_code}: {resp.text}")
+                            # Fail-fast para 400, 401, 403, 404 e 429; mascara o body para evitar vazamento (B8 / S1)
+                            body_text = resp.text or ""
+                            body_hash = hashlib.sha256(body_text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+                            logger.debug("Gemini error status=%s body_hash=%s body=%s", resp.status_code, body_hash, body_text)
+                            raise GeminiClientException(f"HTTP {resp.status_code}: <body len={len(body_text)}>")
                 else:
-                    # Fallback assíncrono transparente via thread pool nativo
-                    loop = asyncio.get_event_loop()
-                    return await loop.run_in_executor(None, self._sync_urllib_call, url, payload)
+                    # Fallback assíncrono via ThreadPoolExecutor explícito limitado (B9 / S6)
+                    loop = asyncio.get_running_loop()
+                    return await loop.run_in_executor(get_urllib_executor(), self._sync_urllib_call, url, payload)
 
             except GeminiClientException:
                 raise
@@ -359,206 +415,11 @@ class GeminiClient:
         maintenances: Optional[List[Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> GeminiAnalysisResponse:
-        """
-        Motor local AI-First quando a chave de API externa não está configurada.
-        Analisa `draft_atual` e `ultimo_servico_salvo` seguindo as 4 funções estruturadas
-        (`upsert_draft`, `confirm_and_save_draft`, `update_last_saved_service`, `get_service_history`)
-        e as regras da Etapa 3 (Anti-Alucinação, Cumulatividade e Condução Ativa na Edição).
-        """
-        from src.ai.schemas import ToolCallAction, VehicleDraft, MaintenanceDraft
-        from src.application.services.conversation import (
-            extract_maintenance_items_strict,
-            parse_km_value,
-            parse_cost_value,
-            extract_date_strict,
-            is_edit_last_service_intent,
-            find_popular_vehicle_spec,
-            ConversationState,
-        )
-
-        clean_text = (message or "").strip()
-        tl = clean_text.lower()
-
-        # 1. Edição de Último Serviço Salvo (update_last_saved_service)
-        if is_edit_last_service_intent(clean_text, context) or any(k in tl for k in ("alterar o último", "alterar o ultimo", "mudar o último", "mudar o ultimo", "corrigir o último", "corrigir o ultimo", "corrigir o km desse último")):
-            last_m_id = None
-            if maintenances:
-                latest = maintenances[0]
-                last_m_id = getattr(latest, "id", None)
-            return GeminiAnalysisResponse(
-                intent=IntentType.UPDATE_LAST_SAVED_SERVICE,
-                confidence=ConfidenceLevel.HIGH,
-                is_critical_action=True,
-                reply_message="Vou atualizar o último serviço salvo.",
-                tool_call=ToolCallAction(name="update_last_saved_service", service_id=last_m_id),
-                extracted_entities={"service_id": last_m_id},
-            )
-
-        # 2. Confirmação (confirm_and_save_draft)
-        if tl in ("sim", "pode salvar", "confirmo", "fechou", "isso", "salvar", "ok", "correto", "pode confirmar"):
-            if context and getattr(context, "is_awaiting_confirmation", lambda: False)():
-                return GeminiAnalysisResponse(
-                    intent=IntentType.CONFIRM_ACTION,
-                    confidence=ConfidenceLevel.HIGH,
-                    is_critical_action=False,
-                    reply_message="Confirmando e salvando registro.",
-                    tool_call=ToolCallAction(name="confirm_and_save_draft"),
-                )
-
-        # 3. Adição Cumulativa ao Rascunho Aberto (upsert_draft)
-        if context and getattr(context, "state", None) == ConversationState.AWAITING_MAINTENANCE_CONFIRM:
-            items = extract_maintenance_items_strict(clean_text)
-            new_km = parse_km_value(clean_text)
-            new_cost = parse_cost_value(clean_text)
-            new_date = extract_date_strict(clean_text)
-            return GeminiAnalysisResponse(
-                intent=IntentType.UPSERT_DRAFT,
-                confidence=ConfidenceLevel.HIGH,
-                is_critical_action=True,
-                reply_message="Atualizando rascunho de manutenção.",
-                tool_call=ToolCallAction(
-                    name="upsert_draft",
-                    itens=items or None,
-                    km=new_km,
-                    data=new_date,
-                    valor=new_cost,
-                ),
-                extracted_entities={"itens": items, "km": new_km, "data": new_date, "valor": new_cost},
-            )
-
-        # 4. Histórico (get_service_history)
-        if any(k in tl for k in ("histórico", "historico", "últimas manutenções", "ultimas manutencoes", "revisões feitas")):
-            return GeminiAnalysisResponse(
-                intent=IntentType.QUERY_HISTORY,
-                confidence=ConfidenceLevel.HIGH,
-                is_critical_action=False,
-                reply_message="Buscando histórico de serviços.",
-                tool_call=ToolCallAction(name="get_service_history"),
-            )
-
-        # 4.5 Múltiplas Ações Encadeadas (ex: manutenção + lembrete OU múltiplos veículos)
-        has_rem = any(k in tl for k in ("lembr", "avis", "agend", "calibrar", "estepe"))
-        has_maint = any(k in tl for k in ("troquei", "trocou", "troca", "óleo", "oleo", "filtro", "revisão", "revisao"))
-        if has_rem and has_maint:
-            from src.ai.schemas import ActionDraft
-            target_veh = getattr(vehicles[0], "model", "Corolla") if vehicles else "Corolla"
-            maint_action = ActionDraft(
-                intent=IntentType.RECORD_MAINTENANCE,
-                description="Troca de óleo e filtro",
-                components=["óleo", "filtro"],
-                total_cost=parse_cost_value(clean_text) or 550.0,
-                target_vehicle_ref=target_veh,
-            )
-            rem_action = ActionDraft(
-                intent=IntentType.SET_REMINDER,
-                task_description="Calibrar o estepe",
-                explicit_time="09:00",
-                target_date_str="amanhã",
-                target_vehicle_ref=target_veh,
-            )
-            return GeminiAnalysisResponse(
-                intent=IntentType.RECORD_MAINTENANCE,
-                confidence=ConfidenceLevel.HIGH,
-                is_critical_action=True,
-                reply_message="Identifiquei a manutenção e o agendamento de lembrete.",
-                actions=[maint_action, rem_action],
-                target_vehicle_ref=target_veh,
-            )
-
-        if "civic" in tl and "sandero" in tl:
-            from src.ai.schemas import ActionDraft
-            km_val = parse_km_value(clean_text) or 45000
-            km_fmt = f"{km_val:,} km".replace(",", ".")
-            a1 = ActionDraft(
-                intent=IntentType.RECORD_MAINTENANCE,
-                description="Revisão preventiva",
-                components=["óleo", "filtro"],
-                target_vehicle_ref="Civic",
-            )
-            a2 = ActionDraft(
-                intent=IntentType.UPDATE_ODOMETER,
-                odometer_km=km_val,
-                target_vehicle_ref="Sandero",
-                description=f"Atualização de hodômetro para {km_fmt}",
-            )
-            return GeminiAnalysisResponse(
-                intent=IntentType.RECORD_MAINTENANCE,
-                confidence=ConfidenceLevel.HIGH,
-                is_critical_action=True,
-                reply_message="Múltiplas ações para Civic e Sandero identificadas.",
-                actions=[a1, a2],
-            )
-
-        # 5. Nova Manutenção (upsert_draft inicial)
-        maint_items = extract_maintenance_items_strict(clean_text)
-        maint_verbs = ("troquei", "trocou", "troca", "fiz", "realizei", "coloquei", "gastei", "paguei")
-        if (any(v in tl for v in maint_verbs) or maint_items) and not any(k in tl for k in ("tem alguma", "quando vence", "qual a revisão")):
-            new_km = parse_km_value(clean_text)
-            new_cost = parse_cost_value(clean_text)
-            new_date = extract_date_strict(clean_text)
-            target_ref = "Nivus" if "nivus" in tl else ("Corolla" if "corolla" in tl else None)
-            m_draft = MaintenanceDraft(
-                description=", ".join(maint_items) if maint_items else clean_text,
-                components=maint_items,
-                total_cost=new_cost,
-                odometer_km=new_km,
-                date_str=new_date,
-            )
-            return GeminiAnalysisResponse(
-                intent=IntentType.RECORD_MAINTENANCE,
-                confidence=ConfidenceLevel.HIGH,
-                is_critical_action=True,
-                reply_message=f"Entendido o registro de manutenção ({', '.join(maint_items) if maint_items else 'serviço'}).",
-                maintenance=m_draft,
-                target_vehicle_ref=target_ref,
-                tool_call=ToolCallAction(
-                    name="upsert_draft",
-                    itens=maint_items or None,
-                    km=new_km,
-                    data=new_date,
-                    valor=new_cost,
-                ),
-                extracted_entities=m_draft.model_dump(exclude_none=True),
-            )
-
-        # 6. Cadastro de Veículo
-        if any(k in tl for k in ("cadastr", "adicion", "tenho um", "tenho uma", "comprei")):
-            import re
-            spec = find_popular_vehicle_spec(clean_text)
-            model_name = spec["model"] if spec else ("Nivus" if "nivus" in tl else ("Palio" if "palio" in tl else "Carro"))
-            make_name = spec["make"] if spec else ("Volkswagen" if "nivus" in tl else ("Fiat" if "palio" in tl else "Veículo"))
-            
-            plate_m = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text) or re.search(r"\b([A-Za-z]{3}[-\s]?[0-9]{4})\b", clean_text)
-            plate_val = re.sub(r"[\s\-]", "", plate_m.group(1)).upper() if plate_m else None
-            year_m = re.search(r"\b(19\d{2}|20\d{2})\b", clean_text)
-            year_val = int(year_m.group(1)) if year_m else None
-            
-            v_draft = VehicleDraft(
-                make=make_name,
-                model=model_name,
-                version=spec.get("version") if spec else ("Highline" if "highline" in tl else None),
-                engine=spec.get("engine") if spec else None,
-                transmission=spec.get("transmission") if spec else None,
-                steering=spec.get("steering") if spec else None,
-                year=year_val,
-                plate=plate_val,
-                odometer_km=parse_km_value(clean_text),
-            )
-            return GeminiAnalysisResponse(
-                intent=IntentType.REGISTER_VEHICLE,
-                confidence=ConfidenceLevel.HIGH,
-                is_critical_action=True,
-                reply_message=f"Cadastro do {model_name} identificado.",
-                vehicle=v_draft,
-                target_vehicle_ref=model_name,
-                extracted_entities=v_draft.model_dump(exclude_none=True),
-            )
-
-        # Default fallback quando nada específico é reconhecido offline
-        return GeminiAnalysisResponse(
-            intent=IntentType.UNKNOWN,
-            confidence=ConfidenceLevel.LOW,
-            is_critical_action=False,
-            reply_message="⚙️ A chave GEMINI_API_KEY não está configurada nas variáveis de ambiente.",
-            reasoning="Chave ausente"
+        """Delegação fina: a lógica vive em `src.ai.offline_fallback` (sem ciclo de import)."""
+        return build_offline_fallback(
+            message,
+            context=context,
+            vehicles=vehicles,
+            maintenances=maintenances,
+            history=history,
         )

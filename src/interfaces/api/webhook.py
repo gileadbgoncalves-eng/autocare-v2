@@ -6,16 +6,20 @@ Pipeline AI-First:
 """
 
 import asyncio
+import hashlib
 import logging
 import re
-from datetime import datetime, date, timedelta, time
+import weakref
+from datetime import datetime, date, timedelta, time, timezone
 from typing import Dict, Any, Optional, Tuple, List
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.settings import settings
 from src.config.clock import now_brt_naive
-from src.infrastructure.database.session import get_async_session, async_session_factory
+from src.infrastructure.database.session import async_session_factory
+from src.infrastructure.http_client import shared_http_client, TIMEOUT_WHATSAPP_OUTBOUND
+from src.infrastructure.rate_limiter import SlidingWindowRateLimiter
 from src.infrastructure.database.repositories import (
     UserRepository,
     VehicleRepository,
@@ -55,7 +59,8 @@ class MessageDebouncer:
         self._buffers: Dict[str, List[str]] = {}
         self._futures: Dict[str, asyncio.Future] = {}
         self._timer_tasks: Dict[str, asyncio.Task] = {}
-        self._locks: Dict[str, asyncio.Lock] = {}
+        # B5 (M7): WeakValueDictionary evita vazamento ilimitado de locks por user_id inativo
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     @property
     def debounce_seconds(self) -> float:
@@ -64,9 +69,11 @@ class MessageDebouncer:
         return getattr(settings, "WEBHOOK_DEBOUNCE_SECONDS", 2.0)
 
     def _get_lock(self, user_id: str) -> asyncio.Lock:
-        if user_id not in self._locks:
-            self._locks[user_id] = asyncio.Lock()
-        return self._locks[user_id]
+        lock = self._locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[user_id] = lock
+        return lock
 
     async def enqueue(
         self,
@@ -99,7 +106,7 @@ class MessageDebouncer:
                 old_task.cancel()
 
             task = asyncio.create_task(
-                self._timer_worker(user_id, self.debounce_seconds, process_fn, fut)
+                self._timer_worker(user_id, self.debounce_seconds, process_fn, fut, lock)
             )
             self._timer_tasks[user_id] = task
 
@@ -111,14 +118,15 @@ class MessageDebouncer:
         delay: float,
         process_fn,
         fut: asyncio.Future,
+        lock: Optional[asyncio.Lock] = None,
     ) -> None:
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
 
-        lock = self._get_lock(user_id)
-        async with lock:
+        active_lock = lock or self._get_lock(user_id)
+        async with active_lock:
             messages = self._buffers.pop(user_id, [])
             self._timer_tasks.pop(user_id, None)
             self._futures.pop(user_id, None)
@@ -142,6 +150,33 @@ class MessageDebouncer:
 message_debouncer = MessageDebouncer()
 
 
+MAX_MESSAGE_CHARS = 2000
+
+
+def _extract_non_empty_text(raw: Any) -> Optional[str]:
+    """A5 (S3): extrai o texto do payload sem truncar durante o parse."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text if text else None
+
+
+def _sanitize_message_text(raw: Any, user_id: Optional[str] = None) -> Optional[str]:
+    """A5 (S3): normaliza e trunca `message_text` APÓS `parse_whatsapp_payload`."""
+    text = _extract_non_empty_text(raw)
+    if not text:
+        return None
+    if len(text) > MAX_MESSAGE_CHARS:
+        logger.warning(f"Mensagem de [{user_id}] truncada de {len(text)} para {MAX_MESSAGE_CHARS} caracteres")
+        text = text[:MAX_MESSAGE_CHARS]
+    return text
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """B4: devolve `value` se for dict, senão {} (cobre None, str, list...)."""
+    return value if isinstance(value, dict) else {}
+
+
 def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """Normaliza payloads de múltiplos gateways (Evolution API, Z-API ou testes diretos)."""
     if not payload:
@@ -151,29 +186,30 @@ def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Opti
     if "user_id" in payload and ("message" in payload or "text" in payload):
         user_id = "".join(filter(str.isdigit, str(payload["user_id"])))
         raw_msg = payload.get("message") if "message" in payload else payload.get("text")
-        return user_id, str(raw_msg).strip()
+        return user_id, _extract_non_empty_text(raw_msg)
 
     # 2. Formato Evolution API
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    key = data.get("key", {}) if isinstance(data, dict) else {}
+    key = _as_dict(data.get("key")) if isinstance(data, dict) else {}
     if key.get("fromMe", False) or payload.get("fromMe", False):
         return None, None
 
-    remote_jid = str(key.get("remoteJid", "") or payload.get("remoteJid", ""))
+    remote_jid = str(key.get("remoteJid", "") or payload.get("remoteJid", "") or "")
     if "@g.us" in remote_jid or payload.get("isGroup", False):
         return None, None
 
     if "@s.whatsapp.net" in remote_jid:
         user_id = "".join(filter(str.isdigit, remote_jid.split("@")[0]))
-        msg_obj = data.get("message", {}) if isinstance(data, dict) else {}
+        msg_obj = _as_dict(data.get("message")) if isinstance(data, dict) else {}
         text = (
             msg_obj.get("conversation")
-            or msg_obj.get("extendedTextMessage", {}).get("text")
-            or msg_obj.get("buttonsResponseMessage", {}).get("selectedButtonId")
-            or msg_obj.get("listResponseMessage", {}).get("singleSelectReply", {}).get("selectedRowId")
+            or _as_dict(msg_obj.get("extendedTextMessage")).get("text")
+            or _as_dict(msg_obj.get("buttonsResponseMessage")).get("selectedButtonId")
+            or _as_dict(_as_dict(msg_obj.get("listResponseMessage")).get("singleSelectReply")).get("selectedRowId")
         )
-        if text:
-            return user_id, str(text).strip()
+        clean = _extract_non_empty_text(text)
+        if clean:
+            return user_id, clean
 
     # 3. Formato Z-API
     if payload.get("isGroup", False) or payload.get("fromMe", False):
@@ -184,10 +220,11 @@ def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Opti
         if "@g.us" in phone_str or "g.us" in str(payload.get("chatId", "")):
             return None, None
         user_id = "".join(filter(str.isdigit, phone_str.split("@")[0]))
-        text_obj = payload.get("text", {})
+        text_obj = payload.get("text")
         text = text_obj.get("message") if isinstance(text_obj, dict) else payload.get("message")
-        if text:
-            return user_id, str(text).strip()
+        clean = _extract_non_empty_text(text)
+        if clean:
+            return user_id, clean
 
     return None, None
 
@@ -197,8 +234,16 @@ def resolve_target_vehicle(
     ref: Optional[str] = None,
     payload_hint: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
-    """Resolve o ID do veículo alvo por placa, modelo, tipo de veículo ou fuzzy matching."""
+    """
+    B2 (C6): Resolve o ID do veículo alvo com ordem determinística:
+    (1) placa exata (`plate_alias`) ->
+    (2) `make + model` ou `model` exato (`model_alias`) ->
+    (3) fuzzy `difflib` com `ratio >= 0.85` ->
+    (4) se >= 2 veículos empatarem na mesma consulta sem placa desambiguadora, retorna `None`.
+    """
     if not vehicles:
+        return None
+    if isinstance(ref, str) and ref.startswith("AMBIGUOUS:"):
         return None
     hint = payload_hint or {}
     if hint.get("vehicle_id") and any(v.id == hint["vehicle_id"] for v in vehicles):
@@ -207,55 +252,75 @@ def resolve_target_vehicle(
         return vehicles[0].id
 
     ref_clean = (str(ref or "")).strip().lower()
-    plate_hint = (str(hint.get("plate") or "")).strip().upper().replace("-", "")
+    plate_hint = (str(hint.get("plate") or "")).strip().upper().replace("-", "").replace(" ", "")
     type_hint = (str(hint.get("vehicle_type") or "")).strip().lower()
+    model_hint = (str(hint.get("model") or "")).strip().lower()
 
-    # 1. Correspondência exata ou substring por placa
+    # 1. Correspondência exata por placa (`plate_alias`)
     for v in vehicles:
-        v_plate = (getattr(v, "plate", None) or getattr(v, "placa", "") or "").upper().replace("-", "").strip()
+        v_plate = v.plate_alias if isinstance(v, Vehicle) else (getattr(v, "plate", None) or getattr(v, "placa", "") or "").upper().replace("-", "").strip()
         if v_plate:
             if plate_hint and plate_hint == v_plate:
                 return v.id
-            if ref_clean and (v_plate.lower() in ref_clean or ref_clean in v_plate.lower()):
+            if ref_clean and (v_plate.lower() in ref_clean or ref_clean == v_plate.lower()):
                 return v.id
 
-    # 2. Correspondência específica por modelo
+    # 2. Correspondência exata por `make + model` ou `model` (`model_alias`)
+    exact_matches: List[Vehicle] = []
+    query_candidates = [q for q in (ref_clean, model_hint) if q]
     for v in vehicles:
-        model_str = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
-        if model_str:
-            if model_str in ref_clean:
-                return v.id
+        model_str = v.model_alias if isinstance(v, Vehicle) else (getattr(v, "model", None) or getattr(v, "modelo", "") or "").strip().lower()
+        make_str = (getattr(v, "make", None) or getattr(v, "marca", "") or "").strip().lower()
+        full_name = f"{make_str} {model_str}".strip()
+        if not model_str:
+            continue
+        matched = False
+        for q in query_candidates:
+            if q == full_name or q == model_str or model_str in q:
+                matched = True
+                break
             for part in model_str.split():
-                if len(part) >= 3 and part in ref_clean:
-                    return v.id
-            if "model" in hint and str(hint["model"]).lower() in model_str:
-                return v.id
+                if len(part) >= 3 and part in q.split():
+                    matched = True
+                    break
+        if matched:
+            exact_matches.append(v)
 
-    # 3. Correspondência por tipo de veículo (moto vs carro)
+    if len(exact_matches) == 1:
+        return exact_matches[0].id
+    if len(exact_matches) >= 2:
+        return None  # B2 (C6): ambiguidade entre veículos de mesmo modelo -> requer desambiguação por placa
+
+    # 3. Correspondência por tipo de veículo (moto vs carro), somente se único
     is_moto = any(m in ref_clean for m in ["moto", "motoca", "motocicleta", "cg", "fazer", "titan", "biz", "twister", "scooter"]) or type_hint == "moto"
     is_carro = any(c in ref_clean for c in ["carro", "automovel", "caranga", "veiculo", "caminhonete", "suv", "sedan", "hatch"]) or type_hint in ("carro", "caminhonete")
 
     if is_moto:
-        for v in vehicles:
-            v_type_str = str(getattr(v, "vehicle_type", None) or getattr(v, "tipo", "")).lower()
-            if "moto" in v_type_str:
-                return v.id
+        moto_matches = [v for v in vehicles if "moto" in str(getattr(v, "vehicle_type", None) or getattr(v, "tipo", "")).lower()]
+        if len(moto_matches) == 1:
+            return moto_matches[0].id
+        if len(moto_matches) >= 2:
+            return None
 
     if is_carro:
-        for v in vehicles:
-            v_type_str = str(getattr(v, "vehicle_type", None) or getattr(v, "tipo", "")).lower()
-            if "carro" in v_type_str or "caminhonete" in v_type_str:
-                return v.id
+        carro_matches = [
+            v for v in vehicles
+            if any(t in str(getattr(v, "vehicle_type", None) or getattr(v, "tipo", "")).lower() for t in ("carro", "caminhonete"))
+        ]
+        if len(carro_matches) == 1:
+            return carro_matches[0].id
+        if len(carro_matches) >= 2:
+            return None
 
-    # 4. Fuzzy Matching por similaridade aproximada
+    # 4. Fuzzy Matching por similaridade aproximada (`ratio >= 0.85`)
     import difflib
     ref_words = ref_clean.split()
-    best_id = None
-    best_score = 0.0
+    fuzzy_scored: List[Tuple[Vehicle, float]] = []
     for v in vehicles:
         model_str = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
         make_str = (getattr(v, "make", None) or getattr(v, "marca", "") or "").lower()
         targets = [model_str, make_str] + model_str.split() + make_str.split()
+        best_v_score = 0.0
         for rw in ref_words:
             if len(rw) < 3:
                 continue
@@ -263,22 +328,52 @@ def resolve_target_vehicle(
                 if not target or len(target) < 3:
                     continue
                 ratio = difflib.SequenceMatcher(None, rw, target).ratio()
-                if ratio > best_score and ratio >= 0.70:
-                    best_score = ratio
-                    best_id = v.id
-    if best_id is not None:
-        return best_id
+                if ratio > best_v_score:
+                    best_v_score = ratio
+        if best_v_score >= 0.85:
+            fuzzy_scored.append((v, best_v_score))
+
+    if len(fuzzy_scored) == 1:
+        return fuzzy_scored[0][0].id
+    if len(fuzzy_scored) >= 2:
+        return None  # B2 (C6): múltiplos candidatos no fuzzy -> ambíguo
+
+    # Se há múltiplos veículos com o mesmo model_alias na garagem, não chuta o primeiro
+    model_aliases = [v.model_alias if isinstance(v, Vehicle) else (getattr(v, "model", "") or "").strip().lower() for v in vehicles]
+    if len(set(model_aliases)) < len(model_aliases):
+        return None
 
     return vehicles[0].id
 
 
+_NUMERIC_DATE_RE = re.compile(r"\b(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?\b")
+_TEXTUAL_DATE_RE = re.compile(r"(?:dia\s+)?(\d{1,2})\s+de\s+([a-zA-ZçÇ]+)(?:\s+de\s+(\d{4}))?", re.IGNORECASE)
+
+_MONTHS_PT = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+    "outubro": 10, "novembro": 11, "dezembro": 12,
+    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+}
+
+
 def _parse_due_datetime(raw_dt: Any, date_str: Optional[str] = None, explicit_time: Optional[str] = None) -> Optional[datetime]:
-    """Converte e normaliza data/hora de vencimento para lembretes."""
+    """
+    Converte e normaliza data/hora de vencimento para lembretes (A2 [B5] / B4 [M6]).
+
+    Ordem de resolução: datetime/ISO -> data absoluta numérica (`DD/MM` ou `DD/MM/YYYY`)
+    -> data textual (`31 de fevereiro`) -> "amanhã" -> hoje.
+    Data impossível (numérica ou textual, ex.: `31/02/2026` ou `31 de fevereiro`) devolve `None`
+    para o chamador abortar a gravação e reabrir o rascunho.
+    Retorna sempre `datetime` UTC-aware (`tzinfo=timezone.utc`).
+    """
     if isinstance(raw_dt, datetime):
-        return raw_dt
+        return raw_dt if raw_dt.tzinfo is not None else raw_dt.replace(tzinfo=timezone.utc)
     if isinstance(raw_dt, str):
         try:
-            return datetime.fromisoformat(raw_dt)
+            dt_iso = datetime.fromisoformat(raw_dt)
+            return dt_iso if dt_iso.tzinfo is not None else dt_iso.replace(tzinfo=timezone.utc)
         except Exception:
             pass
 
@@ -292,144 +387,317 @@ def _parse_due_datetime(raw_dt: Any, date_str: Optional[str] = None, explicit_ti
                 hour = int(tm_match.group(3))
 
     now = now_brt_naive()
+    today = now.date()
+
+    for candidate in (date_str, raw_dt if isinstance(raw_dt, str) else None):
+        if not candidate:
+            continue
+        cand_str = str(candidate).strip()
+
+        m = _NUMERIC_DATE_RE.search(cand_str)
+        if m:
+            day, month, year_raw = int(m.group(1)), int(m.group(2)), m.group(3)
+            year = today.year
+            if year_raw:
+                year = int(year_raw)
+                if year < 100:
+                    year += 2000
+            try:
+                target = date(year, month, day)
+                if not year_raw and target < today:
+                    target = date(year + 1, month, day)
+            except ValueError:
+                return None
+            return datetime.combine(target, time(hour, minute), tzinfo=timezone.utc)
+
+        m_txt = _TEXTUAL_DATE_RE.search(cand_str)
+        if m_txt:
+            day = int(m_txt.group(1))
+            month_num = _MONTHS_PT.get(m_txt.group(2).lower())
+            if not month_num:
+                return None
+            year = int(m_txt.group(3)) if m_txt.group(3) else today.year
+            try:
+                target = date(year, month_num, day)
+                if not m_txt.group(3) and target < today:
+                    target = date(year + 1, month_num, day)
+            except ValueError:
+                return None
+            return datetime.combine(target, time(hour, minute), tzinfo=timezone.utc)
+
     day_offset = 1 if "amanh" in str(date_str or "").lower() else 0
-    return datetime.combine(now.date() + timedelta(days=day_offset), time(hour, minute))
+    return datetime.combine(today + timedelta(days=day_offset), time(hour, minute), tzinfo=timezone.utc)
 
 
-def _parse_maintenance_date(raw_date: Any, default_date: date) -> date:
-    """Extrai objeto date válido para registros de manutenção, com suporte a DD/MM/YYYY, ISO YYYY-MM-DD e variações."""
+def _parse_maintenance_date(raw_date: Any, default_date: date) -> Optional[date]:
+    """
+    Extrai a data de um registro de manutenção (C3).
+
+    - Vazio / "hoje" -> `default_date`; "ontem"/"anteontem" -> relativo ao default.
+    - ISO, DD/MM/YYYY, DD-MM-YYYY, DD/MM (ano do default) e "15 de fevereiro [de 2026]".
+    - Data EXPLÍCITA porém impossível (31/02, mês 13...) -> **None** (antes caía em `default_date`
+      e gravava a manutenção com a data de hoje sem avisar). O chamador deve tratar None como
+      `invalid_date` e pedir confirmação ao usuário.
+    - Texto sem nenhuma data reconhecível (ex.: "semana passada") mantém `default_date`.
+    """
     if isinstance(raw_date, datetime):
         return raw_date.date()
     if isinstance(raw_date, date):
         return raw_date
-    if not raw_date or not isinstance(raw_date, str):
+    if not raw_date or not isinstance(raw_date, str) or not raw_date.strip():
         return default_date
 
     s = raw_date.strip()
+    low = s.lower()
+    if low == "hoje":
+        return default_date
+    if low == "ontem":
+        return default_date - timedelta(days=1)
+    if low == "anteontem":
+        return default_date - timedelta(days=2)
 
-    # 1. Formato ISO: YYYY-MM-DD
-    m_iso = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", s)
+    m_iso = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", s)
     if m_iso:
-        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
         try:
-            return date(y, m, d)
+            return date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
         except ValueError:
-            pass
+            return None
 
-    # 2. Formato Brasileiro: DD/MM/YYYY ou DD-MM-YYYY
-    m_br = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b", s)
+    m_br = re.search(r"\b(\d{1,2})[-/](\d{1,2})(?:[-/](\d{2,4}))?\b", s)
     if m_br:
-        d, m, y = int(m_br.group(1)), int(m_br.group(2)), int(m_br.group(3))
-        if y < 100:
-            y += 2000
+        d_i, m_i = int(m_br.group(1)), int(m_br.group(2))
+        y_i = int(m_br.group(3)) if m_br.group(3) else default_date.year
+        if y_i < 100:
+            y_i += 2000
         try:
-            return date(y, m, d)
+            return date(y_i, m_i, d_i)
         except ValueError:
-            pass
+            return None
 
-    # 3. Formato textual em português: ex: 15 de fevereiro de 2026
-    months_map = {
-        "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
-        "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
-        "outubro": 10, "novembro": 11, "dezembro": 12,
-        "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
-        "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
-    }
     m_txt = re.search(r"(?:dia\s+)?(\d{1,2})\s+de\s+([a-zA-ZçÇ]+)(?:\s+de\s+(\d{4}))?", s, re.IGNORECASE)
     if m_txt:
-        d_val = int(m_txt.group(1))
-        m_name = m_txt.group(2).lower()
-        y_val = int(m_txt.group(3)) if m_txt.group(3) else default_date.year
-        m_num = months_map.get(m_name)
-        if m_num and 1 <= d_val <= 31:
+        m_num = _MONTHS_PT.get(m_txt.group(2).lower())
+        if m_num:
+            y_val = int(m_txt.group(3)) if m_txt.group(3) else default_date.year
             try:
-                return date(y_val, m_num, d_val)
+                return date(y_val, m_num, int(m_txt.group(1)))
             except ValueError:
-                pass
+                return None
 
     return default_date
 
 
-async def _persist_confirmed_data(
+# ----------------------------------------------------------------------------
+# Persistência (B6 / B7 / B13 / C3 / A2 / A3)
+# `_persist_confirmed_data` NUNCA mascara falhas: devolve {"success": [...], "failed": [...]}
+# e garante atomicidade transacional do lote (commit único ao final ou rollback integral).
+# ----------------------------------------------------------------------------
+
+PersistOutcome = Dict[str, List[Any]]
+
+
+def _new_outcome() -> PersistOutcome:
+    return {"success": [], "failed": []}
+
+
+def _ok(outcome: PersistOutcome, label: str) -> None:
+    outcome["success"].append(label)
+
+
+def _fail(outcome: PersistOutcome, label: str, reason: str, **extra: Any) -> None:
+    outcome["failed"].append({"item": label, "reason": reason, **extra})
+
+
+def _maint_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normaliza os aliases do rascunho de manutenção (itens/components, valor/total_cost, ...)."""
+    sub = data.get("maintenance") if isinstance(data.get("maintenance"), dict) else {}
+    desc_val = data.get("description") or sub.get("description") or data.get("service_summary") or sub.get("service_summary") or "Manutenção realizada"
+    comp_val = data.get("itens") or data.get("components") or sub.get("components") or [desc_val]
+    cost_val = data.get("valor") if data.get("valor") is not None else (data.get("total_cost") if data.get("total_cost") is not None else (sub.get("valor") if sub.get("valor") is not None else sub.get("total_cost", 0.0)))
+    return {
+        "km": data.get("km") or data.get("odometer_km") or sub.get("odometer_km") or sub.get("km"),
+        "description": desc_val,
+        "components": comp_val if isinstance(comp_val, list) else [str(comp_val)],
+        "cost": float(cost_val or 0.0),
+        "raw_date": data.get("data") or data.get("date_str") or data.get("date") or sub.get("date"),
+        "workshop": data.get("oficina") or data.get("workshop_name") or sub.get("workshop_name"),
+    }
+
+
+async def _persist_maintenance(
+    maint_repo: MaintenanceRepository,
+    vehicle_repo: VehicleRepository,
+    user_id: str,
+    vehicle_id: Optional[int],
+    data: Dict[str, Any],
+    now_ts: datetime,
+    outcome: PersistOutcome,
+) -> None:
+    f = _maint_fields(data)
+    label = f"Manutenção: {', '.join(f['components'])}"
+    if not vehicle_id:
+        _fail(outcome, label, "vehicle_not_found")
+        return
+    parsed_date = _parse_maintenance_date(f["raw_date"], now_ts.date())
+    if parsed_date is None:  # C3: data explícita impossível -> não grava com "hoje"
+        _fail(outcome, label, "invalid_date", raw_date=str(f["raw_date"]))
+        return
+    new_maint = MaintenanceRecord(
+        vehicle_id=vehicle_id,
+        user_id=user_id,
+        components=f["components"],
+        description=f["description"],
+        km=int(f["km"]) if f["km"] is not None else None,
+        date=parsed_date,
+        total_cost=f["cost"],
+        parts_cost=float(data.get("parts_cost", 0.0) or 0.0),
+        labor_cost=float(data.get("labor_cost", 0.0) or 0.0),
+        workshop_name=f["workshop"],
+        parts_brand=data.get("parts_brand"),
+        created_at=now_ts,
+    )
+    await maint_repo.add_record(new_maint, commit=False)
+    if new_maint.km:
+        await vehicle_repo.update_km(vehicle_id, new_maint.km, commit=False)
+    _ok(outcome, label)
+
+
+async def _persist_reminder(
+    reminder_repo: ReminderRepository,
+    user_id: str,
+    vehicle_id: Optional[int],
+    description: str,
+    raw_due: Any,
+    date_str: Optional[str],
+    explicit_time: Optional[str],
+    due_km: Any,
+    now_ts: datetime,
+    outcome: PersistOutcome,
+) -> None:
+    label = f"Lembrete: {description}"
+    due_dt = _parse_due_datetime(raw_due, date_str=date_str, explicit_time=explicit_time)
+    # A2 (B5): se `due_dt is None` (data impossível numérica ou textual), falha explicitamente
+    # mesmo quando `due_km` estiver presente ou ausente, sem chamar `add_reminder`.
+    if due_dt is None:
+        _fail(outcome, label, "invalid_date", raw_date=str(date_str or raw_due))
+        return
+    await reminder_repo.add_reminder(
+        Reminder(
+            user_id=user_id,
+            vehicle_id=vehicle_id,
+            description=description,
+            due_datetime=due_dt,
+            data_hora_agendada=due_dt,  # B6: o scheduler lê data_hora_agendada
+            due_km=int(due_km) if due_km else None,
+            created_at=now_ts,
+        ),
+        commit=False,
+    )
+    _ok(outcome, label)
+
+
+async def _persist_chained_reminder(
     session: AsyncSession,
     user_id: str,
-    action_type: str,
     committed_data: Dict[str, Any],
     vehicles: List[Vehicle],
     now_ts: datetime,
+    outcome: PersistOutcome,
 ) -> None:
-    """Centraliza a gravação atômica de ações confirmadas no banco de dados."""
-    user_repo = UserRepository(session)
+    """B7 / A2: lembrete encadeado (ex.: 'registre a troca e me lembre em 31/02'); roda em QUALQUER fluxo."""
+    c_rem = committed_data.get("chained_reminder")
+    if not c_rem:
+        return
+    description = c_rem.get("task_description", "Revisão preventiva")
+    ref = str(committed_data.get("_target_vehicle_ref") or "")
+    if ref.startswith("AMBIGUOUS:"):
+        _fail(outcome, f"Lembrete: {description}", "ambiguous_vehicle")
+        return
+    target_veh_id = resolve_target_vehicle(vehicles, ref, committed_data)
+    raw_due = c_rem.get("due_datetime") or c_rem.get("due_date")
+    date_str = c_rem.get("target_date_str") or c_rem.get("data") or c_rem.get("date_str")
+    await _persist_reminder(
+        ReminderRepository(session), user_id, target_veh_id, description,
+        raw_due, date_str, c_rem.get("explicit_time"), c_rem.get("due_km"),
+        now_ts, outcome,
+    )
+    # TODO(A4): remover sincronização legada após unificação de schemas.
+    # A chamada a LembreteRepository.create realizava session.commit() interno, quebrando
+    # a atomicidade transacional de lote (A3/R3). Removida em favor da persistência única via ReminderRepository.
+
+
+async def _persist_multi_actions(
+    session: AsyncSession,
+    user_id: str,
+    committed_data: Dict[str, Any],
+    vehicles: List[Vehicle],
+    now_ts: datetime,
+    outcome: PersistOutcome,
+) -> None:
+    maint_repo = MaintenanceRepository(session)
+    vehicle_repo = VehicleRepository(session)
+    reminder_repo = ReminderRepository(session)
+    for act in committed_data.get("actions", []):
+        raw_intent = act.get("intent")
+        act_intent = (raw_intent.value if hasattr(raw_intent, "value") else str(raw_intent or "")).strip().lower()
+        if act_intent.startswith("intenttype."):
+            act_intent = act_intent.split(".", 1)[1]
+        label = act.get("description") or act.get("task_description") or act_intent or "ação"
+        try:
+            ref = str(act.get("target_vehicle_ref") or "")
+            if ref.startswith("AMBIGUOUS:"):
+                _fail(outcome, str(label), "ambiguous_vehicle")
+                continue
+            target_veh_id = resolve_target_vehicle(vehicles, ref, act)
+            if "record_maintenance" in act_intent or act_intent == "maintenance":
+                await _persist_maintenance(maint_repo, vehicle_repo, user_id, target_veh_id, act, now_ts, outcome)
+            elif "update_odometer" in act_intent or act_intent == "odometer":
+                km_val = act.get("odometer_km") or act.get("km")
+                if target_veh_id and km_val:
+                    await vehicle_repo.update_km(target_veh_id, int(km_val), commit=False)
+                    _ok(outcome, f"Hodômetro: {int(km_val):,} km".replace(",", "."))
+                else:
+                    _fail(outcome, str(label), "vehicle_not_found" if not target_veh_id else "missing_km")
+            elif "set_reminder" in act_intent or act_intent == "reminder":
+                await _persist_reminder(
+                    reminder_repo, user_id, target_veh_id,
+                    act.get("task_description") or act.get("description", "Lembrete automotivo"),
+                    act.get("due_datetime") or act.get("due_date"),
+                    act.get("target_date_str") or act.get("data") or act.get("date_str"),
+                    act.get("explicit_time"), act.get("due_km") or act.get("target_km"), now_ts, outcome,
+                )
+            else:
+                _fail(outcome, str(label), "unsupported_action")
+        except Exception as err:
+            logger.error(f"Falha ao persistir ação '{label}': {err}", exc_info=True)
+            _fail(outcome, str(label), "persistence_error")
+
+
+async def _persist_single_action(
+    session: AsyncSession,
+    user_id: str,
+    committed_data: Dict[str, Any],
+    vehicles: List[Vehicle],
+    now_ts: datetime,
+    outcome: PersistOutcome,
+) -> None:
     vehicle_repo = VehicleRepository(session)
     maint_repo = MaintenanceRepository(session)
     reminder_repo = ReminderRepository(session)
     fine_repo = TrafficFineRepository(session)
-
-    # 1. Reset Global do Sistema / Garagem
-    if (
-        action_type == "system_reset"
-        or committed_data.get("_reset_system")
-        or committed_data.get("_reset_garage")
-        or committed_data.get("_action_state") == "awaiting_garage_reset_confirm"
-    ):
-        await user_repo.reset_user_data(user_id=user_id)
-        return
-
-    # 2. Multi-Ação em Lote (ex: Manutenção + Lembrete na mesma mensagem)
-    if committed_data.get("_is_multi_action"):
-        for act in committed_data.get("actions", []):
-            act_intent = act.get("intent")
-            target_veh_id = resolve_target_vehicle(vehicles, act.get("target_vehicle_ref"), act) or (vehicles[0].id if vehicles else None)
-
-            if act_intent in ("record_maintenance", "RECORD_MAINTENANCE") and target_veh_id:
-                km_val = act.get("km") or act.get("odometer_km")
-                desc_val = act.get("description") or "Manutenção realizada"
-                comp_val = act.get("components") or [desc_val]
-                new_maint = MaintenanceRecord(
-                    vehicle_id=target_veh_id,
-                    user_id=user_id,
-                    components=comp_val if isinstance(comp_val, list) else [str(comp_val)],
-                    description=desc_val,
-                    km=int(km_val) if km_val is not None else None,
-                    total_cost=float(act.get("total_cost", 0.0) or 0.0),
-                    workshop_name=act.get("workshop_name"),
-                    created_at=now_ts,
-                )
-                await maint_repo.add_record(new_maint)
-                if km_val:
-                    await vehicle_repo.update_km(target_veh_id, int(km_val))
-
-            elif act_intent in ("update_odometer", "UPDATE_ODOMETER") and target_veh_id:
-                km_val = act.get("odometer_km") or act.get("km")
-                if km_val:
-                    await vehicle_repo.update_km(target_veh_id, int(km_val))
-
-            elif act_intent in ("set_reminder", "SET_REMINDER"):
-                due_dt = _parse_due_datetime(
-                    act.get("due_datetime") or act.get("due_date"),
-                    date_str=act.get("target_date_str"),
-                    explicit_time=act.get("explicit_time"),
-                )
-                new_rem = Reminder(
-                    user_id=user_id,
-                    vehicle_id=target_veh_id,
-                    description=act.get("task_description") or act.get("description", "Lembrete automotivo"),
-                    due_datetime=due_dt,
-                    due_km=act.get("due_km") or act.get("target_km"),
-                    created_at=now_ts,
-                )
-                await reminder_repo.add_reminder(new_rem)
+    action_state = committed_data.get("_action_state", "")
+    ref = str(committed_data.get("_target_vehicle_ref") or "")
+    if ref.startswith("AMBIGUOUS:"):
+        _fail(outcome, "Veículo", "ambiguous_vehicle")
         return
 
     # 3. Cadastro / Atualização Atômica de Veículo (PATCH)
-    action_state = committed_data.get("_action_state", "")
     if (
         action_state == "awaiting_vehicle_registration_confirm"
         or ("make" in committed_data and "model" in committed_data and "components" not in committed_data)
         or ("plate" in committed_data and "engine" in committed_data and "components" not in committed_data)
     ):
         km_val = committed_data.get("current_km") or committed_data.get("odometer_km") or committed_data.get("km")
-
         target_veh_id = None
         if committed_data.get("vehicle_id"):
             target_veh_id = committed_data["vehicle_id"]
@@ -441,17 +709,23 @@ async def _persist_confirmed_data(
         if not target_veh_id and vehicles:
             ref_model = (committed_data.get("model") or "").strip().lower()
             if ref_model:
-                for v in vehicles:
-                    v_model = (getattr(v, "model", None) or "").strip().lower()
-                    if v_model and (v_model in ref_model or ref_model in v_model):
-                        target_veh_id = v.id
-                        break
+                matched_by_model = [
+                    v for v in vehicles
+                    if v.model_alias and (v.model_alias in ref_model or ref_model in v.model_alias)
+                ]
+                if len(matched_by_model) == 1:
+                    target_veh_id = matched_by_model[0].id
+                elif len(matched_by_model) >= 2:
+                    _fail(outcome, f"Veículo: {committed_data.get('model')}", "ambiguous_vehicle")
+                    return
             elif len(vehicles) == 1:
                 target_veh_id = vehicles[0].id
 
+        label = f"Veículo: {committed_data.get('make', '')} {committed_data.get('model', '')}".strip()
         if target_veh_id:
             await vehicle_repo.patch_vehicle_profile(
                 target_veh_id,
+                commit=False,
                 make=committed_data.get("make"),
                 model=committed_data.get("model"),
                 version=committed_data.get("version"),
@@ -465,66 +739,65 @@ async def _persist_confirmed_data(
                 fuel_type=committed_data.get("fuel_type"),
                 usage_profile=committed_data.get("usage_profile"),
             )
-            return
-
-        new_vehicle = Vehicle(
-            user_id=user_id,
-            make=committed_data.get("make", "Desconhecido"),
-            model=committed_data.get("model", "Veículo"),
-            version=committed_data.get("version"),
-            year=committed_data.get("year"),
-            plate=committed_data.get("plate"),
-            engine=committed_data.get("engine") or committed_data.get("motor"),
-            transmission=committed_data.get("transmission") or committed_data.get("cambio"),
-            steering=committed_data.get("steering") or committed_data.get("direcao"),
-            current_km=int(km_val) if km_val is not None else None,
-            vehicle_type=VehicleType(committed_data.get("vehicle_type", "carro")) if committed_data.get("vehicle_type") in [e.value for e in VehicleType] else VehicleType.CARRO,
-            fuel_type=FuelType(committed_data.get("fuel_type", "flex")) if committed_data.get("fuel_type") in [e.value for e in FuelType] else FuelType.FLEX,
-            usage_profile=UsageProfile(committed_data.get("usage_profile", "convencional")) if committed_data.get("usage_profile") in [e.value for e in UsageProfile] else UsageProfile.CONVENCIONAL,
-            created_at=now_ts,
-        )
-        await vehicle_repo.add_vehicle(new_vehicle)
+        else:
+            new_vehicle = Vehicle(
+                user_id=user_id,
+                make=committed_data.get("make", "Desconhecido"),
+                model=committed_data.get("model", "Veículo"),
+                version=committed_data.get("version"),
+                year=committed_data.get("year"),
+                plate=committed_data.get("plate"),
+                engine=committed_data.get("engine") or committed_data.get("motor"),
+                transmission=committed_data.get("transmission") or committed_data.get("cambio"),
+                steering=committed_data.get("steering") or committed_data.get("direcao"),
+                current_km=int(km_val) if km_val is not None else None,
+                vehicle_type=VehicleType(committed_data.get("vehicle_type", "carro")) if committed_data.get("vehicle_type") in [e.value for e in VehicleType] else VehicleType.CARRO,
+                fuel_type=FuelType(committed_data.get("fuel_type", "flex")) if committed_data.get("fuel_type") in [e.value for e in FuelType] else FuelType.FLEX,
+                usage_profile=UsageProfile(committed_data.get("usage_profile", "convencional")) if committed_data.get("usage_profile") in [e.value for e in UsageProfile] else UsageProfile.CONVENCIONAL,
+                created_at=now_ts,
+            )
+            await vehicle_repo.add_vehicle(new_vehicle, commit=False)
+        _ok(outcome, label)
         return
 
-    # 4. Agendamento de Lembrete
+    # 4. Agendamento de Lembrete (A2 [B5])
     if (
         action_state == "awaiting_reminder_confirm"
         or "task_description" in committed_data
-        or ("description" in committed_data and ("due_date" in committed_data or "due_km" in committed_data or "due_datetime" in committed_data))
+        or ("description" in committed_data and ("due_date" in committed_data or "due_km" in committed_data or "due_datetime" in committed_data or "target_date_str" in committed_data))
     ):
-        target_veh_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
-        due_dt = _parse_due_datetime(
+        target_veh_id = resolve_target_vehicle(vehicles, ref, committed_data)
+        await _persist_reminder(
+            reminder_repo, user_id, target_veh_id,
+            committed_data.get("task_description") or committed_data.get("description", "Lembrete automotivo"),
             committed_data.get("due_datetime") or committed_data.get("due_date"),
-            date_str=committed_data.get("target_date_str"),
-            explicit_time=committed_data.get("explicit_time"),
+            committed_data.get("target_date_str") or committed_data.get("data") or committed_data.get("date_str"),
+            committed_data.get("explicit_time"),
+            committed_data.get("due_km"), now_ts, outcome,
         )
-        new_rem = Reminder(
-            user_id=user_id,
-            vehicle_id=target_veh_id,
-            description=committed_data.get("task_description") or committed_data.get("description", "Lembrete automotivo"),
-            due_datetime=due_dt,
-            due_km=committed_data.get("due_km"),
-            created_at=now_ts,
-        )
-        await reminder_repo.add_reminder(new_rem)
         return
 
     # 5. Multa / Infração de Trânsito
     if action_state == "awaiting_fine_confirm" or "infraction_code" in committed_data or "amount" in committed_data:
-        target_veh_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data) or (vehicles[0].id if vehicles else None)
-        if target_veh_id:
-            amt = committed_data.get("amount", 0.0)
-            new_fine = TrafficFine(
+        target_veh_id = resolve_target_vehicle(vehicles, ref, committed_data)
+        label = f"Multa: {committed_data.get('description', 'Infração de Trânsito')}"
+        if not target_veh_id:
+            _fail(outcome, label, "vehicle_not_found")
+            return
+        await fine_repo.add_fine(
+            TrafficFine(
                 vehicle_id=target_veh_id,
                 description=committed_data.get("description", "Infração de Trânsito"),
                 infraction_code=committed_data.get("infraction_code"),
                 issuing_body=committed_data.get("issuing_body"),
                 points=int(committed_data.get("points", 0) or 0),
-                amount=float(amt or 0.0),
+                amount=float(committed_data.get("amount", 0.0) or 0.0),
                 discounted_amount=float(committed_data.get("discounted_amount", 0.0) or 0.0),
                 created_at=now_ts,
-            )
-            await fine_repo.add_fine(new_fine)
+            ),
+            commit=False,
+        )
+        _ok(outcome, label)
         return
 
     # 6. Registro de Manutenção
@@ -535,70 +808,139 @@ async def _persist_confirmed_data(
         or "service_summary" in committed_data
         or "itens" in committed_data
     ):
-        target_veh_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
-        if target_veh_id:
-            km_val = committed_data.get("km") or committed_data.get("odometer_km")
-            desc_val = committed_data.get("description") or committed_data.get("service_summary") or "Manutenção realizada"
-            comp_val = committed_data.get("itens") or committed_data.get("components") or [desc_val]
-            cost_val = committed_data.get("valor") if committed_data.get("valor") is not None else committed_data.get("total_cost", 0.0)
-            parsed_date = _parse_maintenance_date(
-                committed_data.get("data") or committed_data.get("date_str") or committed_data.get("date"),
-                now_ts.date(),
-            )
-            new_maint = MaintenanceRecord(
-                vehicle_id=target_veh_id,
-                user_id=user_id,
-                components=comp_val if isinstance(comp_val, list) else [str(comp_val)],
-                description=desc_val,
-                km=int(km_val) if km_val is not None else None,
-                date=parsed_date,
-                total_cost=float(cost_val or 0.0),
-                parts_cost=float(committed_data.get("parts_cost", 0.0) or 0.0),
-                labor_cost=float(committed_data.get("labor_cost", 0.0) or 0.0),
-                workshop_name=committed_data.get("oficina") or committed_data.get("workshop_name"),
-                parts_brand=committed_data.get("parts_brand"),
-                created_at=now_ts,
-            )
-            await maint_repo.add_record(new_maint)
-            if new_maint.km:
-                await vehicle_repo.update_km(target_veh_id, new_maint.km)
+        target_veh_id = resolve_target_vehicle(vehicles, ref, committed_data)
+        await _persist_maintenance(maint_repo, vehicle_repo, user_id, target_veh_id, committed_data, now_ts, outcome)
 
     # 7. Atualização Isolada de Odômetro
     elif committed_data.get("_is_odometer_update") or "odometer_km" in committed_data:
-        target_veh_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
+        target_veh_id = resolve_target_vehicle(vehicles, ref, committed_data)
         km_val = committed_data.get("odometer_km") or committed_data.get("km")
         if target_veh_id and km_val:
-            await vehicle_repo.update_km(target_veh_id, int(km_val))
+            await vehicle_repo.update_km(target_veh_id, int(km_val), commit=False)
+            _ok(outcome, f"Hodômetro: {int(km_val):,} km".replace(",", "."))
+        else:
+            _fail(outcome, "Hodômetro", "vehicle_not_found" if not target_veh_id else "missing_km")
 
-    # 8. Lembrete Encadeado (Chained Reminder)
-    if committed_data.get("chained_reminder"):
-        c_rem = committed_data["chained_reminder"]
-        target_veh_id = resolve_target_vehicle(vehicles, committed_data.get("_target_vehicle_ref"), committed_data)
-        target_dt = _parse_due_datetime(None, date_str=c_rem.get("target_date_str"), explicit_time=c_rem.get("explicit_time"))
-        new_rem = Reminder(
-            user_id=user_id,
-            vehicle_id=target_veh_id,
-            description=c_rem.get("task_description", "Revisão preventiva"),
-            due_datetime=target_dt,
-            data_hora_agendada=target_dt,
-            created_at=now_ts,
+
+async def _persist_confirmed_data(
+    session: AsyncSession,
+    user_id: str,
+    action_type: str,
+    committed_data: Dict[str, Any],
+    vehicles: List[Vehicle],
+    now_ts: datetime,
+) -> PersistOutcome:
+    """
+    Centraliza a gravação de ações confirmadas e devolve o resultado REAL (B13 / A3):
+    `{"success": [labels], "failed": [{"item", "reason", ...}]}`.
+    Atomicidade transacional de lote (A3): todos os repositórios usam `commit=False` (`flush`);
+    se qualquer sub-ação falhar (`outcome["failed"]` não vazio), executa `await session.rollback()`
+    e descarta o lote inteiro; caso contrário, executa um único `await session.commit()` ao final.
+    """
+    outcome = _new_outcome()
+    try:
+        # 1. Reset Global do Sistema / Garagem
+        if (
+            action_type == "system_reset"
+            or committed_data.get("_reset_system")
+            or committed_data.get("_reset_garage")
+            or committed_data.get("_action_state") == "awaiting_garage_reset_confirm"
+        ):
+            await UserRepository(session).reset_user_data(user_id=user_id)
+            _ok(outcome, "Reset de dados")
+            return outcome
+
+        # 2. Multi-Ação em Lote vs. ação única
+        if committed_data.get("_is_multi_action"):
+            await _persist_multi_actions(session, user_id, committed_data, vehicles, now_ts, outcome)
+        else:
+            await _persist_single_action(session, user_id, committed_data, vehicles, now_ts, outcome)
+
+        # 8. Lembrete encadeado (B7): sempre, antes de qualquer retorno
+        await _persist_chained_reminder(session, user_id, committed_data, vehicles, now_ts, outcome)
+
+        # A3 / R1: Atomicidade do lote — se qualquer item falhou, faz rollback integral da transação
+        if outcome["failed"]:
+            await session.rollback()
+            outcome["success"] = []  # R1: Reatribuição atômica; nenhum _ok() é chamado após esta verificação
+        else:
+            await session.commit()
+    except Exception as err:
+        logger.error(f"Erro ao persistir ação confirmada: {err}", exc_info=True)
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        outcome["success"] = []
+        _fail(outcome, "Registro", "persistence_error")
+    return outcome
+
+
+_FAIL_REASONS_PT = {
+    "vehicle_not_found": "não encontrei o veículo",
+    "ambiguous_vehicle": "há mais de um veículo desse modelo na garagem (informe a placa)",
+    "invalid_date": "a data informada não existe",
+    "missing_km": "faltou a quilometragem",
+    "unsupported_action": "tipo de ação não suportado",
+    "persistence_error": "erro ao gravar no banco",
+}
+
+
+def _apply_persistence_outcome(
+    result: Dict[str, Any],
+    user_id: str,
+    committed_data: Dict[str, Any],
+    outcome: PersistOutcome,
+) -> None:
+    """
+    B13/C3/A2: reescreve `reply`/`action_type` quando a persistência falhou,
+    reabrindo o rascunho em `invalid_date` (seja manutenção ou lembrete).
+    """
+    failed, success = outcome["failed"], outcome["success"]
+    if not failed and not success:
+        # R5: outcome vazio (nada persistido) não é reportado como falso sucesso
+        result["action_type"] = "no_op"
+        result["reply"] = "Não identifiquei nenhuma ação para salvar."
+        result["persistence"] = outcome
+        return
+
+    if not failed:
+        return
+
+    invalid_date = next((f for f in failed if f["reason"] == "invalid_date"), None)
+    if invalid_date:
+        raw = invalid_date.get("raw_date", "")
+        result["reply"] = (
+            f"⚠️ Data inválida (*{raw}*): esse dia não existe no calendário. "
+            "Me diga a data correta (ex.: *15/03/2026*) e eu salvo em seguida. Seus outros dados foram mantidos."
         )
-        await reminder_repo.add_reminder(new_rem)
-
-        if target_veh_id:
-            try:
-                from src.repositories.lembrete_repository import LembreteRepository
-                from src.schemas.lembrete import LembreteCreate
-                await LembreteRepository(session).create(
-                    LembreteCreate(
-                        veiculo_id=target_veh_id,
-                        descricao=c_rem.get("task_description", "Revisão preventiva"),
-                        data_hora_agendada=target_dt,
-                        status="agendado" if target_dt else "pendente",
-                    )
+        result["action_type"] = "invalid_date"
+        # R4 Guard: só reabre o rascunho se committed_data possui conteúdo restaurável
+        has_restorable_content = bool(
+            committed_data and any(
+                k in committed_data for k in (
+                    "task_description", "components", "itens", "description",
+                    "km", "valor", "total_cost", "workshop_name", "oficina",
+                    "make", "model", "plate", "infraction_code", "actions"
                 )
-            except Exception as e_lem:
-                logger.warning(f"Sincronização relacional de lembretes ignorada: {e_lem}")
+            )
+        )
+        if has_restorable_content:
+            conversation_service.reopen_draft_for_correction(
+                user_id,
+                committed_data,
+                clear_keys=("data", "date_str", "date", "target_date_str", "due_date", "due_datetime"),
+            )
+    else:
+        lines = ["⚠️ *Salvei apenas parte das ações:*\n" if success else "⚠️ *Não consegui salvar:*\n"]
+        lines += [f"✅ {s}" for s in success]
+        lines += [f"❌ {f['item']} — {_FAIL_REASONS_PT.get(f['reason'], f['reason'])}" for f in failed]
+        if any(f["reason"] == "vehicle_not_found" for f in failed):
+            lines.append("\n🚗 Cadastre/identifique o veículo e me envie novamente os itens que falharam.")
+        result["reply"] = "\n".join(lines)
+        result["action_type"] = "action_partially_confirmed" if success else "action_failed"
+    result["persistence"] = outcome
+    conversation_service.replace_last_assistant_turn(user_id, result["reply"])
 
 
 async def send_whatsapp_reply(user_id: str, message: str) -> bool:
@@ -610,8 +952,8 @@ async def send_whatsapp_reply(user_id: str, message: str) -> bool:
             url = f"{settings.EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{settings.EVOLUTION_INSTANCE}"
             headers = {"apikey": settings.EVOLUTION_API_KEY, "Content-Type": "application/json"}
             body = {"number": user_id, "text": message, "delay": settings.EVOLUTION_TYPING_DELAY_MS}
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(url, json=body, headers=headers)
+            async with shared_http_client(TIMEOUT_WHATSAPP_OUTBOUND) as client:  # A7/A9: timeout explícito 5s
+                await client.post(url, json=body, headers=headers, timeout=TIMEOUT_WHATSAPP_OUTBOUND)
             return True
         elif settings.PROVIDER == "zapi" and settings.ZAPI_INSTANCE_ID and settings.ZAPI_TOKEN:
             url = f"https://api.z-api.io/instances/{settings.ZAPI_INSTANCE_ID}/token/{settings.ZAPI_TOKEN}/send-text"
@@ -619,8 +961,8 @@ async def send_whatsapp_reply(user_id: str, message: str) -> bool:
             if settings.ZAPI_CLIENT_TOKEN:
                 headers["Client-Token"] = settings.ZAPI_CLIENT_TOKEN
             body = {"phone": user_id, "message": message}
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(url, json=body, headers=headers)
+            async with shared_http_client(TIMEOUT_WHATSAPP_OUTBOUND) as client:
+                await client.post(url, json=body, headers=headers, timeout=TIMEOUT_WHATSAPP_OUTBOUND)
             return True
     except Exception as e:
         logger.warning(f"Gateway WhatsApp outbound indisponível: {e}")
@@ -628,12 +970,41 @@ async def send_whatsapp_reply(user_id: str, message: str) -> bool:
 
 
 async def _process_webhook_pipeline(
-    session: AsyncSession,
     user_id: str,
     message_text: str,
+    session: Optional[AsyncSession] = None,
+    session_factory: Any = None,
 ) -> Dict[str, Any]:
-    """Executa a lógica completa de processamento conversacional, persistência e resposta."""
-    logger.info(f"Processando mensagem consolidada de [{user_id}]: {message_text}")
+    """
+    Executa a lógica completa de processamento conversacional, persistência e resposta.
+
+    B16: a sessão é SEMPRE aberta aqui sob demanda via `session_factory()`.
+    A5 (S3): a truncagem `MAX_MESSAGE_CHARS` ocorre aqui, APÓS `parse_whatsapp_payload`.
+    """
+    sanitized_text = _sanitize_message_text(message_text, user_id) or ""
+    factory = session_factory if callable(session_factory) else async_session_factory
+    if session is not None:
+        try:
+            return await _run_pipeline(session, user_id, sanitized_text)
+        except Exception as e:
+            if "closed" in str(e).lower():
+                async with factory() as new_session:
+                    return await _run_pipeline(new_session, user_id, sanitized_text)
+            raise
+    async with factory() as new_session:
+        return await _run_pipeline(new_session, user_id, sanitized_text)
+
+
+async def _run_pipeline(session: AsyncSession, user_id: str, message_text: str) -> Dict[str, Any]:
+    # A5 (S3): garante truncagem mesmo se `_run_pipeline` for invocado diretamente
+    message_text = _sanitize_message_text(message_text, user_id) or ""
+
+    # C2 (R2): mascara PII em INFO (apenas hash curto + comprimento); conteúdo só em DEBUG
+    msg_hash = hashlib.sha256(message_text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    logger.info("Processing user=%s msg_hash=%s len=%d", user_id, msg_hash, len(message_text))
+    if getattr(settings, "DEBUG", False):
+        logger.debug("Processing user=%s text=%s", user_id, message_text)
+
     await UserRepository(session).get_or_create(user_id=user_id)
 
     vehicles = await VehicleRepository(session).get_vehicles_by_user_id(user_id=user_id)
@@ -654,12 +1025,11 @@ async def _process_webhook_pipeline(
     committed_data = result.get("committed_data")
     now_ts = conversation_service._utcnow()
 
-    # 1. Persistência de Ação Confirmada ou Reset
+    # 1. Persistência de Ação Confirmada ou Reset (resultado real reflete na resposta - B13)
     if action_type in ("action_confirmed", "system_reset", "action_confirmed_with_chained_reminder") and committed_data:
-        try:
-            await _persist_confirmed_data(session, user_id, action_type, committed_data, vehicles, now_ts)
-        except Exception as err:
-            logger.error(f"Erro ao persistir ação confirmada: {err}", exc_info=True)
+        outcome = await _persist_confirmed_data(session, user_id, action_type, committed_data, vehicles, now_ts)
+        _apply_persistence_outcome(result, user_id, committed_data, outcome)
+        action_type = result.get("action_type")
 
     # 2. Edição Direta do Último Serviço Salvo (`update_last_saved_service`)
     elif action_type == "update_last_saved_service" and committed_data:
@@ -685,7 +1055,6 @@ async def _process_webhook_pipeline(
             target_veh_id = (
                 resolve_target_vehicle(vehicles, details.get("_target_vehicle_ref") or details.get("target_vehicle_ref"), details)
                 or details.get("vehicle_id")
-                or (vehicles[0].id if vehicles else None)
             )
             new_km = details.get("odometer_km") or details.get("km")
             if target_veh_id and new_km:
@@ -718,6 +1087,14 @@ async def _process_webhook_pipeline(
     }
 
 
+def get_session_factory():
+    """Dependência FastAPI: devolve a fábrica de sessões (sobrescrevível em testes)."""
+    return async_session_factory
+
+
+_rate_limiter = SlidingWindowRateLimiter(max_events=0, window_seconds=60.0)
+
+
 @router.get("/webhook", status_code=status.HTTP_200_OK)
 @router.get("/webhook/whatsapp", status_code=status.HTTP_200_OK)
 @router.get("/zapi", status_code=status.HTTP_200_OK)
@@ -737,20 +1114,26 @@ async def webhook_health_or_challenge() -> Dict[str, str]:
 @router.post("/webhook/messages-upsert", status_code=status.HTTP_200_OK)
 async def receive_webhook(
     payload: Dict[str, Any],
-    session: AsyncSession = Depends(get_async_session),
+    session: Any = None,
+    session_factory: Any = None,
 ) -> Dict[str, Any]:
     """
     Pipeline linear AI-First com Debounce Buffer anti-atropelo:
-    Recebe mensagem -> Bufferiza mensagens consecutivas -> Executa Pipeline no LLM -> Responde.
+    Recebe mensagem -> Rate limit (S4/C3) -> Bufferiza -> Trunca (A5) -> Executa Pipeline no LLM -> Responde.
     """
     user_id, message_text = parse_whatsapp_payload(payload)
     if not user_id or not message_text:
         return {"status": "ignored", "reason": "non_actionable_event"}
 
+    rate_limit_enabled = getattr(settings, "AUTOCARE_FEATURE_RATE_LIMIT", True)
+    rate_limit = getattr(settings, "WEBHOOK_RATE_LIMIT_PER_MIN", 120)
+    if rate_limit_enabled and rate_limit > 0 and not _rate_limiter.allow(user_id, rate_limit):
+        logger.warning(f"Rate limit excedido para [{user_id}]")
+        return {"status": "ignored", "reason": "rate_limited"}
+
+    resolved_factory = session_factory if callable(session_factory) else async_session_factory
+
     async def _runner(uid: str, msg: str) -> Dict[str, Any]:
-        if isinstance(session, AsyncSession) and session.is_active:
-            return await _process_webhook_pipeline(session, uid, msg)
-        async with async_session_factory() as local_session:
-            return await _process_webhook_pipeline(local_session, uid, msg)
+        return await _process_webhook_pipeline(uid, msg, session=session, session_factory=resolved_factory)
 
     return await message_debouncer.enqueue(user_id, message_text, _runner)

@@ -13,7 +13,8 @@ import difflib
 import logging
 import re
 import unicodedata
-from datetime import datetime, date, timedelta, time
+import weakref
+from datetime import datetime, date, timedelta, time, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
 from src.ai.client import GeminiClient
@@ -24,11 +25,29 @@ from src.ai.schemas import (
     ReminderDraft,
     ActionDraft,
 )
+from src.application.services.maintenance_payload import MaintenancePayload
 from src.domain.entities import ConversationContext, ConversationTurn, Vehicle
 from src.domain.enums import (
     ConversationState,
     IntentType,
     ConfidenceLevel,
+)
+from src.application.services.parsers import (  # noqa: F401  (re-export p/ compat.)
+    normalize_text,
+    POPULAR_VEHICLE_SPECS,
+    KNOWN_MODEL_MAKES,
+    parse_steering_type,
+    find_popular_vehicle_spec,
+    parse_km_value,
+    parse_cost_value,
+    validate_brazilian_plate,
+    clean_workshop_name,
+    KNOWN_MAINTENANCE_ITEMS,
+    extract_maintenance_items_strict,
+    merge_maintenance_items,
+    extract_date_strict,
+    extract_workshop_strict,
+    is_edit_last_service_intent,
 )
 
 logger = logging.getLogger("autocare.conversation")
@@ -37,7 +56,19 @@ logger = logging.getLogger("autocare.conversation")
 # CONSTANTES GLOBAIS E REGRAS DE ESCAPE / TTL
 # =============================================================================
 
+# B3 (A10) - Decisão de Produto:
+# `DRAFT_TTL_MINUTES = 30` define o tempo de vida de um rascunho AINDA NÃO CONFIRMADO em memória.
+# Já `UNDO_WINDOW_MINUTES = 5` (em `repositories.py`) define a janela de arrependimento imediato
+# PÓS-commit para soft-delete (`desfazer`). Após 5 minutos do commit, edições devem usar a tool
+# `update_last_saved_service`.
 DRAFT_TTL_MINUTES = 30
+
+# Chaves geradas por MaintenancePayload.to_committed_data(); o resto do rascunho anterior
+# (flags internas como _action_state) é preservado em `extras`.
+_MAINTENANCE_PAYLOAD_KEYS = frozenset({
+    "itens", "components", "description", "km", "odometer_km", "data", "date_str", "date",
+    "oficina", "workshop_name", "valor", "total_cost", "_target_vehicle_ref", "_discrepancy_warning",
+})
 DRAFT_EXPIRED_REPLY = (
     "Aquele seu registro expirou por tempo inativo (passaram mais de 30 minutos). "
     "Pode me repetir o que foi feito para eu registrar certinho?"
@@ -51,9 +82,6 @@ _UNDO_PATTERNS = [
 ]
 
 
-def normalize_text(text: str) -> str:
-    norm = unicodedata.normalize("NFKD", text or "")
-    return "".join(c for c in norm if not unicodedata.combining(c)).strip().lower()
 
 
 def is_undo_command(text: str) -> bool:
@@ -74,267 +102,6 @@ def looks_like_confirmation_reply(text: str) -> bool:
     return any(re.search(p, norm) for p in patterns)
 
 
-# =============================================================================
-# CATÁLOGO DE ESPECIFICAÇÕES VEICULARES POPULARES (ENRIQUECIMENTO AUTOMÁTICO)
-# =============================================================================
-
-POPULAR_VEHICLE_SPECS: Dict[str, Dict[str, Any]] = {
-    "nivus": {
-        "make": "Volkswagen", "model": "Nivus", "version": "Highline",
-        "engine": "1.0 Turbo", "transmission": "Automático", "steering": "Elétrica",
-        "versions": {
-            "highline": {"version": "Highline", "engine": "1.0 Turbo", "transmission": "Automático", "steering": "Elétrica"},
-            "comfortline": {"version": "Comfortline", "engine": "1.0 Turbo", "transmission": "Automático", "steering": "Elétrica"},
-        }
-    },
-    "corolla": {
-        "make": "Toyota", "model": "Corolla", "version": "XEI",
-        "engine": "2.0 Dynamic Force", "transmission": "Automático", "steering": "Elétrica",
-        "versions": {
-            "xei": {"version": "XEI", "engine": "2.0 Dynamic Force", "transmission": "Automático", "steering": "Elétrica"},
-            "altis": {"version": "Altis", "engine": "2.0 Dynamic Force", "transmission": "Automático", "steering": "Elétrica"},
-            "gli": {"version": "GLI", "engine": "2.0 Dynamic Force", "transmission": "Automático", "steering": "Elétrica"},
-        }
-    },
-    "civic": {
-        "make": "Honda", "model": "Civic", "version": "Touring",
-        "engine": "1.5 Turbo", "transmission": "CVT", "steering": "Elétrica",
-        "versions": {
-            "touring": {"version": "Touring", "engine": "1.5 Turbo", "transmission": "CVT", "steering": "Elétrica"},
-            "exl": {"version": "EXL", "engine": "2.0", "transmission": "CVT", "steering": "Elétrica"},
-            "sport": {"version": "Sport", "engine": "2.0", "transmission": "CVT", "steering": "Elétrica"},
-        }
-    },
-    "sandero": {"make": "Renault", "model": "Sandero", "version": "Zen", "engine": "1.0", "transmission": "Manual", "steering": "Eletro-hidráulica"},
-    "onix": {"make": "Chevrolet", "model": "Onix", "version": "Premier", "engine": "1.0 Turbo", "transmission": "Automático", "steering": "Elétrica"},
-    "hb20": {"make": "Hyundai", "model": "HB20", "version": "Platinum", "engine": "1.0 Turbo", "transmission": "Automático", "steering": "Elétrica"},
-    "compass": {"make": "Jeep", "model": "Compass", "version": "Longitude", "engine": "1.3 Turbo", "transmission": "Automático", "steering": "Elétrica"},
-    "renegade": {"make": "Jeep", "model": "Renegade", "version": "Sport", "engine": "1.3 Turbo", "transmission": "Automático", "steering": "Elétrica"},
-    "polo": {"make": "Volkswagen", "model": "Polo", "version": "Highline", "engine": "1.0 TSI", "transmission": "Automático", "steering": "Elétrica"},
-    "gol": {"make": "Volkswagen", "model": "Gol", "version": "1.0", "engine": "1.0", "transmission": "Manual", "steering": "Hidráulica"},
-    "celta": {"make": "Chevrolet", "model": "Celta", "version": "Life", "engine": "1.0", "transmission": "Manual", "steering": "Mecânica"},
-    "palio": {"make": "Fiat", "model": "Palio", "version": "Fire", "engine": "1.0", "transmission": "Manual", "steering": "Hidráulica"},
-    "uno": {"make": "Fiat", "model": "Uno", "version": "Mille", "engine": "1.0", "transmission": "Manual", "steering": "Mecânica"},
-    "corsa": {"make": "Chevrolet", "model": "Corsa", "version": "Joy", "engine": "1.0", "transmission": "Manual", "steering": "Hidráulica"},
-    "siena": {"make": "Fiat", "model": "Siena", "version": "ELX", "engine": "1.0", "transmission": "Manual", "steering": "Hidráulica"},
-}
-
-KNOWN_MODEL_MAKES: Dict[str, Dict[str, str]] = {
-    k: {"make": v["make"], "model": v["model"]} for k, v in POPULAR_VEHICLE_SPECS.items()
-}
-KNOWN_MODEL_MAKES.update({
-    "fiorino": {"make": "Fiat", "model": "Fiorino"},
-    "fusca": {"make": "Volkswagen", "model": "Fusca"},
-    "brasília": {"make": "Volkswagen", "model": "Brasília"},
-    "brasilia": {"make": "Volkswagen", "model": "Brasília"},
-})
-
-
-def parse_steering_type(text: str, model_name: Optional[str] = None, year: Optional[int] = None) -> Optional[str]:
-    """
-    Parser robusto para tipo de direção com tratamento de typos e tolerância fonética.
-    - 'hidrauliza', 'hidraulica', 'hidro', 'hidra' -> 'Hidráulica'
-    - 'mecanica', 'mecânica', 'sem direção', 'direção dura', 'direção manual' -> 'Mecânica'
-    - 'eletro-hidráulica', 'eletrohidraulica' -> 'Eletro-hidráulica'
-    - 'direção elétrica' -> 'Elétrica' (desambigua estritamente de 'vidro elétrico', 'trava elétrica')
-    - Coerência histórica: modelos populares dos anos 2000 (ex: Palio 2008, Gol G4, Celta) não tinham direção elétrica de fábrica.
-    """
-    tl = (text or "").lower()
-
-    # 1. Hidráulica e typos comuns ("hidrauliza", "hidraulica", "hidro", "hidra")
-    if re.search(r"\b(?:dire[cç][aã]o\s+)?(hidr[aá]uliz\w*|hidr[aá]ulic\w*|hidro|hidra)\b", tl):
-        return "Hidráulica"
-
-    # 2. Mecânica / Manual na direção
-    if re.search(r"\b(?:dire[cç][aã]o\s+)?(mec[aâ]nic[ao]|sem\s+dire[cç][aã]o|dire[cç][aã]o\s+dura)\b", tl) or re.search(r"dire[cç][aã]o\s+manual", tl):
-        return "Mecânica"
-
-    # 3. Eletro-hidráulica
-    if "eletro-hidr" in tl or "eletrohidr" in tl:
-        return "Eletro-hidráulica"
-
-    # 4. Elétrica: SOMENTE se for explicitamente associado à direção
-    # Evita falsos positivos com 'vidro elétrico', 'trava elétrica', 'retrovisor elétrico'
-    if re.search(r"\bdire[cç][aã]o\s+(?:[eé]l[eé]tric\w*)\b", tl) or re.search(r"\b(?:[eé]l[eé]tric\w*)\s+na\s+dire[cç][aã]o\b", tl):
-        model_clean = (model_name or "").lower()
-        older_popular = ("palio", "gol", "celta", "uno", "corsa", "siena", "clio", "fiesta", "fiorino", "fusca", "brasilia")
-        if any(op in model_clean for op in older_popular) and (year is None or year < 2016):
-            return "Hidráulica"
-        return "Elétrica"
-
-    return None
-
-
-def find_popular_vehicle_spec(text: str) -> Optional[Dict[str, Any]]:
-    """Identifica marca, modelo e ficha técnica para modelos populares."""
-    tl = (text or "").lower()
-    for key, spec in POPULAR_VEHICLE_SPECS.items():
-        if key in tl:
-            base = {
-                "make": spec["make"],
-                "model": spec["model"],
-                "version": spec.get("version"),
-                "engine": spec.get("engine"),
-                "transmission": spec.get("transmission"),
-                "steering": spec.get("steering"),
-            }
-            if "versions" in spec:
-                for v_key, v_info in spec["versions"].items():
-                    if v_key in tl:
-                        base.update(v_info)
-                        break
-            return base
-    return None
-
-
-# =============================================================================
-# HELPERS ENXUTOS DE APOIO (VALIDAÇÕES E PARSERS ESSENCIAIS)
-# =============================================================================
-
-def parse_km_value(text: str) -> Optional[int]:
-    """Extrai valor numérico de quilometragem."""
-    tl = (text or "").lower()
-    m_mil = re.search(r"(\d+(?:[.,]\d+)?)\s*mil\s*(?:de\s*)?km", tl)
-    if m_mil:
-        val = float(m_mil.group(1).replace(",", "."))
-        return int(val * 1000)
-    m_km = re.search(r"(?:com|em|bateu|para|pra|odometro|hodometro|hodômetro)?\s*(\d{1,3}(?:\.\d{3})+|\d+)\s*(?:km|quil[oô]metros?)", tl)
-    if m_km:
-        raw = m_km.group(1).replace(".", "")
-        return int(raw)
-    return None
-
-
-def parse_cost_value(text: str) -> Optional[float]:
-    """Extrai valor financeiro em reais."""
-    tl = (text or "").lower()
-    m_cost = re.search(r"(?:r\$\s*|reais\s*|por\s*|valor\s*(?:de\s*)?|gastei\s*|custou\s*|morreu\s*(?:em\s*)?|paguei\s*)(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+,\d{2}|\d+)\s*(?:reais|conto)?", tl)
-    if m_cost:
-        raw = m_cost.group(1).replace(".", "").replace(",", ".")
-        try:
-            return float(raw)
-        except ValueError:
-            pass
-    m_simple = re.search(r"\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+(?:,\d{2})?)\s*(?:reais|conto)\b", tl)
-    if m_simple:
-        try:
-            return float(m_simple.group(1).replace(".", "").replace(",", "."))
-        except ValueError:
-            pass
-    return None
-
-
-def validate_brazilian_plate(plate: str, context_hint: str = "") -> Dict[str, Any]:
-    """Valida formato de placa de veículo (Mercosul, Amarela ou Cinza Antiga)."""
-    clean = re.sub(r"[\s\-]", "", plate).upper()
-    hint = context_hint.lower()
-    is_mercosul = bool(re.match(r"^[A-Z]{3}[0-9][A-Z][0-9]{2}$", clean))
-    is_amarela = bool(re.match(r"^[A-Z]{2}[0-9]{4}$", clean))
-    warning = ""
-    if "amarela" in hint or is_amarela:
-        warning = "⚠️ Placa no formato antigo amarelo (2 letras e 4 números). Necessário recadastramento para Mercosul."
-    elif "mercosul" in hint and not is_mercosul:
-        warning = "❌ Placa informada como Mercosul, mas não é padrão mercosul (formato antigo cinza de 3 letras e 4 números)."
-    return {"plate": clean, "is_mercosul": is_mercosul, "is_amarela": is_amarela, "warning": warning}
-
-
-def clean_workshop_name(text: str) -> Optional[str]:
-    """Filtra ruídos circunstanciais preservando nomes legítimos de estabelecimentos."""
-    raw = (text or "").strip()
-    if not raw or any(g in raw.lower() for g in ("época", "lugar", "rua", "tempo", "esquina", "lá naquele")):
-        m = re.search(r"(oficina\s+do\s+[a-zA-ZÀ-ÿ]+|auto\s+center\s+[a-zA-ZÀ-ÿ\s]+)", raw, re.I)
-        if m:
-            return re.sub(r"(?:da\s+esquina|lá\s+naquele\s+lugar|na\s+época)[,\s]*", "", m.group(0), flags=re.I).strip()
-        return None
-    return raw
-
-
-KNOWN_MAINTENANCE_ITEMS = {
-    "óleo": "troca de óleo",
-    "oleo": "troca de óleo",
-    "filtro de óleo": "filtro de óleo",
-    "filtro de oleo": "filtro de óleo",
-    "filtro de combustível": "filtro de combustível",
-    "filtro de combustivel": "filtro de combustível",
-    "filtro de cabine": "filtro de cabine",
-    "filtro": "filtro de óleo",
-    "pastilha de freio": "pastilhas de freio",
-    "pastilhas de freio": "pastilhas de freio",
-    "pastilha": "pastilhas de freio",
-    "pastilhas": "pastilhas de freio",
-    "disco de freio": "discos de freio",
-    "discos de freio": "discos de freio",
-    "discos": "discos de freio",
-    "vela": "velas de ignição",
-    "velas": "velas de ignição",
-    "alinhamento": "alinhamento",
-    "balanceamento": "balanceamento",
-    "correia dentada": "correia dentada",
-    "correia de acessórios": "correia de acessórios",
-    "bateria": "bateria",
-    "pneu": "troca de pneus",
-    "pneus": "troca de pneus",
-    "amortecedor": "amortecedores",
-    "amortecedores": "amortecedores",
-    "fluido de freio": "fluido de freio",
-    "arrefecimento": "fluido de arrefecimento",
-}
-
-
-def extract_maintenance_items_strict(text: str) -> List[str]:
-    tl = (text or "").lower()
-    found, seen = [], set()
-    for kw, canonical in sorted(KNOWN_MAINTENANCE_ITEMS.items(), key=lambda x: len(x[0]), reverse=True):
-        if re.search(r"\b" + re.escape(kw) + r"\b", tl):
-            if canonical not in seen:
-                seen.add(canonical)
-                found.append(canonical)
-    return found
-
-
-def merge_maintenance_items(existing: List[str], new_items: List[str]) -> List[str]:
-    seen, res = set(), []
-    for it in (existing or []) + (new_items or []):
-        clean = str(it).strip()
-        if clean and clean.lower() not in seen:
-            seen.add(clean.lower())
-            res.append(clean)
-    return res
-
-
-def extract_date_strict(text: str) -> Optional[str]:
-    tl = (text or "").lower()
-    m_abs = re.search(r"\b(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?\b", tl)
-    if m_abs:
-        d, m = int(m_abs.group(1)), int(m_abs.group(2))
-        y = int(m_abs.group(3)) if m_abs.group(3) else 2026
-        if y < 100:
-            y += 2000
-        return f"{d:02d}/{m:02d}/{y}"
-    m_ext = re.search(r"\b(?:dia\s*)?(\d{1,2})\s+de\s+(janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)(?:\s+de\s+(\d{4}))?\b", tl)
-    if m_ext:
-        months = {"janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4, "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12}
-        d, m = int(m_ext.group(1)), months[m_ext.group(2)]
-        y = int(m_ext.group(3)) if m_ext.group(3) else 2026
-        return f"{d:02d}/{m:02d}/{y}"
-    if "ontem" in tl:
-        return (datetime.now() - timedelta(days=1)).strftime("%d/%m/%Y")
-    if "hoje" in tl:
-        return datetime.now().strftime("%d/%m/%Y")
-    return None
-
-
-def extract_workshop_strict(text: str) -> Optional[str]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    m = re.search(r"(?:l[aá]\s+no\s+|l[aá]\s+na\s+|na\s+|em\s+|no\s+)?\b([A-Za-zÀ-ÿ0-9\-]+(?:\s+[A-Za-zÀ-ÿ0-9\-]+)?\s+Auto\s+Center)\b", raw, re.I)
-    if m:
-        return clean_workshop_name(m.group(1).strip())
-    m2 = re.search(r"\b(Oficina\s+do\s+[A-Za-zÀ-ÿ0-9\-]+|Auto\s+Center\s+[A-Za-zÀ-ÿ0-9\-]+|Mec[aâ]nica\s+[A-Za-zÀ-ÿ0-9\-]+|Concession[aá]ria\s+[A-Za-zÀ-ÿ0-9\-]+)\b", raw, re.I)
-    if m2:
-        return clean_workshop_name(m2.group(1).strip())
-    return None
 
 
 def is_vague_service_initiation(text: str) -> Optional[str]:
@@ -353,23 +120,6 @@ def is_vague_service_initiation(text: str) -> Optional[str]:
     return None
 
 
-def is_edit_last_service_intent(text: str, context: Optional[Any] = None) -> bool:
-    tl = (text or "").lower()
-    if context and getattr(context, "pending_edit_field", None):
-        return True
-
-    # Consultas e perguntas nunca são comandos de edição
-    if re.search(r"\b(qual|quando|quanto|quantos|o que|quais|ver|mostrar|listar|consulta|hist[oó]rico)\b", tl):
-        return False
-
-    patterns = [
-        r"\b(alterar|mudar|corrigir|editar|atualizar|retificar|arrumar|consertar)\b.*\b(?:[uú]ltim[oa]\s+)?(?:servi[çc]o|registro|manuten[çc][ãa]o)\b",
-        r"\b(?:quero|preciso|gostaria de)\s+(?:alterar|mudar|editar|corrigir|atualizar|arrumar)\b.*\b(?:[uú]ltim[oa]\s+)?(?:servi[çc]o|registro|manuten[çc][ãa]o|deste|desse)\b",
-        r"\berrei\s+(?:a\s+data|o\s+valor|o\s+km|os\s+itens|a\s+oficina|o\s+preço)\b",
-        r"\b(corrigir|alterar|mudar|editar)\s+(?:o\s+km|o\s+valor|a\s+data|os\s+itens|a\s+oficina)\s+(?:d[eo]ss?e\s+)?(?:[uú]ltimo\b)?",
-        r"\b(adicionar|incluir)\b.*\b(?:no|ao)\s+(?:[uú]ltim[oa]\s+)?(?:servi[çc]o|registro|manuten[çc][ãa]o)\b",
-    ]
-    return any(re.search(p, tl) for p in patterns)
 
 
 
@@ -377,19 +127,95 @@ def is_edit_last_service_intent(text: str, context: Optional[Any] = None) -> boo
 # CONVERSATION SERVICE PRINCIPAL
 # =============================================================================
 
+def _maintenance_sort_key(m: Any) -> Tuple[float, int]:
+    """Chave de ordenação (data, id) de um registro de manutenção; tolera date str/date/datetime/None."""
+    dt = getattr(m, "date", None)
+    ts = 0.0
+    if dt:
+        if hasattr(dt, "timestamp"):
+            ts = dt.timestamp()
+        elif isinstance(dt, date):
+            ts = datetime.combine(dt, time()).timestamp()
+        elif isinstance(dt, str):
+            try:
+                ts = datetime.strptime(dt, "%d/%m/%Y").timestamp()
+            except Exception:
+                ts = 0.0
+    try:
+        m_id_num = int(getattr(m, "id", 0) or 0)
+    except Exception:
+        m_id_num = 0
+    return (ts, m_id_num)
+
+
+class _TurnLock:
+    """
+    Wrapper de posse sobre `asyncio.Lock` para um único turno (B3).
+
+    - `async with _TurnLock(lock)`: adquire na entrada, libera na saída (try/finally implícito).
+    - `released()`: cede o lock durante um bloco (ex.: chamada ao LLM) e o readquire depois.
+    A flag `_held` garante que `__aexit__` só libera se este turno detém o lock, inclusive
+    quando um `CancelledError` interrompe a readquisição.
+    """
+
+    def __init__(self, lock: asyncio.Lock):
+        self._lock = lock
+        self._held = False
+
+    async def __aenter__(self) -> "_TurnLock":
+        await self._lock.acquire()
+        self._held = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._held:
+            self._held = False
+            self._lock.release()
+
+    def released(self):
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _cm():
+            if self._held:
+                self._held = False
+                self._lock.release()
+            try:
+                yield
+            finally:
+                await self._lock.acquire()
+                self._held = True
+
+        return _cm()
+
+
 class ConversationService:
-    """Orquestrador conversacional AI-First com persistência de estado e function calling."""
+    """
+    Orquestrador conversacional AI-First com persistência de estado e function calling.
+
+    ⚠️ ESTADO IN-MEMORY / DEPLOY SINGLE-WORKER (A1/A2)
+    `_contexts` (rascunhos, turnos) e `_user_locks` vivem na memória do processo, assim como o
+    `MessageDebouncer` do webhook. Portanto o deploy DEVE rodar com **um único worker**
+    (`uvicorn --workers 1`, sem réplicas horizontais): com 2+ workers, o "sim" de confirmação pode
+    cair num processo que não tem o rascunho, e as rajadas de mensagens não seriam agrupadas.
+    Um restart também descarta os rascunhos em aberto (o TTL de `DRAFT_TTL_MINUTES` não sobrevive).
+    Dívida planejada: mover contexto para Redis (TTL = DRAFT_TTL_MINUTES) e o buffer do debouncer
+    para Redis + `asyncio.Event` local por worker.
+    """
 
     def __init__(self, gemini_client: Optional[GeminiClient] = None, draft_ttl_minutes: Optional[int] = None):
         self.gemini = gemini_client or GeminiClient()
         self.draft_ttl_minutes = draft_ttl_minutes or DRAFT_TTL_MINUTES
         self._contexts: Dict[str, ConversationContext] = {}
-        self._user_locks: Dict[str, asyncio.Lock] = {}
+        # B5 (M7): WeakValueDictionary libera locks de usuários ociosos automaticamente
+        self._user_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def _get_user_lock(self, user_id: str) -> asyncio.Lock:
-        if user_id not in self._user_locks:
-            self._user_locks[user_id] = asyncio.Lock()
-        return self._user_locks[user_id]
+        lock = self._user_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_locks[user_id] = lock
+        return lock
 
     def get_context(self, user_id: str) -> ConversationContext:
         if user_id not in self._contexts:
@@ -400,13 +226,49 @@ class ConversationService:
         self._contexts[context.user_id] = context
 
     def _utcnow(self) -> datetime:
-        return datetime.utcnow()
+        """B4 (M6): carimbo de tempo canônico UTC-aware."""
+        return datetime.now(timezone.utc)
 
     def _is_draft_expired(self, context: ConversationContext) -> bool:
         if not context.is_awaiting_confirmation() or not context.draft_updated_at:
             return False
-        delta = self._utcnow() - context.draft_updated_at
+        now_utc = self._utcnow()
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=timezone.utc)
+        else:
+            now_utc = now_utc.astimezone(timezone.utc)
+        draft_ts = context.draft_updated_at
+        if draft_ts.tzinfo is None:
+            draft_ts = draft_ts.replace(tzinfo=timezone.utc)
+        else:
+            draft_ts = draft_ts.astimezone(timezone.utc)
+        delta = now_utc - draft_ts
         return delta > timedelta(minutes=self.draft_ttl_minutes)
+
+    def reopen_draft_for_correction(
+        self,
+        user_id: str,
+        committed_data: Dict[str, Any],
+        clear_keys: Tuple[str, ...] = ("data", "date_str", "date"),
+    ) -> None:
+        """
+        Reabre o rascunho confirmado cuja persistência falhou por dado inválido (C3), removendo
+        apenas os campos problemáticos (`clear_keys`). O usuário corrige com uma nova mensagem e o
+        Deep Merge de `_upsert_maintenance_draft` preserva todo o resto.
+        """
+        if not committed_data:
+            return
+        ctx = self.get_context(user_id)
+        state_value = committed_data.get("_action_state") or ConversationState.AWAITING_MAINTENANCE_CONFIRM.value
+        try:
+            ctx.state = ConversationState(state_value)
+        except ValueError:
+            ctx.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+        ctx.draft_payload = {
+            k: v for k, v in committed_data.items() if k != "_action_state" and k not in clear_keys
+        }
+        ctx.draft_updated_at = self._utcnow()
+        self.update_context(ctx)
 
     def replace_last_assistant_turn(self, user_id: str, new_reply: str) -> None:
         ctx = self.get_context(user_id)
@@ -420,6 +282,9 @@ class ConversationService:
 
     def _record_assistant_turn(self, context: ConversationContext, reply: str) -> None:
         context.recent_turns.append(ConversationTurn(role="assistant", content=reply))
+        max_t = getattr(context, "max_turns", 50)
+        if len(context.recent_turns) > max_t:
+            context.recent_turns = context.recent_turns[-max_t:]
 
     async def handle_incoming_message(
         self,
@@ -430,10 +295,43 @@ class ConversationService:
         reminders: Optional[List[Any]] = None,
         fines: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
-        """Ponto de entrada protegido por lock individual por usuário."""
-        lock = self._get_user_lock(user_id)
-        async with lock:
-            return await self._handle_incoming_message_locked(
+        """
+        Ponto de entrada. NÃO adquire lock aqui (B3): o lock por usuário é adquirido
+        exclusivamente em `_handle_incoming_message_locked`, via `_TurnLock`.
+        """
+        return await self._handle_incoming_message_locked(
+            user_id=user_id,
+            message_text=message_text,
+            vehicles=vehicles,
+            maintenances=maintenances,
+            reminders=reminders,
+            fines=fines,
+        )
+
+    async def _handle_incoming_message_locked(
+        self,
+        user_id: str,
+        message_text: str,
+        vehicles: Optional[List[Any]] = None,
+        maintenances: Optional[List[Any]] = None,
+        reminders: Optional[List[Any]] = None,
+        fines: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Serializa turnos por usuário com `asyncio.Lock` + `try/finally` (via `_TurnLock`).
+
+        Contrato de concorrência (A1 [B3]):
+        - O lock cobre a leitura/escrita do `ConversationContext` (fases pré e pós-LLM).
+        - `GeminiClient.analyze_message` roda SEM o lock (via `async with turn_lock.released()`).
+          O contexto passado ao LLM é um snapshot profundo (`context.model_copy(deep=True)`).
+        - Ao retomar o lock, o estado é reconciliado por `live_ctx.turn_seq == turn_id`: se outro
+          turno avançou o contexto enquanto o LLM respondia, o resultado antigo é descartado
+          (`async_superseded_completed`) sem sobrescrever `self._contexts[user_id]`.
+        """
+        user_lock = self._get_user_lock(user_id)
+        async with _TurnLock(user_lock) as turn_lock:
+            return await self._process_turn(
+                turn_lock,
                 user_id=user_id,
                 message_text=message_text,
                 vehicles=vehicles,
@@ -442,8 +340,9 @@ class ConversationService:
                 fines=fines,
             )
 
-    async def _handle_incoming_message_locked(
+    async def _process_turn(
         self,
+        turn_lock: "_TurnLock",
         user_id: str,
         message_text: str,
         vehicles: Optional[List[Any]] = None,
@@ -515,103 +414,31 @@ class ConversationService:
                 "details": {"reset_all": True}
             }
 
-        # 1.5 Casos de Borda e Auditoria Determinística
-        if "31 de fevereiro" in text_lower or "30 de fevereiro" in text_lower:
-            context.state = ConversationState.NORMAL
-            context.draft_payload = None
-            garage_res = await self._handle_garage_checkup(user_id=user_id, vehicles=vehicles, maintenances=maintenances, reminders=reminders)
-            reply = (
-                "🔄 *Comando 'Ignora tudo' reconhecido:* Estados anteriores e rascunhos foram descartados.\n\n"
-                "⚠️ *Inconsistências Identificadas:*\n"
-                "• ❌ *Data Inexistente:* O dia *31 de fevereiro* não existe no calendário gregoriano.\n"
-                "• ❌ *Agendamento no Passado:* Não é possível agendar uma vistoria futura para o *ano passado*.\n"
-                "• ❌ *Veículo Não Cadastrado:* O Honda Civic não consta na sua garagem (você possui apenas o Toyota Corolla).\n\n"
-                f"{garage_res['reply']}\n\n"
-                "Como posso ajudar com o seu Corolla hoje? 🚗🔧"
-            )
-            self._record_assistant_turn(context, reply)
+        # 2. Resolução do Veículo Alvo (B2 [C6] / R2: desambiguação determinística para modelos repetidos)
+        matched_veh, discrepancy_warning = self._resolve_vehicle(
+            clean_text, vehicles, active_vehicle_id=context.active_vehicle_id
+        )
+        if discrepancy_warning and discrepancy_warning.startswith("AMBIGUOUS:"):
+            clarification_reply = discrepancy_warning.split("AMBIGUOUS:", 1)[1]
+            context.pending_ambiguous_message = clean_text
+            self._record_assistant_turn(context, clarification_reply)
             self.update_context(context)
-            return {"reply": reply, "action_type": "impossible_logic_handled", "state": context.state.value, "details": {"error": "impossible_date", "garage_report": True}}
-
-        if "-50" in text_lower and ("6 meses e meio" in text_lower or "seis meses e meio" in text_lower):
-            future_dt = (datetime.now() + timedelta(days=198)).strftime("%d/%m/%Y")
-            reply = (
-                "⚠️ *Inconsistência de Hodômetro:*\n"
-                "Não é possível registrar quilometragem negativa (*-50 km*). O hodômetro de um veículo deve ser estritamente positivo (>= 0). Por favor, verifique o painel para registrarmos o valor correto.\n\n"
-                f"⏰ *Lembrete Calculado (daqui a 6 meses e meio):*\n"
-                f"• *Tarefa:* Olhar a pressão dos pneus do Corolla\n"
-                f"• *Data Prevista:* {future_dt} às 09:00\n\n"
-                "💡 Posso agendar o lembrete de calibragem dos pneus para você enquanto corrigimos o valor do odômetro?"
-            )
-            self._record_assistant_turn(context, reply)
-            self.update_context(context)
-            return {"reply": reply, "action_type": "invalid_odometer", "state": context.state.value, "details": {"error": "negative_odometer", "reminder_date": future_dt}}
-
-        if "cancela" in text_lower and "civic" in text_lower and "150.000" in text_lower and "corolla" in text_lower:
-            context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
-            context.draft_payload = {"_target_vehicle_ref": "Corolla", "odometer_km": 150000, "km": 150000, "_needs_date_clarification": True}
-            context.draft_updated_at = self._utcnow()
-            reply = (
-                "👍 Entendido! Cancelei o agendamento da revisão do Civic conforme solicitado.\n\n"
-                "🚗 *Atualização do Toyota Corolla:*\n"
-                "• *Novo Hodômetro:* 150.000 km\n"
-                "• 🔴 *ALERTA DE REVISÃO PESADA (150.000 km):* O seu Corolla atingiu uma marca crítica de alta quilometragem! Recomenda-se a inspeção imediata de: correia de acessórios, fluido de arrefecimento, fluido de freio, amortecedores e velas de ignição.\n\n"
-                "❓ *Dúvida sobre a Última Troca de Óleo:*\n"
-                "Você mencionou dúvida sobre a data (*'dia 15 de setembro ou mês passado'*). Para eu consultar ou registrar com precisão no histórico do Corolla, você confirma qual foi a data exata?"
-            )
-            self._record_assistant_turn(context, reply)
-            self.update_context(context)
-            return {"reply": reply, "action_type": "awaiting_confirmation", "state": context.state.value, "draft": context.draft_payload}
-
-        if self._is_garage_checkup_query(text_lower) and any(k in text_lower for k in ("cadastr", "adicion", "comprei", "brasilia", "brasília", "fusca")):
-            garage_res = await self._handle_garage_checkup(user_id=user_id, vehicles=vehicles, maintenances=maintenances, reminders=reminders)
-            p_brasilia = validate_brazilian_plate("AB-0123", "placa amarela")
-            p_fusca = validate_brazilian_plate("HUE-9999", "placa mercosul")
-            reply = (
-                f"{garage_res['reply']}\n\n"
-                "📋 *Processamento dos Novos Cadastros:*\n"
-                f"1. 🚗 *Volkswagen Brasília (1976)*\n   • Placa: `AB0123`\n   • {p_brasilia['warning']}\n"
-                f"2. 🚗 *Volkswagen Fusca*\n   • Placa: `HUE9999`\n   • {p_fusca['warning']}\n\n"
-                "👉 Deseja confirmar o cadastro da Brasília com placa amarela e corrigir a placa informada para o Fusca?"
-            )
-            context.state = ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
-            context.draft_payload = {"_is_multi_action": True, "actions": [{"make": "Volkswagen", "model": "Brasília", "year": 1976, "plate": "AB0123"}, {"make": "Volkswagen", "model": "Fusca", "plate": "HUE9999"}]}
-            context.draft_updated_at = self._utcnow()
-            self._record_assistant_turn(context, reply)
-            self.update_context(context)
-            return {"reply": reply, "action_type": "awaiting_confirmation", "state": context.state.value, "draft": context.draft_payload}
-
-        if "civic touring" in text_lower and "oficina do zé" in text_lower:
-            ontem_str = (datetime.now() - timedelta(days=1)).strftime("%d/%m/%Y")
-            revisao_str = (datetime.now() + timedelta(days=14)).strftime("%d/%m/%Y")
-            shop = "Oficina do Zé"
-            civic_draft = {
-                "make": "Honda", "model": "Civic", "version": "Touring", "engine": "1.5 Turbo",
-                "transmission": "CVT", "year": 2024, "purchase_date": ontem_str,
-                "scheduled_review_date": revisao_str, "workshop_name": shop,
+            return {
+                "reply": clarification_reply,
+                "action_type": "vehicle_disambiguation_required",
+                "state": context.state.value,
+                "details": {"ambiguous_vehicle": True},
             }
-            context.state = ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
-            context.draft_payload = civic_draft
-            context.draft_updated_at = self._utcnow()
-            reply = (
-                "Excelente escolha! Já capturei a ficha técnica do seu Honda Civic Touring 2024:\n"
-                "• *Motor:* 1.5 Turbo\n• *Câmbio:* CVT\n"
-                f"• *Data da Compra:* {ontem_str} (ontem de manhã)\n\n"
-                "⏰ *Agendamento da 1ª Revisão:*\n"
-                f"• *Data Prevista:* {revisao_str} às 09:00 (daqui a duas semanas)\n"
-                f"• *Local / Oficina:* {shop}\n\n"
-                "📌 Deseja salvar o Civic Touring na garagem e agendar a revisão?"
-            )
-            self._record_assistant_turn(context, reply)
-            self.update_context(context)
-            return {"reply": reply, "action_type": "awaiting_confirmation", "state": context.state.value, "draft": civic_draft}
-
-        # 2. Resolução do Veículo Alvo
-        matched_veh, discrepancy_warning = self._resolve_vehicle(clean_text, vehicles)
         if matched_veh:
             v_id = getattr(matched_veh, "id", None)
             if v_id is not None and context.active_vehicle_id != v_id:
                 context.active_vehicle_id = v_id
+                context.pending_ambiguous_vehicle_resolved_id = v_id
+            if getattr(context, "pending_ambiguous_message", None):
+                # R2: Substitui clean_text pela mensagem original SEM concatenar, preservando regex e heurísticas
+                clean_text = context.pending_ambiguous_message
+                text_lower = clean_text.lower()
+                context.pending_ambiguous_message = None
 
         # 3. Estado Pendente de Confirmação
         if context.is_awaiting_confirmation():
@@ -626,9 +453,12 @@ class ConversationService:
                 fines=fines,
                 matched_veh=matched_veh,
                 discrepancy_warning=discrepancy_warning,
+                turn_lock=turn_lock,
+                turn_id=turn_id,
             )
-            self._record_assistant_turn(context, result["reply"])
-            self.update_context(context)
+            if result.get("action_type") != "async_superseded_completed":
+                self._record_assistant_turn(context, result["reply"])
+                self.update_context(context)
             return result
 
         # 4. Anti-Alucinação para Frases Vagas
@@ -643,14 +473,8 @@ class ConversationService:
         # 5. Roteamento AI-First (Análise pelo LLM com Injeção Invisível de Estado)
         history_dicts = [{"role": t.role, "content": t.content} for t in context.recent_turns]
         context_snapshot = context.model_copy(deep=True)
-        lock = self._get_user_lock(user_id)
-        if lock.locked():
-            lock.release()
-            need_reacquire = True
-        else:
-            need_reacquire = False
-
-        try:
+        # LLM roda SEM o lock (ver docstring de `_handle_incoming_message_locked`).
+        async with turn_lock.released():
             analysis = await self.gemini.analyze_message(
                 user_id=user_id,
                 current_message=clean_text,
@@ -661,14 +485,20 @@ class ConversationService:
                 reminders=reminders,
                 fines=fines,
             )
-        finally:
-            if need_reacquire:
-                await lock.acquire()
 
-        # Detecção de superação de turno por concorrência
-        if context.turn_seq > turn_id:
-            reply = analysis.reply_message
-            return {"reply": reply, "action_type": "async_superseded_completed", "state": context.state.value}
+        # A1 (B3): Reconciliação de concorrência via `turn_seq == turn_id` sobre o contexto vivo
+        live_ctx = self.get_context(user_id)
+        if live_ctx.turn_seq != turn_id:
+            return {"reply": analysis.reply_message, "action_type": "async_superseded_completed", "state": live_ctx.state.value}
+        context = live_ctx
+
+        # B7 (M9): Pré/pós-processamento unificado de múltiplas ações (roda online e offline)
+        decomposed_actions = self._decompose_multi_action_message(clean_text, vehicles)
+        if len(decomposed_actions) >= 2 and len(analysis.actions or []) < 2:
+            analysis.actions = [
+                ActionDraft(**act) if isinstance(act, dict) else act
+                for act in decomposed_actions
+            ]
 
         # 5.1 Edição do Último Serviço Salvo (prioritário sobre qualquer alucinação de upsert_draft)
         tool_calls_to_run = []
@@ -694,7 +524,17 @@ class ConversationService:
             self.update_context(context)
             return edit_res
 
-        # 5.2 Execução de Tool Call Estruturada da IA
+        # 5.2 Múltiplas Ações Estruturadas (B7: unificado online e offline antes de single tool_call)
+        if analysis.actions and len(analysis.actions) >= 2:
+            conf_res = self._initiate_multi_action_confirmation_flow(
+                context, analysis.actions, discrepancy_warning=discrepancy_warning,
+                matched_veh=matched_veh, vehicles=vehicles,
+            )
+            self._record_assistant_turn(context, conf_res["reply"])
+            self.update_context(context)
+            return conf_res
+
+        # 5.3 Execução de Tool Call Estruturada da IA
         if tool_calls_to_run:
             tc_res = await self._execute_ai_tool_calls(
                 context=context,
@@ -711,19 +551,12 @@ class ConversationService:
                 self.update_context(context)
                 return tc_res
 
-        # 5.3 Consulta de Histórico de Serviços
+        # 5.4 Consulta de Histórico de Serviços
         if analysis.intent == IntentType.QUERY_HISTORY:
             hist_res = self._handle_get_service_history(maintenances=maintenances, vehicles=vehicles, context=context, llm_reply=analysis.reply_message if analysis.confidence == ConfidenceLevel.HIGH else None)
             self._record_assistant_turn(context, hist_res["reply"])
             self.update_context(context)
             return hist_res
-
-        # 5.4 Múltiplas Ações Estruturadas
-        if analysis.actions and len(analysis.actions) >= 2:
-            conf_res = self._initiate_multi_action_confirmation_flow(context, analysis.actions, discrepancy_warning=discrepancy_warning)
-            self._record_assistant_turn(context, conf_res["reply"])
-            self.update_context(context)
-            return conf_res
 
         # 5.5 Fallback Local quando Offline
         gemini_failed = (
@@ -745,10 +578,12 @@ class ConversationService:
                 self.update_context(context)
                 return {"reply": reply, "action_type": "polite_closing", "state": context.state.value, "details": {}}
 
-            # Múltiplas ações offline
-            multi_actions = self._decompose_multi_action_message(clean_text, vehicles)
-            if len(multi_actions) >= 2:
-                conf_res = self._initiate_multi_action_confirmation_flow(context, multi_actions, discrepancy_warning=discrepancy_warning)
+            # Múltiplas ações offline (usa a mesma decomposição `decomposed_actions`)
+            if len(decomposed_actions) >= 2:
+                conf_res = self._initiate_multi_action_confirmation_flow(
+                    context, decomposed_actions, discrepancy_warning=discrepancy_warning,
+                    matched_veh=matched_veh, vehicles=vehicles,
+                )
                 self._record_assistant_turn(context, conf_res["reply"])
                 self.update_context(context)
                 return conf_res
@@ -989,7 +824,15 @@ class ConversationService:
                 payload["direcao"] = parsed_st
 
         matched_model = (getattr(matched_veh, "model", None) or getattr(matched_veh, "modelo", None)) if matched_veh else None
-        target_ref = matched_model or analysis.target_vehicle_ref or payload.get("model")
+        v_plate = getattr(matched_veh, "plate", None) or getattr(matched_veh, "placa", None) if matched_veh else None
+        has_dup = False
+        if matched_model and vehicles:
+            has_dup = sum(1 for v in vehicles if (getattr(v, "model", None) or getattr(v, "modelo", "")).strip().lower() == matched_model.strip().lower()) > 1
+
+        if has_dup and v_plate:
+            target_ref = v_plate
+        else:
+            target_ref = matched_model or analysis.target_vehicle_ref or payload.get("model")
         payload["_target_vehicle_ref"] = target_ref
         if matched_veh and getattr(matched_veh, "id", None):
             payload["vehicle_id"] = matched_veh.id
@@ -1058,6 +901,8 @@ class ConversationService:
         fines: Optional[List[Any]] = None,
         matched_veh: Optional[Any] = None,
         discrepancy_warning: Optional[str] = None,
+        turn_lock: Optional["_TurnLock"] = None,
+        turn_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Processa a mensagem do usuário quando há um rascunho aguardando confirmação."""
         # ORDEM 2: Proibição Absoluta de Salvamento quando há Dados Novos no Turno
@@ -1131,16 +976,12 @@ class ConversationService:
             return self._confirm_and_save_draft(context)
 
         # 4. Mensagem com Adições ou Correções -> Analisa pelo LLM com injeção de draft_atual
+        # A1 (B3): usa `turn_lock.released()` + snapshot isolado + reconciliação `turn_seq == turn_id`
         history_dicts = [{"role": t.role, "content": t.content} for t in context.recent_turns]
         context_snapshot = context.model_copy(deep=True)
-        lock = self._get_user_lock(user_id)
-        if lock.locked():
-            lock.release()
-            need_reacquire = True
-        else:
-            need_reacquire = False
+        active_turn_lock = turn_lock or _TurnLock(self._get_user_lock(user_id))
 
-        try:
+        async with active_turn_lock.released():
             analysis = await self.gemini.analyze_message(
                 user_id=user_id,
                 current_message=clean_text,
@@ -1151,9 +992,15 @@ class ConversationService:
                 reminders=reminders,
                 fines=fines,
             )
-        finally:
-            if need_reacquire:
-                await lock.acquire()
+
+        if turn_id is not None:
+            live_ctx = self.get_context(user_id)
+            if live_ctx.turn_seq != turn_id:
+                return {
+                    "reply": analysis.reply_message,
+                    "action_type": "async_superseded_completed",
+                    "state": live_ctx.state.value,
+                }
 
         tool_calls_list = []
         if analysis.tool_calls:
@@ -1269,8 +1116,14 @@ class ConversationService:
                 payload = dict(context.draft_payload)
                 actions = list(payload.get("actions", []))
                 for act in actions:
-                    if act.get("intent") in (IntentType.RECORD_MAINTENANCE.value, "record_maintenance"):
+                    raw_intent = act.get("intent")
+                    act_intent = (raw_intent.value if hasattr(raw_intent, "value") else str(raw_intent or "")).strip().lower()
+                    if "record_maintenance" in act_intent or act_intent == "maintenance":
                         act["total_cost"] = new_cost
+                        act["valor"] = new_cost
+                        if isinstance(act.get("maintenance"), dict):
+                            act["maintenance"]["total_cost"] = new_cost
+                            act["maintenance"]["valor"] = new_cost
                         break
                 payload["actions"] = actions
                 context.draft_payload = payload
@@ -1509,6 +1362,13 @@ class ConversationService:
         if strict_items:
             new_items = merge_maintenance_items(new_items, strict_items)
 
+        # B1/B2: MaintenanceDraft expõe `service_summary` (não `description`). Sem itens
+        # explícitos, usa o resumo como fonte de itens (extração estrita -> o próprio resumo).
+        if not new_items and not prev_items:
+            summary_txt = str(entities.get("service_summary") or "").strip()
+            if summary_txt:
+                new_items = extract_maintenance_items_strict(summary_txt) or [summary_txt]
+
         # Merge de Itens (Deep Merge: mescla/append itens do existing_draft com novos itens)
         merged_items = merge_maintenance_items(prev_items, new_items)
         if not merged_items and prev_items:
@@ -1605,30 +1465,56 @@ class ConversationService:
         else:
             final_cost = new_cost if new_cost is not None else parse_cost_value(clean_text)
 
+        m_mod = getattr(matched_veh, "model", None) if matched_veh else None
+        v_plate = getattr(matched_veh, "plate", None) or getattr(matched_veh, "placa", None) if matched_veh else None
+        has_dup = False
+        if m_mod and vehicles:
+            has_dup = sum(1 for v in vehicles if (getattr(v, "model", None) or getattr(v, "modelo", "")).strip().lower() == m_mod.strip().lower()) > 1
+
         target_veh_ref = (
             existing_draft.get("_target_vehicle_ref")
+            or (v_plate if (has_dup and v_plate) else None)
             or (getattr(matched_veh, "model", None) if matched_veh else None)
             or (getattr(vehicles[0], "model", None) if vehicles else None)
         )
 
-        updated_payload = {
-            **existing_draft,
-            "itens": merged_items,
-            "components": merged_items,
-            "description": ", ".join(merged_items) if merged_items else (existing_draft.get("description") or "Manutenção realizada"),
-            "km": final_km,
-            "odometer_km": final_km,
-            "data": final_data,
-            "date_str": final_data,
-            "date": final_data,
-            "oficina": final_oficina,
-            "workshop_name": final_oficina,
-            "valor": final_cost,
-            "total_cost": final_cost if final_cost is not None else 0.0,
-            "_target_vehicle_ref": target_veh_ref,
-        }
-        if discrepancy_warning:
-            updated_payload["_discrepancy_warning"] = discrepancy_warning
+        # B12: sem veículo resolvido não há onde persistir -> não abrir rascunho "fantasma".
+        if target_veh_ref is None:
+            return {
+                "reply": (
+                    "Para registrar esse serviço eu preciso saber de qual veículo se trata, "
+                    "mas você ainda não tem nenhum cadastrado. 🚗 Cadastre o veículo primeiro "
+                    "(ex.: *'Cadastrar meu Honda Civic 2020'*) e depois me conte o serviço."
+                ),
+                "action_type": "needs_vehicle",
+                "state": context.state.value,
+                "details": {"reason": "no_vehicle_registered"},
+            }
+
+        # B2: descrição. Com itens, reflete a lista mesclada; sem itens, cai em
+        # description anterior -> service_summary (MaintenanceDraft) -> default.
+        service_summary = entities.get("service_summary")
+        if merged_items:
+            final_description = ", ".join(merged_items)
+        else:
+            final_description = (
+                existing_draft.get("description")
+                or service_summary
+                or "Manutenção realizada"
+            )
+
+        payload_obj = MaintenancePayload(
+            itens=merged_items,
+            description=final_description,
+            km=final_km,
+            data=final_data,
+            oficina=final_oficina,
+            valor=final_cost,
+            target_vehicle_ref=target_veh_ref,
+            discrepancy_warning=discrepancy_warning,
+            extras={k: v for k, v in existing_draft.items() if k not in _MAINTENANCE_PAYLOAD_KEYS},
+        )
+        updated_payload = payload_obj.to_committed_data()
 
         context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
         context.draft_payload = updated_payload
@@ -1701,6 +1587,22 @@ class ConversationService:
 
         return {"reply": reply, "action_type": "action_confirmed", "state": context.state.value, "committed_data": draft_data}
 
+    @staticmethod
+    def _detect_edit_field(text_lower: str) -> Optional[str]:
+        """B9: mapeia a resposta do usuário ao campo editável (data/valor/km/oficina/itens)."""
+        norm = normalize_text(text_lower)
+        if re.search(r"\b(data|dia)\b", norm):
+            return "data"
+        if re.search(r"\b(valor|custo|preco|pagamento|reais)\b", norm):
+            return "valor"
+        if re.search(r"\b(km|quilometragem|odometro|hodometro)\b", norm):
+            return "km"
+        if re.search(r"\b(oficina|mecanica|local)\b", norm):
+            return "oficina"
+        if re.search(r"\b(itens?|pecas?|servicos?|componentes?)\b", norm):
+            return "itens"
+        return None
+
     async def _handle_edit_last_saved_service(
         self,
         context: ConversationContext,
@@ -1724,25 +1626,7 @@ class ConversationService:
             last_m = next((m for m in active_maints if str(getattr(m, "id", "")) == str(target_id)), None)
 
         if last_m is None:
-            def sort_key(m):
-                dt = getattr(m, "date", None)
-                ts = 0.0
-                if dt:
-                    if hasattr(dt, "timestamp"):
-                        ts = dt.timestamp()
-                    elif isinstance(dt, str):
-                        try:
-                            ts = datetime.strptime(dt, "%d/%m/%Y").timestamp()
-                        except Exception:
-                            ts = 0.0
-                m_id = getattr(m, "id", 0) or 0
-                try:
-                    m_id_num = int(m_id)
-                except Exception:
-                    m_id_num = 0
-                return (ts, m_id_num)
-
-            sorted_maints = sorted(active_maints, key=sort_key, reverse=True)
+            sorted_maints = sorted(active_maints, key=_maintenance_sort_key, reverse=True)
             last_m = sorted_maints[0]
 
         srv_id = getattr(last_m, "id", None)
@@ -1750,6 +1634,40 @@ class ConversationService:
         prev_components = list(getattr(last_m, "components", []) or [getattr(last_m, "description", "Manutenção")])
         m_dt = getattr(last_m, "date", None)
         prev_dt_str = m_dt.strftime("%d/%m/%Y") if hasattr(m_dt, "strftime") and m_dt else (str(m_dt) if m_dt else "não informada")
+
+        # 0. B9: o bot perguntou QUAL campo editar (pending_edit_field=None + awaiting_choice=True).
+        #    A resposta é a ESCOLHA do campo (data/valor/km/oficina/itens), nunca o novo valor de "itens".
+        if getattr(context, "pending_edit_awaiting_choice", False) and not getattr(context, "pending_edit_field", None):
+            chosen = self._detect_edit_field(text_lower)
+            if chosen is None:
+                return {
+                    "reply": "Não entendi qual informação alterar. Pode dizer: *a data*, *o valor*, *os itens*, *o km* ou *a oficina*?",
+                    "action_type": "awaiting_edit_value",
+                    "state": context.state.value,
+                    "details": {"service_id": srv_id, "awaiting_field_choice": True},
+                }
+            context.pending_edit_awaiting_choice = False
+            context.pending_edit_field = chosen
+            context.pending_edit_service_id = srv_id
+            has_inline_value = (
+                (chosen == "data" and extract_date_strict(clean_text))
+                or (chosen == "valor" and parse_cost_value(clean_text) is not None)
+                or (chosen == "km" and parse_km_value(clean_text) is not None)
+            )
+            if not has_inline_value:
+                prompts = {
+                    "data": "Qual é a data correta? (ex: 15/03/2026)",
+                    "valor": "Qual é o valor correto em reais?",
+                    "km": "Qual é a quilometragem correta?",
+                    "oficina": "Qual é o nome correto da oficina?",
+                    "itens": "Quais itens devo registrar? (eles serão somados aos já existentes)",
+                }
+                return {
+                    "reply": f"Certo! {prompts[chosen]}",
+                    "action_type": "awaiting_edit_value",
+                    "state": context.state.value,
+                    "details": {"field": chosen, "service_id": srv_id},
+                }
 
         # 1. Se o usuário já está respondendo ao campo pendente (Turno 2 da condução ativa)
         field_to_edit = getattr(context, "pending_edit_field", None)
@@ -1778,6 +1696,7 @@ class ConversationService:
                 reply_msg = f"✅ Os itens do último serviço foram atualizados para *{', '.join(merged)}*!"
 
             context.pending_edit_field = None
+            context.pending_edit_awaiting_choice = False
             context.pending_edit_service_id = None
             context.state = ConversationState.NORMAL
             return {"reply": reply_msg, "action_type": "update_last_saved_service", "state": context.state.value, "committed_data": committed}
@@ -1838,7 +1757,8 @@ class ConversationService:
 
         # Caso geral sem campo especificado
         context.pending_edit_service_id = srv_id
-        context.pending_edit_field = "awaiting_field_choice"
+        context.pending_edit_field = None
+        context.pending_edit_awaiting_choice = True
         m_comp = ", ".join(prev_components)
         m_val = getattr(last_m, "total_cost", 0.0) or 0.0
         reply = (
@@ -1854,14 +1774,23 @@ class ConversationService:
         context: Optional[ConversationContext] = None,
         llm_reply: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Consulta e formata o histórico de manutenções registradas."""
+        """
+        Consulta e formata o histórico de manutenções registradas.
+
+        Decisão de ordenação (B11): o histórico é exibido do MAIS RECENTE para o mais antigo.
+        `MaintenanceRepository.get_by_user_id` já devolve `ORDER BY date DESC, id DESC`, então
+        NÃO se inverte (o antigo `reversed()` mostrava o mais antigo primeiro, contradizendo o
+        rótulo). Para não depender silenciosamente da ordem do chamador, reordenamos de forma
+        estável por (data, id) decrescente — idempotente quando a entrada já vem DESC.
+        """
         active_maints = [m for m in (maintenances or []) if getattr(m, "status", "active") != "cancelled"]
         if not active_maints:
             return {"reply": "Você ainda não possui nenhum serviço registrado no seu histórico. Deseja cadastrar a primeira manutenção?", "action_type": "query_history", "state": "normal", "details": {"total_maintenances": 0}}
 
+        active_maints = sorted(active_maints, key=_maintenance_sort_key, reverse=True)
         lines = ["🔧 *Histórico de Serviços Registrados:*\n"]
         total_val = 0.0
-        for idx, m in enumerate(reversed(active_maints), 1):
+        for idx, m in enumerate(active_maints, 1):
             desc = getattr(m, "description", None) or ", ".join(getattr(m, "components", [])) or "Manutenção"
             cost = float(getattr(m, "total_cost", 0.0) or getattr(m, "custo", 0.0) or 0.0)
             total_val += cost
@@ -1929,11 +1858,33 @@ class ConversationService:
         context: ConversationContext,
         actions: List[Any],
         discrepancy_warning: Optional[str] = None,
+        matched_veh: Optional[Any] = None,
+        vehicles: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Gera card harmonioso de confirmação para múltiplas intenções encadeadas."""
         context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
         action_dicts = [a.model_dump(exclude_none=True) if hasattr(a, "model_dump") else (a if isinstance(a, dict) else {"description": str(a)}) for a in actions]
+
+        # R2 / B2: Resolve target ref (usando placa se houver modelo duplicado na garagem)
+        target_ref = None
+        has_dup = False
+        if matched_veh:
+            v_plate = getattr(matched_veh, "plate", None) or getattr(matched_veh, "placa", None)
+            m_mod = getattr(matched_veh, "model", None) or getattr(matched_veh, "modelo", "")
+            if m_mod and vehicles:
+                has_dup = sum(1 for v in vehicles if (getattr(v, "model", None) or getattr(v, "modelo", "")).strip().lower() == m_mod.strip().lower()) > 1
+            target_ref = v_plate if (has_dup and v_plate) else m_mod
+
+        if target_ref:
+            for act in action_dicts:
+                if not act.get("target_vehicle_ref") or act.get("target_vehicle_ref") in ("Veículo", "veículo") or has_dup:
+                    act["target_vehicle_ref"] = target_ref
+
         payload = {"_is_multi_action": True, "_action_state": "awaiting_multi_action_confirm", "actions": action_dicts}
+        if target_ref:
+            payload["_target_vehicle_ref"] = target_ref
+            if getattr(matched_veh, "id", None):
+                payload["vehicle_id"] = matched_veh.id
         if discrepancy_warning:
             payload["_discrepancy_warning"] = discrepancy_warning
         context.draft_payload = payload
@@ -1975,7 +1926,7 @@ class ConversationService:
         return {"reply": reply, "action_type": "awaiting_confirmation", "state": context.state.value, "draft": payload}
 
     def _decompose_multi_action_message(self, text: str, vehicles: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
-        """Decompõe cláusulas de múltiplas ações offline."""
+        """B7 (M9): Decompõe cláusulas de múltiplas ações (usado como pré-processador online e fallback offline)."""
         if not text:
             return []
         split_pattern = r"(?:\.\s+|\n+|;\s*|\s+(?:e\s+tamb[eé]m|j[áa]\s+salva\s+isso\s+e|(?:e\s+)?j[áa]\s+me\s+lembra|e\s+me\s+lembra|e\s+lembra|e\s+atualiza|e\s+registra|e\s+agenda)\s+)"
@@ -2045,43 +1996,148 @@ class ConversationService:
 
         return actions
 
-    def _resolve_vehicle(self, text: str, vehicles: Optional[List[Any]]) -> Tuple[Optional[Any], Optional[str]]:
-        """Identifica o veículo mencionado no texto e alerta se houver divergência de modelo/placa."""
+    def _resolve_vehicle(
+        self,
+        text: str,
+        vehicles: Optional[List[Any]],
+        active_vehicle_id: Optional[int] = None,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """
+        B2 (C6) / R2: Identifica o veículo mencionado com ordem determinística:
+        (1) placa exata -> (2) `make + model` ou `model` exato -> (3) fuzzy `difflib` com `ratio >= 0.85` ->
+        (4) se >= 2 veículos empatarem para o mesmo modelo sem placa desambiguadora, usa `active_vehicle_id`
+        como hint prioritário; se ainda ambíguo, retorna `(None, "AMBIGUOUS:...")`.
+        """
         if not vehicles:
             return None, None
         tl = (text or "").lower()
-        plate_match = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", text)
-        clean_plate = plate_match.group(1).replace("-", "").upper() if plate_match else None
+        plate_match = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", text) or re.search(r"\b([A-Za-z]{3}[-\s]?[0-9]{4})\b", text)
+        clean_plate = re.sub(r"[\s\-]", "", plate_match.group(1)).upper() if plate_match else None
 
+        # 1. Correspondência exata por placa
+        if clean_plate:
+            for v in vehicles:
+                v_plate = re.sub(r"[\s\-]", "", getattr(v, "plate", None) or getattr(v, "placa", "") or "").upper()
+                v_model = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
+                if v_plate and v_plate == clean_plate:
+                    for known_key, known_spec in KNOWN_MODEL_MAKES.items():
+                        if known_key in tl and known_spec["model"].lower() != v_model:
+                            warn = f"Atenção: A placa {v_plate} pertence ao seu {v.model}, e não a um {known_spec['model']}. Os dados foram lançados no {v.model}."
+                            return v, warn
+                    return v, None
+
+        # 2. Correspondência exata por `make + model` ou `model`
+        model_matches: List[Any] = []
         for v in vehicles:
-            v_plate = (getattr(v, "plate", None) or getattr(v, "placa", "")).replace("-", "").upper()
-            v_model = (getattr(v, "model", None) or getattr(v, "modelo", "")).lower()
-            if clean_plate and v_plate == clean_plate:
-                for known_key, known_spec in KNOWN_MODEL_MAKES.items():
-                    if known_key in tl and known_spec["model"].lower() != v_model:
-                        warn = f"Atenção: A placa {v_plate} pertence ao seu {v.model}, e não a um {known_spec['model']}. Os dados foram lançados no {v.model}."
-                        return v, warn
-                return v, None
-            if v_model and v_model in tl:
-                return v, None
+            v_model = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").strip().lower()
+            v_make = (getattr(v, "make", None) or getattr(v, "marca", "") or "").strip().lower()
+            full_name = f"{v_make} {v_model}".strip()
+            if v_model and (full_name in tl or v_model in tl):
+                model_matches.append(v)
 
-        return self._resolve_vehicle_fuzzy(text, vehicles), None
+        if len(model_matches) == 1:
+            return model_matches[0], None
+        if len(model_matches) >= 2:
+            if active_vehicle_id is not None:
+                hint_match = next((v for v in model_matches if getattr(v, "id", None) == active_vehicle_id), None)
+                if hint_match:
+                    return hint_match, None
+            dups = self._find_same_model_duplicates(model_matches)
+            if dups:
+                return None, self._build_ambiguous_vehicle_prompt(dups)
+            return model_matches[0], None
+
+        # 3. Fuzzy matching com `ratio >= 0.85`
+        fuzzy_matches = self._resolve_vehicle_fuzzy_candidates(text, vehicles, min_ratio=0.85)
+        if len(fuzzy_matches) == 1:
+            return fuzzy_matches[0], None
+        if len(fuzzy_matches) >= 2:
+            if active_vehicle_id is not None:
+                hint_match = next((v for v in fuzzy_matches if getattr(v, "id", None) == active_vehicle_id), None)
+                if hint_match:
+                    return hint_match, None
+            dups = self._find_same_model_duplicates(fuzzy_matches)
+            if dups:
+                return None, self._build_ambiguous_vehicle_prompt(dups)
+            return fuzzy_matches[0], None
+
+        # Fallback legado para typos moderados (ratio >= 0.70) apenas se único
+        legacy_fuzzy = self._resolve_vehicle_fuzzy_candidates(text, vehicles, min_ratio=0.70)
+        if len(legacy_fuzzy) == 1:
+            return legacy_fuzzy[0], None
+        if len(legacy_fuzzy) >= 2:
+            if active_vehicle_id is not None:
+                hint_match = next((v for v in legacy_fuzzy if getattr(v, "id", None) == active_vehicle_id), None)
+                if hint_match:
+                    return hint_match, None
+            dups = self._find_same_model_duplicates(legacy_fuzzy)
+            if dups:
+                return None, self._build_ambiguous_vehicle_prompt(dups)
+            return legacy_fuzzy[0], None
+
+        # R2: Hint prioritário se nenhum modelo foi detectado no texto
+        if active_vehicle_id is not None:
+            active_veh = next((v for v in vehicles if getattr(v, "id", None) == active_vehicle_id), None)
+            if active_veh:
+                return active_veh, None
+
+        return None, None
+
+    @staticmethod
+    def _find_same_model_duplicates(candidates: List[Any]) -> List[Any]:
+        by_model: Dict[str, List[Any]] = {}
+        for v in candidates:
+            m = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").strip().lower()
+            by_model.setdefault(m, []).append(v)
+        for group in by_model.values():
+            if len(group) >= 2:
+                return group
+        return []
+
+    @staticmethod
+    def _build_ambiguous_vehicle_prompt(candidates: List[Any]) -> str:
+        model_display = getattr(candidates[0], "model", None) or getattr(candidates[0], "modelo", "veículo")
+        plates = [
+            getattr(v, "plate", None) or getattr(v, "placa", None) or f"ID {getattr(v, 'id', '?')}"
+            for v in candidates
+        ]
+        plates_str = " ou ".join(f"placa *{p}*" for p in plates)
+        return (
+            f"AMBIGUOUS:Você possui mais de um *{model_display}* cadastrado na garagem ({plates_str}). "
+            f"A qual dos dois *{model_display}* você se refere? Por favor, informe a placa correspondente."
+        )
+
+    def _resolve_vehicle_fuzzy_candidates(
+        self, text: str, vehicles: Optional[List[Any]], min_ratio: float = 0.85
+    ) -> List[Any]:
+        if not vehicles:
+            return []
+        tl = (text or "").lower()
+        words = [w for w in re.split(r"\W+", tl) if len(w) >= 3]
+        scored: List[Tuple[Any, float]] = []
+        for v in vehicles:
+            target = (getattr(v, "model", None) or getattr(v, "modelo", "") or "").lower()
+            if not target:
+                continue
+            best_for_v = 0.0
+            for w in words:
+                for t_part in [target] + target.split():
+                    if len(t_part) < 3:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, w, t_part).ratio()
+                    if ratio > best_for_v:
+                        best_for_v = ratio
+            if best_for_v >= min_ratio:
+                scored.append((v, best_for_v))
+        if not scored:
+            return []
+        max_score = max(s for _, s in scored)
+        return [v for v, s in scored if abs(s - max_score) < 1e-6]
 
     def _resolve_vehicle_fuzzy(self, text: str, vehicles: Optional[List[Any]]) -> Optional[Any]:
         """Fuzzy matching para nomes de modelos com pequenos erros de digitação (ex: sandeiro -> Sandero)."""
-        if not vehicles:
-            return None
-        tl = (text or "").lower()
-        words = tl.split()
-        best_v, best_score = None, 0.0
-        for v in vehicles:
-            target = (getattr(v, "model", None) or getattr(v, "modelo", "")).lower()
-            for w in words:
-                ratio = difflib.SequenceMatcher(None, w, target).ratio()
-                if ratio > best_score and ratio >= 0.70:
-                    best_score = ratio
-                    best_v = v
-        return best_v
+        cands = self._resolve_vehicle_fuzzy_candidates(text, vehicles, min_ratio=0.70)
+        return cands[0] if len(cands) == 1 else None
 
     def _is_garage_checkup_query(self, text_lower: str) -> bool:
         """Verifica se é consulta global sobre todos os carros."""

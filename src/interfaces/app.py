@@ -4,15 +4,19 @@ Ponto de montagem da API HTTP com suporte assíncrono, gerenciamento de ciclo de
 (Lifespan para inicialização de banco), middleware de métricas e tratamento global de exceções.
 """
 
+import asyncio
 import time
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
+from src.ai.client import get_urllib_executor, shutdown_urllib_executor
 from src.config.settings import settings
-from src.infrastructure.database.session import init_db, close_db
+from src.infrastructure.database.session import init_db, close_db, async_session_factory
+from src.infrastructure.http_client import close_http_client, TIMEOUT_HEALTHCHECK, get_http_client
 from src.interfaces.api.webhook import router as webhook_router
 from src.interfaces.routers import (
     veiculos_router,
@@ -39,6 +43,14 @@ class HealthCheckResponse(BaseModel):
     provider: str = Field(..., description="Gateway WhatsApp padrão configurado")
 
 
+async def ping_database() -> float:
+    """C3 (R3): executa SELECT 1 no banco e devolve a latência em milissegundos."""
+    t0 = time.perf_counter()
+    async with async_session_factory() as session:
+        await session.execute(text("SELECT 1"))
+    return round((time.perf_counter() - t0) * 1000.0, 2)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gerenciamento de Ciclo de Vida da Aplicação (Startup e Shutdown)."""
@@ -49,6 +61,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Falha ao inicializar banco de dados: {e}", exc_info=True)
 
+    # B9 (S6): Inicializa ThreadPoolExecutor limitado (max_workers=8, thread_name_prefix="gemini-urllib")
+    app.state.urllib_executor = get_urllib_executor()
+
     # Inicia o agendador de notificações em segundo plano
     notification_scheduler.start()
 
@@ -56,6 +71,8 @@ async def lifespan(app: FastAPI):
 
     logger.info("🛑 Encerrando AutoCare V2...")
     await notification_scheduler.stop()
+    shutdown_urllib_executor(wait=False)
+    await close_http_client()
     await close_db()
     logger.info("✅ Conexões do banco liberadas.")
 
@@ -112,6 +129,48 @@ def create_app() -> FastAPI:
             environment=settings.ENVIRONMENT,
             provider=settings.PROVIDER,
         )
+
+    @app.get("/healthz", tags=["Health"], summary="Healthcheck operacional detalhado com timeout de 2s (C3 / R3 / R6)")
+    async def healthz():
+        db_ok = True
+        db_ping_ms = None
+        timeout_sec = 2.0
+        if isinstance(TIMEOUT_HEALTHCHECK, (int, float)):
+            timeout_sec = float(TIMEOUT_HEALTHCHECK)
+        elif hasattr(TIMEOUT_HEALTHCHECK, "read") and TIMEOUT_HEALTHCHECK.read is not None:
+            timeout_sec = float(TIMEOUT_HEALTHCHECK.read)
+
+        try:
+            db_ping_ms = await asyncio.wait_for(ping_database(), timeout=timeout_sec)
+            if db_ping_ms is not None and db_ping_ms > (timeout_sec * 1000.0):
+                db_ok = False
+        except Exception as exc:
+            logger.warning("Healthcheck DB ping falhou ou excedeu timeout: %s", exc)
+            db_ok = False
+
+        # R6: Validação do cliente HTTP compartilhado vivo
+        client_ok = False
+        try:
+            client = get_http_client()
+            client_ok = not client.is_closed
+        except Exception as exc_client:
+            logger.warning("Healthcheck shared_http_client falhou: %s", exc_client)
+            client_ok = False
+
+        raw_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
+        gemini_key_configured = bool(
+            raw_key and len(raw_key) > 10 and "sua_chave" not in raw_key.lower() and "placeholder" not in raw_key.lower()
+        )
+        checks = {
+            "shared_http_client": bool(getattr(settings, "AUTOCARE_FEATURE_SHARED_HTTP_CLIENT", True)),
+            "shared_http_client_feature_flag": bool(getattr(settings, "AUTOCARE_FEATURE_SHARED_HTTP_CLIENT", True)),
+            "shared_http_client_alive": client_ok,
+            "rate_limiter": bool(getattr(settings, "AUTOCARE_FEATURE_RATE_LIMIT", True)),
+            "db_ping_ms": db_ping_ms,
+            "gemini_key_configured": gemini_key_configured,
+        }
+        overall_status = "ok" if (db_ok and client_ok) else "degraded"
+        return {"status": overall_status, "checks": checks}
 
     # 5. Inclusão das Rotas de Webhook, Veículos, Proprietários e Manutenções
     app.include_router(webhook_router)

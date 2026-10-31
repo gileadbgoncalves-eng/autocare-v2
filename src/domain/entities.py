@@ -20,6 +20,22 @@ from .enums import (
 )
 
 
+MAX_CONTEXT_TURNS = 50
+
+
+def utc_now() -> dt.datetime:
+    """B4: carimbo de tempo canônico UTC aware (`datetime.now(timezone.utc)`)."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _ensure_utc_aware(val: Optional[dt.datetime]) -> Optional[dt.datetime]:
+    if val is None or not isinstance(val, dt.datetime):
+        return val
+    if val.tzinfo is None:
+        return val.replace(tzinfo=dt.timezone.utc)
+    return val.astimezone(dt.timezone.utc)
+
+
 class UserPreferences(BaseModel):
     """Preferências granulares de notificação do motorista."""
     notify_financial: bool = Field(default=True, description="Notificações de IPVA, seguro e licenciamento")
@@ -27,7 +43,7 @@ class UserPreferences(BaseModel):
     notify_minor_checks: bool = Field(default=True, description="Lembretes de calibragem de pneus e fluidos")
     quiet_mode: bool = Field(default=False, description="Modo silencioso global (suspende disparos ativos)")
     horario_notificacao_padrao: dt.time = Field(default=dt.time(9, 0), description="Horário preferido para receber o Check-up Diário")
-    updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    updated_at: dt.datetime = Field(default_factory=utc_now)
 
 
 class User(BaseModel):
@@ -35,7 +51,7 @@ class User(BaseModel):
     id: str = Field(..., description="Telefone sanitizado no formato internacional, ex: 5521992028482")
     name: Optional[str] = Field(default=None, description="Nome ou apelido preferido do condutor")
     preferences: UserPreferences = Field(default_factory=UserPreferences)
-    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    created_at: dt.datetime = Field(default_factory=utc_now)
 
     @field_validator("id")
     @classmethod
@@ -62,7 +78,7 @@ class Vehicle(BaseModel):
     fuel_type: FuelType = Field(default=FuelType.FLEX)
     usage_profile: UsageProfile = Field(default=UsageProfile.CONVENCIONAL)
     current_km: Optional[int] = Field(default=None, ge=0, description="Quilometragem atual no odômetro")
-    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    created_at: dt.datetime = Field(default_factory=utc_now)
 
     @field_validator("plate")
     @classmethod
@@ -70,6 +86,16 @@ class Vehicle(BaseModel):
         if not v:
             return None
         return v.upper().replace("-", "").strip()
+
+    @property
+    def plate_alias(self) -> str:
+        """Placa canônica para comparação: MAIÚSCULA, sem hífen/espaço ('' quando ausente). (C2)"""
+        return (self.plate or "").upper().replace("-", "").replace(" ", "").strip()
+
+    @property
+    def model_alias(self) -> str:
+        """Modelo canônico para comparação: minúsculo e sem espaços nas pontas ('' quando ausente). (C2)"""
+        return (self.model or "").strip().lower()
 
 
 class MaintenanceRecord(BaseModel):
@@ -89,7 +115,7 @@ class MaintenanceRecord(BaseModel):
     warranty_months: Optional[int] = Field(default=None, ge=0, description="Tempo de garantia em meses")
     invoice_photo_url: Optional[str] = Field(default=None, description="Foto da nota fiscal ou recibo")
     status: str = Field(default=RecordStatus.ACTIVE.value, description="active | cancelled (soft delete)")
-    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    created_at: dt.datetime = Field(default_factory=utc_now)
 
     @property
     def maintenance_date(self) -> dt.date:
@@ -107,7 +133,12 @@ class Reminder(BaseModel):
     due_km: Optional[int] = Field(default=None, ge=0, description="Disparo por hodômetro atingido")
     recurrence: ReminderRecurrence = Field(default=ReminderRecurrence.ONCE)
     status: ReminderStatus = Field(default=ReminderStatus.PENDING)
-    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    created_at: dt.datetime = Field(default_factory=utc_now)
+
+    @field_validator("created_at", "due_datetime", "data_hora_agendada", mode="after")
+    @classmethod
+    def ensure_utc_timestamps(cls, v: Optional[dt.datetime]) -> Optional[dt.datetime]:
+        return _ensure_utc_aware(v)
 
 
 class TrafficFine(BaseModel):
@@ -123,14 +154,14 @@ class TrafficFine(BaseModel):
     infraction_date: Optional[dt.date] = Field(default=None, description="Data da autuação")
     due_date: Optional[dt.date] = Field(default=None, description="Data de vencimento para pagamento com desconto")
     status: FineStatus = Field(default=FineStatus.NOTIFICADA)
-    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    created_at: dt.datetime = Field(default_factory=utc_now)
 
 
 class ConversationTurn(BaseModel):
     """Representação de um turno de diálogo atômico."""
     role: str = Field(..., description="'user' para mensagem do condutor, 'assistant' para resposta do bot")
     content: str = Field(..., description="Texto integral da mensagem enviada ou recebida")
-    timestamp: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    timestamp: dt.datetime = Field(default_factory=utc_now)
 
 
 class ConversationContext(BaseModel):
@@ -143,17 +174,21 @@ class ConversationContext(BaseModel):
     active_vehicle_id: Optional[int] = Field(default=None, description="Veículo ativo em foco na sessão")
     draft_payload: Optional[Dict[str, Any]] = Field(default=None, description="Dados temporários aguardando confirmação do usuário")
     recent_turns: List[ConversationTurn] = Field(default_factory=list, description="Últimos turnos de diálogo para injeção de contexto no Gemini")
-    updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    max_turns: int = Field(default=MAX_CONTEXT_TURNS, description="B6 (M8): limite máximo de turnos mantidos em memória")
+    updated_at: dt.datetime = Field(default_factory=utc_now)
     draft_updated_at: Optional[dt.datetime] = Field(default=None, description="Última atividade do rascunho pendente (base do TTL, UTC)")
     turn_seq: int = Field(default=0, description="Contador sequencial monótono de turnos para controle de concorrência")
     pending_edit_field: Optional[str] = Field(default=None, description="Campo do último serviço aguardando novo valor na condução ativa")
     pending_edit_service_id: Optional[Any] = Field(default=None, description="ID do último serviço salvo em processo de edição")
+    pending_edit_awaiting_choice: bool = Field(default=False, description="True quando o bot perguntou QUAL campo editar e aguarda a escolha (pending_edit_field fica None)")
+    pending_ambiguous_message: Optional[str] = Field(default=None, description="B2 (C6): mensagem original aguardando desambiguação de placa pelo usuário")
+    pending_ambiguous_vehicle_resolved_id: Optional[int] = Field(default=None, description="B2/R2: ID do veículo resolvido durante desambiguação")
 
     def advance_turn(self, content: str) -> int:
         self.turn_seq += 1
         self.recent_turns.append(ConversationTurn(role="user", content=content))
-        if len(self.recent_turns) > 10:
-            self.recent_turns = self.recent_turns[-10:]
+        if len(self.recent_turns) > self.max_turns:
+            self.recent_turns = self.recent_turns[-self.max_turns:]
         return self.turn_seq
 
     def is_awaiting_confirmation(self) -> bool:

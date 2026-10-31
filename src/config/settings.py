@@ -27,9 +27,16 @@ class Settings(BaseSettings):
 
     # 1. Ambiente & Execução
     ENVIRONMENT: str = Field(default="development", description="development, staging ou production")
+    DEBUG: bool = Field(default=False, description="Habilita logs de depuração com conteúdo em nível DEBUG")
     PORT: int = Field(default=8080, description="Porta HTTP do servidor Webhook")
     LOG_LEVEL: str = Field(default="info", description="debug, info, warning, error")
     WEBHOOK_DEBOUNCE_SECONDS: float = Field(default=2.0, description="Janela de debounce em segundos no webhook (buffer anti-atropelo)")
+    WEBHOOK_RATE_LIMIT_PER_MIN: int = Field(default=120, description="Máx. de mensagens por minuto por telefone no webhook (0 desativa)")
+
+    # Feature Flags Operacionais (C3 / R3)
+    AUTOCARE_FEATURE_RATE_LIMIT: bool = Field(default=True, description="Liga/desliga rate limiting sem redeploy")
+    AUTOCARE_FEATURE_SHARED_HTTP_CLIENT: bool = Field(default=True, description="Liga/desliga pool HTTP compartilhado")
+    AUTOCARE_FEATURE_GEMINI_CIRCUIT_BREAKER: bool = Field(default=True, description="Liga/desliga circuit breaker do Gemini")
 
     # 2. Google Gemini AI (Cérebro NLP)
     GEMINI_API_KEY: str = Field(default="", description="Chave de API do Google AI Studio / Gemini")
@@ -39,6 +46,7 @@ class Settings(BaseSettings):
     GEMINI_MAX_RETRIES: int = Field(default=2, description="Tentativas rápidas em 5xx")
     GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=400, description="Teto de tokens de saída por chamada (guardrail de custo: 250-400)")
     GEMINI_HISTORY_MAX_TURNS: int = Field(default=5, description="Quantidade máxima de turnos do histórico enviados à API")
+    GEMINI_RATE_LIMIT_PER_MIN: int = Field(default=20, description="Máx. de chamadas por minuto ao Gemini por user_id (proteção de quota)")
 
     # 3. Banco de Dados Relacional (SQLAlchemy 2.0 Async)
     DATABASE_URL: str = Field(
