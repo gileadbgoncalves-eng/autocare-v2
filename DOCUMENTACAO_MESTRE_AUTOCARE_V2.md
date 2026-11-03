@@ -389,6 +389,7 @@ TOTAL                                               4463    974   1546    291   
     - 15.1 Especificação Completa do Settings
     - 15.2 Feature Flags de Degradação Graciosa
 16. [Checklist de Conformidade do Auditor Externo](#16-checklist-de-conformidade-do-auditor-externo)
+17. [Guia Exaustivo de Auditoria de Pequenos Bugs e Casos de Borda](#17-guia-exaustivo-de-auditoria-de-pequenos-bugs-e-casos-de-borda-análise-linha-a-linha)
 - [Apêndice A: Dicionário de Erros e Motivos de Falha](#apêndice-a-dicionário-de-erros-e-motivos-de-falha)
 - [Apêndice B: Exemplos de Payloads Webhook dos Provedores](#apêndice-b-exemplos-de-payloads-webhook-dos-provedores)
 - [Apêndice C: Matriz de Rastreabilidade dos 22 Eixos de Auditoria](#apêndice-c-matriz-de-rastreabilidade-dos-22-eixos-de-auditoria)
@@ -1039,6 +1040,42 @@ Matriz executável com verificação mecânica de código e teste para cada requ
   "messageId": "ZA12345678"
 }
 ```
+
+---
+
+## 17. GUIA EXAUSTIVO DE AUDITORIA DE PEQUENOS BUGS E CASOS DE BORDA (ANÁLISE LINHA A LINHA)
+
+Esta seção detalha o comportamento do AutoCare V2 em cenários de borda para apoiar auditorias profundas independentes:
+
+### 17.1 Normalização e Parsing de Placas (Mercosul vs Tradicional)
+- **Arquivo e Linha:** `src/application/services/parsers.py:12` (`normalize_plate`)
+- **Comportamento:** Remove caracteres não alfanuméricos e converte para maiúsculo. Valida contra os padrões `^[A-Z]{3}[0-9]{4}$` (Cinza tradicional) e `^[A-Z]{3}[0-9][A-Z][0-9]{2}$` (Mercosul).
+- **Caso de Borda sob Auditoria:** Placas enviadas com espaços (ex: `"ABC 1234"` ou `"ABC 1D23"`) são normalizadas para `"ABC1234"`. Placas concatenadas diretamente a nomes sem separador exigem desambiguação no Turno 2.
+
+### 17.2 Validação de Datas de Calendário e Viradas de Ano
+- **Arquivo e Linha:** `src/application/services/parsers.py:65` (`parse_date_br`) e `src/interfaces/api/webhook.py:361` (`_parse_due_datetime`)
+- **Comportamento:** Valida contra o calendário civil estrito com `datetime.strptime(..., "%d/%m/%Y")`. Datas impossíveis como `31/02/2026` ou `29/02/2025` retornam `None`, disparando a rejeição determinística com motivo `invalid_date`.
+- **Caso de Borda sob Auditoria:** Menções relativas complexas ancoram-se no fuso horário de Brasília injetado no prompt (`src/config/clock.py:22`).
+
+### 17.3 Parsing de Valores Monetários e Notação Numérica Brasileira
+- **Arquivo e Linha:** `src/application/services/parsers.py:180` (`parse_monetary_value`)
+- **Comportamento:** Suporta notações brasileiras (`"R$ 1.250,50"`, `"1250,50"`, `"250 conto"`, `"300 reais"`). Converte vírgula decimal para ponto flutuante após descartar separadores de milhar.
+
+### 17.4 Concorrência em Rajada de Webhook (Debounce Buffer vs TurnLock)
+- **Arquivo e Linha:** `src/interfaces/api/webhook.py:50` (`MessageDebouncer`) e `src/application/services/conversation.py:151` (`_TurnLock`)
+- **Comportamento:** Mensagens recebidas no intervalo de 2.0s por um mesmo remetente são enfileiradas no buffer in-memory do `MessageDebouncer`. O processamento real do lote ocorre sob o context manager `async with self._get_user_lock(user_id):` com `WeakValueDictionary`.
+
+### 17.5 Rollback Atômico e Sanitização de Listas de Sucesso (R1)
+- **Arquivo e Linha:** `src/interfaces/api/webhook.py:865` (`_persist_confirmed_data`)
+- **Comportamento:** A regra R1 proíbe mutação in-place por `.clear()` e exige reatribuição atômica `outcome["success"] = []` no bloco de captura de exceção.
+
+### 17.6 Isolamento de Lembrete Encadeado sem Commit Prematuro (R3)
+- **Arquivo e Linha:** `src/interfaces/api/webhook.py:623` (`_persist_chained_reminder`)
+- **Comportamento:** Eliminação definitiva de `LembreteRepository.create()`, substituindo-o por `db.add(lembrete)` seguido exclusivamente de `await db.flush()`. Em falha na transação pai, o rollback anula o lembrete.
+
+### 17.7 Desambiguação de Veículos por Substituição Limpa (R2)
+- **Arquivo e Linha:** `src/application/services/conversation.py:438` (`process_turn`)
+- **Comportamento:** O texto original do condutor armazenado em `context.pending_ambiguous_message` substitui integralmente a mensagem do turno (`clean_text = context.pending_ambiguous_message`), eliminando interpolações de strings espúrias.
 
 ---
 
