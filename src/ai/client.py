@@ -132,12 +132,12 @@ class GeminiClient:
                 )
 
         if not self.is_available():
-            return self._build_offline_fallback(
-                current_message,
-                context=context,
-                vehicles=vehicles,
-                maintenances=maintenances,
-                history=history,
+            return GeminiAnalysisResponse(
+                intent=IntentType.UNKNOWN,
+                confidence=ConfidenceLevel.LOW,
+                is_critical_action=False,
+                reply_message="⚙️ O assistente está em manutenção de configuração de IA. Tente novamente em instantes.",
+                reasoning="Chave de API do Gemini não configurada",
             )
 
         # Guardrail 2: somente as últimas N interações do histórico seguem para a API
@@ -166,10 +166,15 @@ class GeminiClient:
             except Exception as e:
                 last_error = e
                 err_str = str(e)
-                # Se a chave de API estiver sem cota (429) ou erro 4xx, abre circuit breaker curto e não bloqueia
-                if cb_enabled and any(code in err_str for code in ("HTTP 429", "HTTP 401", "HTTP 403", "HTTP 400", "HTTP 404")):
-                    self._circuit_open_until = _time.monotonic() + 30.0
+                # Interrupção imediata e abertura do circuit breaker APENAS se a chave for inválida (401 / 403)
+                if any(code in err_str for code in ("HTTP 401", "HTTP 403")):
+                    if cb_enabled:
+                        self._circuit_open_until = _time.monotonic() + 30.0
+                    logger.warning("Falha de autenticação com a API Gemini no modelo %s: %s. Interrompendo chamadas.", model_name, e)
                     break
+
+                # Erros HTTP 404, 429, 400 ou 5xx: warning e tenta o fallback_model
+                logger.warning("Modelo %s falhou com erro (%s). Tentando próximo modelo...", model_name, e)
                 continue
 
         # Se todas as tentativas falharem, aciona o Fallback Handler
@@ -371,19 +376,7 @@ class GeminiClient:
         maintenances: Optional[List[Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> GeminiAnalysisResponse:
-        """Fallback seguro em caso de indisponibilidade ou timeout excedido."""
-        # Tenta interpretar localmente pelo motor de fallback offline
-        offline_res = self._build_offline_fallback(
-            message,
-            context=context,
-            vehicles=vehicles,
-            maintenances=maintenances,
-            history=history,
-        )
-        if offline_res.intent != IntentType.UNKNOWN:
-            return offline_res
-
-        clean = message.lower().strip()
+        clean = (message or "").lower().strip()
         if any(w in clean for w in ["ok", "valeu", "show", "beleza", "obrigado", "combinado"]):
             return GeminiAnalysisResponse(
                 intent=IntentType.POLITE_CLOSING,
@@ -398,13 +391,10 @@ class GeminiClient:
             confidence=ConfidenceLevel.LOW,
             is_critical_action=False,
             reply_message=(
-                "😅 Desculpe, estou processando muitas mensagens agora, pode repetir em instantes?\n\n"
-                "Exemplos de como falar comigo:\n"
-                "• *Troquei óleo e filtro hoje com 145 mil km*\n"
-                "• *Me lembra de calibrar pneus na sexta*\n"
-                "• *Menu* (ver opções da sua garagem)"
+                "😅 Tive uma oscilação momentânea na conexão com o sistema de inteligência. "
+                "Pode repetir sua mensagem em instantes?"
             ),
-            reasoning=f"Contingência de Timeout/Erro: {error_detail}"
+            reasoning=f"Falha de API do Gemini: {error_detail}"
         )
 
     def _build_offline_fallback(
@@ -415,9 +405,10 @@ class GeminiClient:
         maintenances: Optional[List[Any]] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> GeminiAnalysisResponse:
-        """Delegação fina: a lógica vive em `src.ai.offline_fallback` (sem ciclo de import)."""
-        return build_offline_fallback(
+        """Delegação direta para contingência amigável em modo offline (AI-First puro)."""
+        return self._build_contingency_fallback(
             message,
+            "offline_mode",
             context=context,
             vehicles=vehicles,
             maintenances=maintenances,

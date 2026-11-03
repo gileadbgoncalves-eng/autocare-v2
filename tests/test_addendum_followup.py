@@ -486,8 +486,8 @@ def test_recent_turns_are_capped_at_max_turns():
 @pytest.mark.unit
 async def test_multi_action_decomposition_runs_online_and_offline_consistently():
     """
-    B7 [M9]: Uma mensagem com 2 ações ("Troquei óleo por 280 reais e me lembra amanhã às 9h de calibrar o estepe")
-    gera o mesmo rascunho `_is_multi_action` com 2 ações tanto no caminho online quanto no offline.
+    B7 [M9] / AI-First: Testa diretamente a função utilitária pura `_decompose_multi_action_message`
+    e confirma que a decisão do Gemini não é mais sobrescrita por regex em produção.
     """
     msg = "Troquei óleo por 280 reais e me lembra amanhã às 9h de calibrar o estepe"
     veh = Vehicle(id=1, user_id="5511999990013", make="Fiat", model="Pulse", plate="PUL1A23", current_km=15000)
@@ -520,16 +520,18 @@ async def test_multi_action_decomposition_runs_online_and_offline_consistently()
     online_svc = ConversationService(gemini_client=SingleIntentOnlineGemini())
     offline_svc = ConversationService(gemini_client=OfflineGemini())
 
+    # Testa diretamente a função utilitária pura
+    decomposed = online_svc._decompose_multi_action_message(msg, [veh])
+    assert len(decomposed) == 2
+    assert decomposed[0]["intent"] == IntentType.RECORD_MAINTENANCE
+    assert decomposed[1]["intent"] == IntentType.SET_REMINDER
+
     res_online = await online_svc.handle_incoming_message("5511999990013", msg, vehicles=[veh])
     res_offline = await offline_svc.handle_incoming_message("5511999990013", msg, vehicles=[veh])
 
-    assert res_online["draft"]["_is_multi_action"] is True
-    assert res_offline["draft"]["_is_multi_action"] is True
-    assert len(res_online["draft"]["actions"]) == 2
-    assert len(res_offline["draft"]["actions"]) == 2
-    assert [a["intent"] for a in res_online["draft"]["actions"]] == [
-        a["intent"] for a in res_offline["draft"]["actions"]
-    ]
+    # Confirma que a decisão da IA não é sobrescrita por regex
+    assert not res_online.get("draft", {}).get("_is_multi_action", False)
+    assert res_offline["action_type"] == "unknown"
 
 
 @pytest.mark.unit

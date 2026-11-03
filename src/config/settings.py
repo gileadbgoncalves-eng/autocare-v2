@@ -40,9 +40,9 @@ class Settings(BaseSettings):
 
     # 2. Google Gemini AI (Cérebro NLP)
     GEMINI_API_KEY: str = Field(default="", description="Chave de API do Google AI Studio / Gemini")
-    GEMINI_PRIMARY_MODEL: str = Field(default="gemini-flash-lite-latest", description="Modelo veloz e inteligente para análise de intenções")
+    GEMINI_PRIMARY_MODEL: str = Field(default="gemini-2.5-flash", description="Modelo veloz e inteligente para análise de intenções")
     GEMINI_FALLBACK_MODEL: str = Field(default="gemini-2.0-flash-lite", description="Modelo alternativo para contingência de timeout")
-    GEMINI_TIMEOUT_SECONDS: float = Field(default=4.0, description="Timeout estrito para requisições de IA")
+    GEMINI_TIMEOUT_SECONDS: float = Field(default=12.0, description="Timeout estrito para requisições de IA")
     GEMINI_MAX_RETRIES: int = Field(default=2, description="Tentativas rápidas em 5xx")
     GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=400, description="Teto de tokens de saída por chamada (guardrail de custo: 250-400)")
     GEMINI_HISTORY_MAX_TURNS: int = Field(default=5, description="Quantidade máxima de turnos do histórico enviados à API")

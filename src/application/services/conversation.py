@@ -492,14 +492,6 @@ class ConversationService:
             return {"reply": analysis.reply_message, "action_type": "async_superseded_completed", "state": live_ctx.state.value}
         context = live_ctx
 
-        # B7 (M9): Pré/pós-processamento unificado de múltiplas ações (roda online e offline)
-        decomposed_actions = self._decompose_multi_action_message(clean_text, vehicles)
-        if len(decomposed_actions) >= 2 and len(analysis.actions or []) < 2:
-            analysis.actions = [
-                ActionDraft(**act) if isinstance(act, dict) else act
-                for act in decomposed_actions
-            ]
-
         # 5.1 Edição do Último Serviço Salvo (prioritário sobre qualquer alucinação de upsert_draft)
         tool_calls_to_run = []
         if analysis.tool_calls:
@@ -557,192 +549,6 @@ class ConversationService:
             self._record_assistant_turn(context, hist_res["reply"])
             self.update_context(context)
             return hist_res
-
-        # 5.5 Fallback Local quando Offline
-        gemini_failed = (
-            not getattr(self.gemini, "is_available", lambda: True)()
-            or analysis.confidence == ConfidenceLevel.LOW
-            or "não está configurada" in (analysis.reply_message or "")
-            or "desculpe, estou processando muitas mensagens" in (analysis.reply_message or "").lower()
-        )
-        if analysis.intent == IntentType.UNKNOWN and gemini_failed:
-            clean_no_punct = re.sub(r"[^\w\s]", "", text_lower).strip()
-
-            # Encerramento educado
-            courtesies = {"ok", "valeu", "show", "beleza", "obrigado", "obrigada", "combinado", "perfeito"}
-            if clean_no_punct in courtesies or (any(w in clean_no_punct for w in ("show", "valeu", "obrigado")) and len(clean_no_punct.split()) <= 4):
-                context.state = ConversationState.NORMAL
-                context.draft_payload = None
-                reply = "Show de bola! Qualquer novidade ou manutenção no seu veículo, estou por aqui. Um abraço! 👍"
-                self._record_assistant_turn(context, reply)
-                self.update_context(context)
-                return {"reply": reply, "action_type": "polite_closing", "state": context.state.value, "details": {}}
-
-            # Múltiplas ações offline (usa a mesma decomposição `decomposed_actions`)
-            if len(decomposed_actions) >= 2:
-                conf_res = self._initiate_multi_action_confirmation_flow(
-                    context, decomposed_actions, discrepancy_warning=discrepancy_warning,
-                    matched_veh=matched_veh, vehicles=vehicles,
-                )
-                self._record_assistant_turn(context, conf_res["reply"])
-                self.update_context(context)
-                return conf_res
-
-            # Check-up da garagem offline
-            if self._is_garage_checkup_query(text_lower):
-                garage_res = await self._handle_garage_checkup(user_id=user_id, vehicles=vehicles, maintenances=maintenances, reminders=reminders)
-                self._record_assistant_turn(context, garage_res["reply"])
-                self.update_context(context)
-                return garage_res
-
-            # Status de veículo individual por placa ou modelo
-            plate_match = re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text)
-            if plate_match and any(k in text_lower for k in ("status", "situa", "dados", "como ta", "como está")):
-                clean_plate = re.sub(r"[\s\-]", "", plate_match.group(1)).upper()
-                st_res = await self._query_vehicle_status_by_plate(clean_plate, vehicles, maintenances)
-                if st_res:
-                    self._record_assistant_turn(context, st_res["reply"])
-                    self.update_context(context)
-                    return st_res
-
-            if matched_veh and any(k in text_lower for k in ("status", "situa", "como ta", "como está", "em dia")):
-                st_res = self._format_single_vehicle_status(matched_veh, maintenances)
-                self._record_assistant_turn(context, st_res["reply"])
-                self.update_context(context)
-                return st_res
-
-            # 1. Upsert de manutenção explícita offline (processa ANTES de registration para não confundir 'troquei óleo do Nivus')
-            is_revisao_query = any(q in text_lower for q in (
-                "tem alguma", "tem alguma revisão", "tem alguma revisao", "alguma revisão", "alguma revisao",
-                "tem revisão", "tem revisao", "revisão vencendo", "revisao vencendo", "vencendo",
-                "o que trocar", "o que preciso", "qual a revisão", "qual a revisao", "quando vence", "quando é"
-            ))
-            maint_verbs = ("troquei", "trocou", "troca", "fiz", "realizei", "coloquei", "gastei", "paguei")
-            has_maint_verb = any(v in text_lower for v in maint_verbs)
-            has_past_revisao = ("revisão" in text_lower or "revisao" in text_lower) and not is_revisao_query and any(w in text_lower for w in ("fiz", "feita", "realizada", "feitas", "passada", "anterior", "concluída", "concluida"))
-            is_maint = (
-                (has_maint_verb or has_past_revisao or bool(extract_maintenance_items_strict(clean_text) and (parse_cost_value(clean_text) or " em " in text_lower or "/" in clean_text)))
-                and not (is_revisao_query and parse_km_value(text_lower) is not None and not parse_cost_value(clean_text))
-            )
-            if is_maint:
-                # O fallback NÃO deve emular rascunhos cumulativos caso já exista rascunho
-                if context.is_awaiting_confirmation() or context.draft_payload:
-                    reply = "⚠️ Não foi possível mesclar os itens no rascunho no momento devido à indisponibilidade temporária da IA. Por favor, tente novamente em instantes."
-                    self._record_assistant_turn(context, reply)
-                    self.update_context(context)
-                    return {"reply": reply, "action_type": "offline_error", "state": context.state.value}
-                upsert_res = self._upsert_maintenance_draft(context=context, analysis=analysis, clean_text=clean_text, vehicles=vehicles, matched_veh=matched_veh, discrepancy_warning=discrepancy_warning)
-                self._record_assistant_turn(context, upsert_res["reply"])
-                self.update_context(context)
-                return upsert_res
-
-            # 2. Cadastro de veículo offline
-            registration_verbs = ("cadastr", "adicion", "tenho um", "tenho uma", "comprei", "meu carro", "minha moto")
-            matched_spec = find_popular_vehicle_spec(clean_text)
-            has_plate = bool(re.search(r"\b([A-Za-z]{3}[-\s]?[0-9][A-Za-z0-9][0-9]{2})\b", clean_text))
-            if matched_veh and not any(rv in text_lower for rv in registration_verbs):
-                is_registration = False
-            else:
-                is_registration = any(rv in text_lower for rv in registration_verbs) or bool(matched_spec) or (has_plate and not vehicles)
-
-            if is_registration:
-                make = matched_spec["make"] if matched_spec else "Veículo"
-                model = matched_spec["model"] if matched_spec else "Carro"
-                plate_val = plate_match.group(1).replace("-", "").upper() if plate_match else None
-                year_m = re.search(r"\b(19\d{2}|20\d{2})\b", clean_text)
-                year_val = int(year_m.group(1)) if year_m else None
-                v_draft = VehicleDraft(
-                    make=make, model=model,
-                    version=matched_spec.get("version") if matched_spec else None,
-                    engine=matched_spec.get("engine") if matched_spec else None,
-                    transmission=matched_spec.get("transmission") if matched_spec else None,
-                    steering=matched_spec.get("steering") if matched_spec else None,
-                    plate=plate_val,
-                    year=year_val,
-                    odometer_km=parse_km_value(text_lower),
-                )
-                analysis = GeminiAnalysisResponse(
-                    intent=IntentType.REGISTER_VEHICLE,
-                    confidence=ConfidenceLevel.HIGH,
-                    is_critical_action=True,
-                    reply_message=f"Cadastro do veículo {model} identificado.",
-                    vehicle=v_draft,
-                    target_vehicle_ref=model,
-                    extracted_entities=v_draft.model_dump(exclude_none=True),
-                )
-
-            # 3. Atualização de odômetro com alerta
-            elif not parse_cost_value(clean_text) and parse_km_value(text_lower) is not None and any(k in text_lower for k in ("km", "hodometro", "estou com", "rodou", "atualiza", "odômetro", "bateu", "marcando")):
-                parsed_km = parse_km_value(text_lower)
-                target_veh = matched_veh or (vehicles[0] if vehicles else None)
-                target_ref = getattr(target_veh, "model", None) or getattr(target_veh, "modelo", "veículo")
-                current_km = getattr(target_veh, "current_km", None) or getattr(target_veh, "quilometragem", None)
-
-                # Detecção de retrocesso de hodômetro OU discrepância de entidade/veículo
-                if (current_km and parsed_km < current_km) or discrepancy_warning:
-                    context.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
-                    context.draft_payload = {
-                        "_is_odometer_rollback": bool(current_km and parsed_km < current_km),
-                        "_is_odometer_update": True,
-                        "odometer_km": parsed_km,
-                        "km": parsed_km,
-                        "current_km": current_km,
-                        "_target_vehicle_ref": target_ref,
-                    }
-                    if discrepancy_warning:
-                        context.draft_payload["_discrepancy_warning"] = discrepancy_warning
-                    context.draft_updated_at = self._utcnow()
-                    if current_km and parsed_km < current_km:
-                        reply = f"⚠️ Identifiquei que a quilometragem informada ({parsed_km:,} km) é menor que a registrada anteriormente ({current_km:,} km). Foi um erro de digitação? (Responda se deseja cancelar ou confirmar)".replace(",", ".")
-                    else:
-                        reply = f"Entendi a atualização do hodômetro com {parsed_km} km. Posso confirmar?"
-                    if discrepancy_warning:
-                        reply = f"⚠️ {discrepancy_warning}\n\n" + reply
-                    self._record_assistant_turn(context, reply)
-                    self.update_context(context)
-                    return {"reply": reply, "action_type": "awaiting_confirmation", "state": context.state.value, "draft": context.draft_payload}
-
-                sched_mark = (parsed_km // 10000) * 10000
-                exceeded = (parsed_km - sched_mark) if sched_mark > 0 else 0
-                context.state = ConversationState.NORMAL
-                context.draft_payload = None
-
-                target_veh_id = getattr(target_veh, "id", None)
-                if target_veh:
-                    target_veh.current_km = parsed_km
-
-                reply_parts = [f"✅ Hodômetro do {target_ref} atualizado para {parsed_km:,} km!".replace(",", ".")]
-                if exceeded > 0:
-                    reply_parts.append(f"🔴 ALERTA: Você passou da revisão programada ({sched_mark:,} km) em {exceeded:,} km! Recomenda-se realizar a revisão preventiva.".replace(",", "."))
-                elif any(q in text_lower for q in ("tem alguma", "revisão", "revisao", "vencendo", "o que trocar", "o que preciso")):
-                    next_rev = sched_mark + 10000
-                    rem_km = next_rev - parsed_km
-                    reply_parts.append(f"📋 A próxima revisão programada é na marca de {next_rev:,} km (faltam aproximadamente {rem_km:,} km).".replace(",", "."))
-
-                reply = "\n\n".join(reply_parts)
-                if discrepancy_warning:
-                    reply = f"⚠️ {discrepancy_warning}\n\n" + reply
-
-                self._record_assistant_turn(context, reply)
-                self.update_context(context)
-                return {
-                    "reply": reply,
-                    "action_type": "odometer_updated",
-                    "state": context.state.value,
-                    "committed_data": {
-                        "_is_odometer_update": True,
-                        "odometer_km": parsed_km,
-                        "km": parsed_km,
-                        "vehicle_id": target_veh_id,
-                        "_target_vehicle_ref": target_ref,
-                    },
-                    "details": {
-                        "odometer_km": parsed_km,
-                        "km": parsed_km,
-                        "vehicle_id": target_veh_id,
-                        "_target_vehicle_ref": target_ref,
-                    }
-                }
 
         # 5.6 Ação Crítica com Rascunho
         if analysis.is_critical_action:
@@ -1566,6 +1372,7 @@ class ConversationService:
                 "• 🔧 Manutenção registrada no seu histórico.",
                 "• ⏰ Lembrete agendado na sua garagem.",
             ]
+
             for a in acts:
                 desc = a.get("description") or a.get("task_description") or "Ação registrada"
                 target_veh = a.get("target_vehicle_ref")
