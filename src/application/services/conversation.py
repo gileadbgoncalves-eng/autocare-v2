@@ -673,11 +673,13 @@ class ConversationService:
                     reply = f"⚠️ {discrepancy_warning}\n\n" + reply
                 return {"reply": reply, "action_type": "awaiting_confirmation", "state": context.state.value, "draft": payload}
 
-        # Verificação de retrocesso de hodômetro para manutenção
+        # Verificação de retrocesso de hodômetro para manutenção com Correlação Cronológica
         km_in_maint = payload.get("odometer_km") or payload.get("km")
         if matched_veh and km_in_maint is not None:
             curr_km = getattr(matched_veh, "current_km", None) or getattr(matched_veh, "quilometragem", None)
-            if curr_km and km_in_maint < curr_km:
+            m_date = payload.get("data") or payload.get("date_str") or payload.get("date")
+            is_past = self._is_past_date_or_context(m_date, clean_text)
+            if curr_km and km_in_maint < curr_km and not is_past:
                 payload["_is_odometer_rollback"] = True
                 reply = f"⚠️ Identifiquei que a quilometragem informada ({km_in_maint:,} km) é menor que a registrada anteriormente ({curr_km:,} km). Foi um erro de digitação? (Responda se deseja cancelar ou confirmar)".replace(",", ".")
                 if discrepancy_warning:
@@ -1326,11 +1328,12 @@ class ConversationService:
         context.draft_payload = updated_payload
         context.draft_updated_at = self._utcnow()
 
-        # Verificação de retrocesso de hodômetro para manutenção
+        # Verificação de retrocesso de hodômetro para manutenção com Correlação Cronológica
         target_veh = matched_veh or (vehicles[0] if vehicles else None)
         if target_veh and final_km is not None:
             curr_km = getattr(target_veh, "current_km", None) or getattr(target_veh, "quilometragem", None)
-            if curr_km and final_km < curr_km:
+            is_past = self._is_past_date_or_context(final_data, clean_text)
+            if curr_km and final_km < curr_km and not is_past:
                 updated_payload["_is_odometer_rollback"] = True
                 reply = f"⚠️ Identifiquei que a quilometragem informada ({int(final_km):,} km) é menor que a registrada anteriormente ({int(curr_km):,} km). Foi um erro de digitação? (Responda se deseja cancelar ou confirmar)".replace(",", ".")
                 if discrepancy_warning:
@@ -1385,7 +1388,7 @@ class ConversationService:
             reply = f"✅ *Atualização do hodômetro com {km:,} km confirmada e salva!*".replace(",", ".")
         elif "make" in draft_data and "model" in draft_data and "components" not in draft_data:
             model = draft_data.get("model", "Veículo")
-            reply = "✅ *Veículo cadastrado com sucesso na sua garagem!*"
+            reply = "✅ *Veículo cadastrado com sucesso na sua garagem!*\n\nDeseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?"
         else:
             reply = "✅ *Ação confirmada e salva com sucesso no seu histórico!*"
 
@@ -1393,6 +1396,53 @@ class ConversationService:
             reply = f"⚠️ {draft_data['_discrepancy_warning']}\n\n" + reply
 
         return {"reply": reply, "action_type": "action_confirmed", "state": context.state.value, "committed_data": draft_data}
+
+    @staticmethod
+    def _is_past_date_or_context(date_val: Any, text: Optional[str] = None) -> bool:
+        """
+        Verifica se a manutenção se refere a uma data proporcionalmente no passado.
+        Permite registrar serviços passados com KM menor que a atual sem falso alarme de rollback.
+        """
+        tl = (text or "").lower()
+        past_keywords = (
+            "ano passado", "mês passado", "mes passado", "anos atrás", "meses atrás",
+            "semana passada", "semanas atrás", "antiga", "anteriormente", "quando comprei",
+            "já tinha feito", "ja tinha feito", "serviço passado", "servico passado",
+            "serviço antigo", "servico antigo", "revisão antiga", "revisao antiga",
+            "revisão passada", "revisao passada", "na época", "na epoca", "ontem"
+        )
+        if any(k in tl for k in past_keywords):
+            return True
+
+        current_year = datetime.now().year
+        past_years = [str(y) for y in range(2000, current_year)]
+        for y_str in past_years:
+            if re.search(r"\b" + y_str + r"\b", tl):
+                return True
+
+        if date_val:
+            if isinstance(date_val, (date, datetime)):
+                dt = date_val if isinstance(date_val, date) else date_val.date()
+                return dt < (date.today() - timedelta(days=14))
+            s = str(date_val).strip()
+            m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})", s)
+            if m:
+                try:
+                    d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    dt = date(y, mth, d)
+                    return dt < (date.today() - timedelta(days=14))
+                except Exception:
+                    pass
+            m2 = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", s)
+            if m2:
+                try:
+                    y, mth, d = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+                    dt = date(y, mth, d)
+                    return dt < (date.today() - timedelta(days=14))
+                except Exception:
+                    pass
+
+        return False
 
     @staticmethod
     def _detect_edit_field(text_lower: str) -> Optional[str]:

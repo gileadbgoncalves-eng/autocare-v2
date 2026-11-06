@@ -429,3 +429,85 @@ async def test_edit_last_saved_service_anti_hallucination_and_routing():
     assert res2["committed_data"]["km"] == 145000
     assert "145.000 km" in res2["reply"]
     assert ctx.pending_edit_field is None
+
+
+def test_prompts_anti_hallucination_and_onboarding_rules():
+    """Valida que o SYSTEM_INSTRUCTION contém as regras mestras de anti-alucinação e onboarding."""
+    # 1. Anti-Alucinação de Especificações
+    assert "NUNCA presuma ou preencha automaticamente especificações opcionais" in SYSTEM_INSTRUCTION
+    assert "Palio 2008" in SYSTEM_INSTRUCTION
+    # 2. Obrigatoriedade do Odômetro no Onboarding
+    assert "Durante o cadastro de um novo veículo, é OBRIGATÓRIO solicitar a quilometragem" in SYSTEM_INSTRUCTION
+    # 3. Gatilho de Manutenções Pendentes
+    assert "Deseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?" in SYSTEM_INSTRUCTION
+    # 4. Correlação Cronológica
+    assert "É PERMITIDO registrar uma manutenção com quilometragem inferior à atual" in SYSTEM_INSTRUCTION
+
+
+@pytest.mark.asyncio
+async def test_vehicle_registration_confirmation_triggers_maintenance_engagement():
+    """Valida que o pós-cadastro engaja o motorista perguntando sobre manutenções passadas/pendentes."""
+    service = ConversationService()
+    user_id = "5511999990099"
+    ctx = service.get_context(user_id)
+    ctx.state = ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
+    ctx.draft_payload = {
+        "make": "Volkswagen",
+        "model": "Nivus",
+        "plate": "RJA1B23",
+        "engine": "1.0 Turbo",
+        "odometer_km": 15000,
+    }
+
+    res = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="sim, pode salvar",
+        vehicles=[],
+    )
+
+    assert res["action_type"] == "action_confirmed"
+    assert "Veículo cadastrado com sucesso na sua garagem!" in res["reply"]
+    assert "Deseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?" in res["reply"]
+
+
+@pytest.mark.asyncio
+async def test_retroactive_past_maintenance_allowed_without_rollback_warning():
+    """Valida que manutenção proporcionalmente no passado com KM menor que a atual não bloqueia com alarme de erro."""
+    service = ConversationService()
+    user_id = "5511999990088"
+    from src.domain.entities import Vehicle
+    civic = Vehicle(id=1, user_id=user_id, make="Honda", model="Civic", current_km=80000)
+
+    # Serviço feito no passado com 50.000 km (menor que os 80.000 km atuais do carro)
+    res = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="Troquei as pastilhas de freio do Civic ano passado com 50000 km por 350 reais",
+        vehicles=[civic],
+    )
+
+    assert res["action_type"] == "awaiting_confirmation"
+    # Não deve disparar o alarme de erro de digitação/retrocesso
+    assert "menor que a registrada anteriormente" not in res["reply"]
+    assert "Foi um erro de digitação?" not in res["reply"]
+    assert res["draft"].get("_is_odometer_rollback") is not True
+
+
+@pytest.mark.asyncio
+async def test_current_date_retrograde_km_triggers_rollback_warning():
+    """Valida que manutenção em data recente/hoje com KM menor que a atual continua disparando o aviso de erro de digitação."""
+    service = ConversationService()
+    user_id = "5511999990077"
+    from src.domain.entities import Vehicle
+    civic = Vehicle(id=1, user_id=user_id, make="Honda", model="Civic", current_km=80000)
+
+    # Serviço relatado hoje com KM menor sem justificativa temporal
+    res = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="Troquei as pastilhas de freio do Civic hoje com 20000 km por 350 reais",
+        vehicles=[civic],
+    )
+
+    assert res["action_type"] == "awaiting_confirmation"
+    assert "menor que a registrada anteriormente" in res["reply"]
+    assert "Foi um erro de digitação?" in res["reply"]
+    assert res["draft"].get("_is_odometer_rollback") is True
