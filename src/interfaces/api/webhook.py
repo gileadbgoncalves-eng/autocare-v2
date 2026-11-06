@@ -59,7 +59,6 @@ class MessageDebouncer:
         self._buffers: Dict[str, List[str]] = {}
         self._futures: Dict[str, asyncio.Future] = {}
         self._timer_tasks: Dict[str, asyncio.Task] = {}
-        # B5 (M7): WeakValueDictionary evita vazamento ilimitado de locks por user_id inativo
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     @property
@@ -81,11 +80,6 @@ class MessageDebouncer:
         message_text: str,
         process_fn,
     ) -> Dict[str, Any]:
-        """
-        Adiciona a mensagem à fila de espera do usuário.
-        Se debounce_seconds <= 0, processa imediatamente.
-        Caso contrário, inicia ou reseta a janela de debounce.
-        """
         if self.debounce_seconds <= 0:
             return await process_fn(user_id, message_text)
 
@@ -149,12 +143,10 @@ class MessageDebouncer:
 
 message_debouncer = MessageDebouncer()
 
-
 MAX_MESSAGE_CHARS = 2000
 
 
 def _extract_non_empty_text(raw: Any) -> Optional[str]:
-    """A5 (S3): extrai o texto do payload sem truncar durante o parse."""
     if raw is None:
         return None
     text = str(raw).strip()
@@ -162,7 +154,6 @@ def _extract_non_empty_text(raw: Any) -> Optional[str]:
 
 
 def _sanitize_message_text(raw: Any, user_id: Optional[str] = None) -> Optional[str]:
-    """A5 (S3): normaliza e trunca `message_text` APÓS `parse_whatsapp_payload`."""
     text = _extract_non_empty_text(raw)
     if not text:
         return None
@@ -173,7 +164,6 @@ def _sanitize_message_text(raw: Any, user_id: Optional[str] = None) -> Optional[
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
-    """B4: devolve `value` se for dict, senão {} (cobre None, str, list...)."""
     return value if isinstance(value, dict) else {}
 
 
@@ -182,13 +172,11 @@ def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Opti
     if not payload:
         return None, None
 
-    # 1. Payload de teste direto ({user_id, message} ou {user_id, text})
     if "user_id" in payload and ("message" in payload or "text" in payload):
         user_id = "".join(filter(str.isdigit, str(payload["user_id"])))
         raw_msg = payload.get("message") if "message" in payload else payload.get("text")
         return user_id, _extract_non_empty_text(raw_msg)
 
-    # 2. Formato Evolution API
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     key = _as_dict(data.get("key")) if isinstance(data, dict) else {}
     if key.get("fromMe", False) or payload.get("fromMe", False):
@@ -211,7 +199,6 @@ def parse_whatsapp_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Opti
         if clean:
             return user_id, clean
 
-    # 3. Formato Z-API
     if payload.get("isGroup", False) or payload.get("fromMe", False):
         return None, None
     phone = payload.get("phone") or payload.get("senderPhone") or payload.get("connectedPhone")
@@ -235,11 +222,9 @@ def resolve_target_vehicle(
     payload_hint: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
     """
-    B2 (C6): Resolve o ID do veículo alvo com ordem determinística:
-    (1) placa exata (`plate_alias`) ->
-    (2) `make + model` ou `model` exato (`model_alias`) ->
-    (3) fuzzy `difflib` com `ratio >= 0.85` ->
-    (4) se >= 2 veículos empatarem na mesma consulta sem placa desambiguadora, retorna `None`.
+    Resolve o ID do veículo alvo com ordem determinística:
+    (1) placa exata -> (2) make + model ou model exato -> (3) fuzzy difflib ratio >= 0.85 ->
+    (4) se >= 2 veículos empatarem sem placa desambiguadora, retorna None.
     """
     if not vehicles:
         return None
@@ -256,7 +241,6 @@ def resolve_target_vehicle(
     type_hint = (str(hint.get("vehicle_type") or "")).strip().lower()
     model_hint = (str(hint.get("model") or "")).strip().lower()
 
-    # 1. Correspondência exata por placa (`plate_alias`)
     for v in vehicles:
         v_plate = v.plate_alias if isinstance(v, Vehicle) else (getattr(v, "plate", None) or getattr(v, "placa", "") or "").upper().replace("-", "").strip()
         if v_plate:
@@ -265,7 +249,6 @@ def resolve_target_vehicle(
             if ref_clean and (v_plate.lower() in ref_clean or ref_clean == v_plate.lower()):
                 return v.id
 
-    # 2. Correspondência exata por `make + model` ou `model` (`model_alias`)
     exact_matches: List[Vehicle] = []
     query_candidates = [q for q in (ref_clean, model_hint) if q]
     for v in vehicles:
@@ -289,9 +272,8 @@ def resolve_target_vehicle(
     if len(exact_matches) == 1:
         return exact_matches[0].id
     if len(exact_matches) >= 2:
-        return None  # B2 (C6): ambiguidade entre veículos de mesmo modelo -> requer desambiguação por placa
+        return None
 
-    # 3. Correspondência por tipo de veículo (moto vs carro), somente se único
     is_moto = any(m in ref_clean for m in ["moto", "motoca", "motocicleta", "cg", "fazer", "titan", "biz", "twister", "scooter"]) or type_hint == "moto"
     is_carro = any(c in ref_clean for c in ["carro", "automovel", "caranga", "veiculo", "caminhonete", "suv", "sedan", "hatch"]) or type_hint in ("carro", "caminhonete")
 
@@ -312,7 +294,6 @@ def resolve_target_vehicle(
         if len(carro_matches) >= 2:
             return None
 
-    # 4. Fuzzy Matching por similaridade aproximada (`ratio >= 0.85`)
     import difflib
     ref_words = ref_clean.split()
     fuzzy_scored: List[Tuple[Vehicle, float]] = []
@@ -336,9 +317,8 @@ def resolve_target_vehicle(
     if len(fuzzy_scored) == 1:
         return fuzzy_scored[0][0].id
     if len(fuzzy_scored) >= 2:
-        return None  # B2 (C6): múltiplos candidatos no fuzzy -> ambíguo
+        return None
 
-    # Se há múltiplos veículos com o mesmo model_alias na garagem, não chuta o primeiro
     model_aliases = [v.model_alias if isinstance(v, Vehicle) else (getattr(v, "model", "") or "").strip().lower() for v in vehicles]
     if len(set(model_aliases)) < len(model_aliases):
         return None
@@ -360,13 +340,9 @@ _MONTHS_PT = {
 
 def _parse_due_datetime(raw_dt: Any, date_str: Optional[str] = None, explicit_time: Optional[str] = None) -> Optional[datetime]:
     """
-    Converte e normaliza data/hora de vencimento para lembretes (A2 [B5] / B4 [M6]).
-
-    Ordem de resolução: datetime/ISO -> data absoluta numérica (`DD/MM` ou `DD/MM/YYYY`)
-    -> data textual (`31 de fevereiro`) -> "amanhã" -> hoje.
-    Data impossível (numérica ou textual, ex.: `31/02/2026` ou `31 de fevereiro`) devolve `None`
-    para o chamador abortar a gravação e reabrir o rascunho.
-    Retorna sempre `datetime` UTC-aware (`tzinfo=timezone.utc`).
+    Converte e normaliza data/hora de vencimento para lembretes.
+    Data inexistente no calendário devolve None para o chamador abortar a gravação e reabrir o rascunho.
+    Retorna sempre datetime UTC-aware.
     """
     if isinstance(raw_dt, datetime):
         return raw_dt if raw_dt.tzinfo is not None else raw_dt.replace(tzinfo=timezone.utc)
@@ -431,14 +407,11 @@ def _parse_due_datetime(raw_dt: Any, date_str: Optional[str] = None, explicit_ti
 
 def _parse_maintenance_date(raw_date: Any, default_date: date) -> Optional[date]:
     """
-    Extrai a data de um registro de manutenção (C3).
-
-    - Vazio / "hoje" -> `default_date`; "ontem"/"anteontem" -> relativo ao default.
-    - ISO, DD/MM/YYYY, DD-MM-YYYY, DD/MM (ano do default) e "15 de fevereiro [de 2026]".
-    - Data EXPLÍCITA porém impossível (31/02, mês 13...) -> **None** (antes caía em `default_date`
-      e gravava a manutenção com a data de hoje sem avisar). O chamador deve tratar None como
-      `invalid_date` e pedir confirmação ao usuário.
-    - Texto sem nenhuma data reconhecível (ex.: "semana passada") mantém `default_date`.
+    Extrai e valida a data de um registro de manutenção:
+    - Vazio / "hoje" -> default_date; "ontem"/"anteontem" -> relativo ao default.
+    - Expressões relativas passadas ("semana passada", "mês passado", "ano passado", "há X dias/semanas/meses/anos").
+    - ISO, DD/MM/YYYY, DD-MM-YYYY, DD/MM e data textual em português.
+    - Data explícita porém inexistente no calendário -> None (tratado como invalid_date).
     """
     if isinstance(raw_date, datetime):
         return raw_date.date()
@@ -455,6 +428,29 @@ def _parse_maintenance_date(raw_date: Any, default_date: date) -> Optional[date]
         return default_date - timedelta(days=1)
     if low == "anteontem":
         return default_date - timedelta(days=2)
+    if "semana passada" in low:
+        return default_date - timedelta(days=7)
+    if "mês passado" in low or "mes passado" in low:
+        return default_date - timedelta(days=30)
+    if "ano passado" in low:
+        return default_date - timedelta(days=365)
+
+    m_rel = re.search(
+        r"(?:h[aá]\s+)?(\d+|um|uma)\s*(dia|dias|semana|semanas|m[eê]s|meses|ano|anos)(?:\s+atr[aá]s)?",
+        low,
+    )
+    if m_rel and ("há" in low or "ha " in low or "atrás" in low or "atras" in low):
+        qty_raw = m_rel.group(1)
+        qty = 1 if qty_raw in ("um", "uma") else int(qty_raw)
+        unit = m_rel.group(2)
+        if unit.startswith("dia"):
+            return default_date - timedelta(days=qty)
+        if unit.startswith("semana"):
+            return default_date - timedelta(days=qty * 7)
+        if unit.startswith("m"):
+            return default_date - timedelta(days=qty * 30)
+        if unit.startswith("ano"):
+            return default_date - timedelta(days=qty * 365)
 
     m_iso = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", s)
     if m_iso:
@@ -486,12 +482,6 @@ def _parse_maintenance_date(raw_date: Any, default_date: date) -> Optional[date]
 
     return default_date
 
-
-# ----------------------------------------------------------------------------
-# Persistência (B6 / B7 / B13 / C3 / A2 / A3)
-# `_persist_confirmed_data` NUNCA mascara falhas: devolve {"success": [...], "failed": [...]}
-# e garante atomicidade transacional do lote (commit único ao final ou rollback integral).
-# ----------------------------------------------------------------------------
 
 PersistOutcome = Dict[str, List[Any]]
 
@@ -539,9 +529,20 @@ async def _persist_maintenance(
         _fail(outcome, label, "vehicle_not_found")
         return
     parsed_date = _parse_maintenance_date(f["raw_date"], now_ts.date())
-    if parsed_date is None:  # C3: data explícita impossível -> não grava com "hoje"
+    if parsed_date is None:
         _fail(outcome, label, "invalid_date", raw_date=str(f["raw_date"]))
         return
+    if f["km"] is not None:
+        target_veh = await vehicle_repo.get_by_id(vehicle_id)
+        if (
+            target_veh
+            and target_veh.current_km is not None
+            and int(f["km"]) < target_veh.current_km
+            and parsed_date >= now_ts.date()
+            and not data.get("_allow_regressive_km")
+        ):
+            _fail(outcome, label, "regressive_km", km=int(f["km"]), current_km=target_veh.current_km)
+            return
     new_maint = MaintenanceRecord(
         vehicle_id=vehicle_id,
         user_id=user_id,
@@ -576,8 +577,6 @@ async def _persist_reminder(
 ) -> None:
     label = f"Lembrete: {description}"
     due_dt = _parse_due_datetime(raw_due, date_str=date_str, explicit_time=explicit_time)
-    # A2 (B5): se `due_dt is None` (data impossível numérica ou textual), falha explicitamente
-    # mesmo quando `due_km` estiver presente ou ausente, sem chamar `add_reminder`.
     if due_dt is None:
         _fail(outcome, label, "invalid_date", raw_date=str(date_str or raw_due))
         return
@@ -587,7 +586,7 @@ async def _persist_reminder(
             vehicle_id=vehicle_id,
             description=description,
             due_datetime=due_dt,
-            data_hora_agendada=due_dt,  # B6: o scheduler lê data_hora_agendada
+            data_hora_agendada=due_dt,
             due_km=int(due_km) if due_km else None,
             created_at=now_ts,
         ),
@@ -604,7 +603,7 @@ async def _persist_chained_reminder(
     now_ts: datetime,
     outcome: PersistOutcome,
 ) -> None:
-    """B7 / A2: lembrete encadeado (ex.: 'registre a troca e me lembre em 31/02'); roda em QUALQUER fluxo."""
+    """Persiste lembrete encadeado junto com a ação principal."""
     c_rem = committed_data.get("chained_reminder")
     if not c_rem:
         return
@@ -621,9 +620,6 @@ async def _persist_chained_reminder(
         raw_due, date_str, c_rem.get("explicit_time"), c_rem.get("due_km"),
         now_ts, outcome,
     )
-    # TODO(A4): remover sincronização legada após unificação de schemas.
-    # A chamada a LembreteRepository.create realizava session.commit() interno, quebrando
-    # a atomicidade transacional de lote (A3/R3). Removida em favor da persistência única via ReminderRepository.
 
 
 async def _persist_multi_actions(
@@ -697,6 +693,15 @@ async def _persist_single_action(
         or ("make" in committed_data and "model" in committed_data and "components" not in committed_data)
         or ("plate" in committed_data and "engine" in committed_data and "components" not in committed_data)
     ):
+        label = f"Veículo: {committed_data.get('make', '')} {committed_data.get('model', '')}".strip()
+        raw_plate = committed_data.get("plate")
+        if raw_plate and str(raw_plate).strip().lower() not in ("a cadastrar", "none", "null", ""):
+            clean_plate = re.sub(r"[\s\-]", "", str(raw_plate)).upper()
+            if not re.match(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$", clean_plate):
+                _fail(outcome, label, "invalid_plate", raw_plate=str(raw_plate))
+                return
+            committed_data["plate"] = clean_plate
+
         km_val = committed_data.get("current_km") or committed_data.get("odometer_km") or committed_data.get("km")
         target_veh_id = None
         if committed_data.get("vehicle_id"):
@@ -721,7 +726,6 @@ async def _persist_single_action(
             elif len(vehicles) == 1:
                 target_veh_id = vehicles[0].id
 
-        label = f"Veículo: {committed_data.get('make', '')} {committed_data.get('model', '')}".strip()
         if target_veh_id:
             await vehicle_repo.patch_vehicle_profile(
                 target_veh_id,
@@ -760,7 +764,7 @@ async def _persist_single_action(
         _ok(outcome, label)
         return
 
-    # 4. Agendamento de Lembrete (A2 [B5])
+    # 4. Agendamento de Lembrete
     if (
         action_state == "awaiting_reminder_confirm"
         or "task_description" in committed_data
@@ -831,15 +835,12 @@ async def _persist_confirmed_data(
     now_ts: datetime,
 ) -> PersistOutcome:
     """
-    Centraliza a gravação de ações confirmadas e devolve o resultado REAL (B13 / A3):
-    `{"success": [labels], "failed": [{"item", "reason", ...}]}`.
-    Atomicidade transacional de lote (A3): todos os repositórios usam `commit=False` (`flush`);
-    se qualquer sub-ação falhar (`outcome["failed"]` não vazio), executa `await session.rollback()`
-    e descarta o lote inteiro; caso contrário, executa um único `await session.commit()` ao final.
+    Centraliza a gravação de ações confirmadas e garante atomicidade transacional de lote:
+    se qualquer sub-ação falhar (outcome["failed"] não vazio), executa session.rollback()
+    e descarta o lote inteiro; caso contrário, executa um único session.commit() ao final.
     """
     outcome = _new_outcome()
     try:
-        # 1. Reset Global do Sistema / Garagem
         if (
             action_type == "system_reset"
             or committed_data.get("_reset_system")
@@ -850,19 +851,16 @@ async def _persist_confirmed_data(
             _ok(outcome, "Reset de dados")
             return outcome
 
-        # 2. Multi-Ação em Lote vs. ação única
         if committed_data.get("_is_multi_action"):
             await _persist_multi_actions(session, user_id, committed_data, vehicles, now_ts, outcome)
         else:
             await _persist_single_action(session, user_id, committed_data, vehicles, now_ts, outcome)
 
-        # 8. Lembrete encadeado (B7): sempre, antes de qualquer retorno
         await _persist_chained_reminder(session, user_id, committed_data, vehicles, now_ts, outcome)
 
-        # A3 / R1: Atomicidade do lote — se qualquer item falhou, faz rollback integral da transação
         if outcome["failed"]:
             await session.rollback()
-            outcome["success"] = []  # R1: Reatribuição atômica; nenhum _ok() é chamado após esta verificação
+            outcome["success"] = []
         else:
             await session.commit()
     except Exception as err:
@@ -880,6 +878,8 @@ _FAIL_REASONS_PT = {
     "vehicle_not_found": "não encontrei o veículo",
     "ambiguous_vehicle": "há mais de um veículo desse modelo na garagem (informe a placa)",
     "invalid_date": "a data informada não existe",
+    "invalid_plate": "a placa informada não segue o padrão brasileiro (ABC-1234 ou Mercosul ABC1D23)",
+    "regressive_km": "quilometragem inferior à atual do veículo para a data de hoje",
     "missing_km": "faltou a quilometragem",
     "unsupported_action": "tipo de ação não suportado",
     "persistence_error": "erro ao gravar no banco",
@@ -892,13 +892,8 @@ def _apply_persistence_outcome(
     committed_data: Dict[str, Any],
     outcome: PersistOutcome,
 ) -> None:
-    """
-    B13/C3/A2: reescreve `reply`/`action_type` quando a persistência falhou,
-    reabrindo o rascunho em `invalid_date` (seja manutenção ou lembrete).
-    """
     failed, success = outcome["failed"], outcome["success"]
     if not failed and not success:
-        # R5: outcome vazio (nada persistido) não é reportado como falso sucesso
         result["action_type"] = "no_op"
         result["reply"] = "Não identifiquei nenhuma ação para salvar."
         result["persistence"] = outcome
@@ -915,7 +910,6 @@ def _apply_persistence_outcome(
             "Me diga a data correta (ex.: *15/03/2026*) e eu salvo em seguida. Seus outros dados foram mantidos."
         )
         result["action_type"] = "invalid_date"
-        # R4 Guard: só reabre o rascunho se committed_data possui conteúdo restaurável
         has_restorable_content = bool(
             committed_data and any(
                 k in committed_data for k in (
@@ -952,7 +946,7 @@ async def send_whatsapp_reply(user_id: str, message: str) -> bool:
             url = f"{settings.EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{settings.EVOLUTION_INSTANCE}"
             headers = {"apikey": settings.EVOLUTION_API_KEY, "Content-Type": "application/json"}
             body = {"number": user_id, "text": message, "delay": settings.EVOLUTION_TYPING_DELAY_MS}
-            async with shared_http_client(TIMEOUT_WHATSAPP_OUTBOUND) as client:  # A7/A9: timeout explícito 5s
+            async with shared_http_client(TIMEOUT_WHATSAPP_OUTBOUND) as client:
                 await client.post(url, json=body, headers=headers, timeout=TIMEOUT_WHATSAPP_OUTBOUND)
             return True
         elif settings.PROVIDER == "zapi" and settings.ZAPI_INSTANCE_ID and settings.ZAPI_TOKEN:
@@ -975,12 +969,6 @@ async def _process_webhook_pipeline(
     session: Optional[AsyncSession] = None,
     session_factory: Any = None,
 ) -> Dict[str, Any]:
-    """
-    Executa a lógica completa de processamento conversacional, persistência e resposta.
-
-    B16: a sessão é SEMPRE aberta aqui sob demanda via `session_factory()`.
-    A5 (S3): a truncagem `MAX_MESSAGE_CHARS` ocorre aqui, APÓS `parse_whatsapp_payload`.
-    """
     sanitized_text = _sanitize_message_text(message_text, user_id) or ""
     factory = session_factory if callable(session_factory) else async_session_factory
     if session is not None:
@@ -996,10 +984,8 @@ async def _process_webhook_pipeline(
 
 
 async def _run_pipeline(session: AsyncSession, user_id: str, message_text: str) -> Dict[str, Any]:
-    # A5 (S3): garante truncagem mesmo se `_run_pipeline` for invocado diretamente
     message_text = _sanitize_message_text(message_text, user_id) or ""
 
-    # C2 (R2): mascara PII em INFO (apenas hash curto + comprimento); conteúdo só em DEBUG
     msg_hash = hashlib.sha256(message_text.encode("utf-8", errors="ignore")).hexdigest()[:8]
     logger.info("Processing user=%s msg_hash=%s len=%d", user_id, msg_hash, len(message_text))
     if getattr(settings, "DEBUG", False):
@@ -1025,13 +1011,11 @@ async def _run_pipeline(session: AsyncSession, user_id: str, message_text: str) 
     committed_data = result.get("committed_data")
     now_ts = conversation_service._utcnow()
 
-    # 1. Persistência de Ação Confirmada ou Reset (resultado real reflete na resposta - B13)
     if action_type in ("action_confirmed", "system_reset", "action_confirmed_with_chained_reminder") and committed_data:
         outcome = await _persist_confirmed_data(session, user_id, action_type, committed_data, vehicles, now_ts)
         _apply_persistence_outcome(result, user_id, committed_data, outcome)
         action_type = result.get("action_type")
 
-    # 2. Edição Direta do Último Serviço Salvo (`update_last_saved_service`)
     elif action_type == "update_last_saved_service" and committed_data:
         try:
             srv_id = committed_data.get("service_id")
@@ -1048,7 +1032,6 @@ async def _run_pipeline(session: AsyncSession, user_id: str, message_text: str) 
         except Exception as err:
             logger.error(f"Erro ao atualizar último serviço: {err}", exc_info=True)
 
-    # 3. Atualização Direta de Odômetro
     elif action_type in ("update_odometer", "odometer_updated") or (committed_data and committed_data.get("_is_odometer_update")):
         try:
             details = result.get("details") or committed_data or {}
@@ -1062,7 +1045,6 @@ async def _run_pipeline(session: AsyncSession, user_id: str, message_text: str) 
         except Exception as err:
             logger.error(f"Erro ao atualizar odômetro: {err}", exc_info=True)
 
-    # 4. Escape Global (Soft delete do último registro nos últimos 5 minutos)
     elif action_type == "undo_last_record":
         try:
             cancelled = await soft_delete_last_user_record(session, user_id, now=now_ts)
@@ -1073,7 +1055,6 @@ async def _run_pipeline(session: AsyncSession, user_id: str, message_text: str) 
             result["reply"] = "Não consegui apagar o último registro agora. Pode tentar de novo em instantes?"
         conversation_service.replace_last_assistant_turn(user_id, result["reply"])
 
-    # 5. Disparo outbound transparente
     reply_text = result.get("reply")
     if reply_text:
         await send_whatsapp_reply(user_id, reply_text)
@@ -1119,7 +1100,7 @@ async def receive_webhook(
 ) -> Dict[str, Any]:
     """
     Pipeline linear AI-First com Debounce Buffer anti-atropelo:
-    Recebe mensagem -> Rate limit (S4/C3) -> Bufferiza -> Trunca (A5) -> Executa Pipeline no LLM -> Responde.
+    Recebe mensagem -> Rate limit -> Bufferiza -> Trunca -> Executa Pipeline no LLM -> Responde.
     """
     user_id, message_text = parse_whatsapp_payload(payload)
     if not user_id or not message_text:

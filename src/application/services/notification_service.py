@@ -5,8 +5,8 @@ Motor assíncrono de notificações, consolidação em lote (batching) e agendam
 Funcionalidades:
 1. Agrupamento em lote (Batching): Consolida todos os alertas dos veículos do condutor
    em um único boletim diário elegante, eliminando mensagens fragmentadas (spam).
-2. Isolamento estrito por Foreign Key (FK): Garante que alertas de um veículo (ex: Civic)
-   nunca vazem para outro (ex: Sandero).
+2. Isolamento estrito por Foreign Key (FK): Garante que alertas de um veículo
+   nunca vazem para outro veículo da mesma garagem.
 3. Proteção contra disparo antecipado: Lembretes agendados para horários específicos
    futuros (ex: 08:00) são estritamente ignorados pelo boletim padrão das 05:00.
 4. Lembretes pontuais isolados: Disparados no minuto exato agendado e marcados como 'concluido'.

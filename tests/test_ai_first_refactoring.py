@@ -452,43 +452,183 @@ async def test_vehicle_registration_confirmation_triggers_maintenance_engagement
 
 
 @pytest.mark.asyncio
-async def test_retroactive_past_maintenance_allowed_without_rollback_warning():
-    """Valida que manutenção proporcionalmente no passado com KM menor que a atual não bloqueia com alarme de erro."""
-    service = ConversationService()
-    user_id = "5511999990088"
+async def test_adversarial_chronological_correlation_and_relative_dates_sqlite():
+    """
+    Teste Adversarial Real (SQLite + _persist_confirmed_data):
+    1. Manutenção retroativa no passado ('mês passado', 'há 1 ano', '10/01/2025') com KM menor que o atual (42.000 < 60.000)
+       DEVE ser permitida, gravando a data retroativa real no banco e preservando current_km=60.000 no veículo.
+    2. Manutenção na data de hoje ('hoje' ou sem data passada) com KM regressivo (42.000 < 60.000)
+       DEVE ser bloqueada ('regressive_km') com rollback transacional no SQLite.
+    """
+    from datetime import timedelta, timezone
+    from sqlalchemy import select
     from src.domain.entities import Vehicle
-    civic = Vehicle(id=1, user_id=user_id, make="Honda", model="Civic", current_km=80000)
+    from src.infrastructure.database.models import MaintenanceRecordModel
+    from src.infrastructure.database.repositories import VehicleRepository, UserRepository
+    from src.infrastructure.database.session import init_db, async_session_factory
+    from src.interfaces.api.webhook import _persist_confirmed_data, _parse_maintenance_date
 
-    # Serviço feito no passado com 50.000 km (menor que os 80.000 km atuais do carro)
-    res = await service.handle_incoming_message(
-        user_id=user_id,
-        message_text="Troquei as pastilhas de freio do Civic ano passado com 50000 km por 350 reais",
-        vehicles=[civic],
-    )
+    await init_db()
+    user_id = "5511999998801"
+    now_ts = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
 
-    assert res["action_type"] == "awaiting_confirmation"
-    # Não deve disparar o alarme de erro de digitação/retrocesso
-    assert "menor que a registrada anteriormente" not in res["reply"]
-    assert "Foi um erro de digitação?" not in res["reply"]
-    assert res["draft"].get("_is_odometer_rollback") is not True
+    # 1. Valida parser de datas relativas misturadas com datas absolutas e datas impossíveis
+    assert _parse_maintenance_date("mês passado", now_ts.date()) == now_ts.date() - timedelta(days=30)
+    assert _parse_maintenance_date("há 1 ano", now_ts.date()) == now_ts.date() - timedelta(days=365)
+    assert _parse_maintenance_date("há 3 meses", now_ts.date()) == now_ts.date() - timedelta(days=90)
+    assert _parse_maintenance_date("semana passada", now_ts.date()) == now_ts.date() - timedelta(days=7)
+    assert _parse_maintenance_date("10/01/2025", now_ts.date()).isoformat() == "2025-01-10"
+    assert _parse_maintenance_date("31/02/2026", now_ts.date()) is None
+    assert _parse_maintenance_date("31 de abril de 2026", now_ts.date()) is None
+
+    async with async_session_factory() as async_db_session:
+        await UserRepository(async_db_session).reset_user_data(user_id)
+        await UserRepository(async_db_session).get_or_create(user_id=user_id)
+        v_repo = VehicleRepository(async_db_session)
+        veh = await v_repo.add_vehicle(
+            Vehicle(user_id=user_id, make="Fiat", model="Toro", plate="ABC1D23", current_km=60000),
+            commit=True,
+        )
+
+        # 2. Manutenção na data de hoje com KM regressivo (42.000 < 60.000) -> BLOQUEADA
+        bad_today_payload = {
+            "_action_state": "awaiting_maintenance_confirm",
+            "vehicle_id": veh.id,
+            "itens": ["pastilhas de freio"],
+            "km": 42000,
+            "data": "hoje",
+            "valor": 380.0,
+        }
+        outcome_blocked = await _persist_confirmed_data(
+            async_db_session, user_id, "action_confirmed", bad_today_payload, [veh], now_ts
+        )
+        assert outcome_blocked["success"] == []
+        assert len(outcome_blocked["failed"]) == 1
+        assert outcome_blocked["failed"][0]["reason"] == "regressive_km"
+
+        rows_after_block = (
+            await async_db_session.execute(select(MaintenanceRecordModel).where(MaintenanceRecordModel.user_id == user_id))
+        ).scalars().all()
+        assert len(rows_after_block) == 0
+
+        # 3. Manutenção retroativa ('há 1 ano') com KM menor que o atual (42.000 < 60.000) -> PERMITIDA
+        retro_payload = {
+            "_action_state": "awaiting_maintenance_confirm",
+            "vehicle_id": veh.id,
+            "itens": ["correia dentada", "tensor"],
+            "km": 42000,
+            "data": "há 1 ano",
+            "oficina": "Oficina Central",
+            "valor": 950.0,
+        }
+        outcome_ok = await _persist_confirmed_data(
+            async_db_session, user_id, "action_confirmed", retro_payload, [veh], now_ts
+        )
+        assert len(outcome_ok["success"]) == 1
+        assert outcome_ok["failed"] == []
+
+        rows_after_ok = (
+            await async_db_session.execute(select(MaintenanceRecordModel).where(MaintenanceRecordModel.user_id == user_id))
+        ).scalars().all()
+        assert len(rows_after_ok) == 1
+        assert rows_after_ok[0].km == 42000
+        assert rows_after_ok[0].date.date() if hasattr(rows_after_ok[0].date, "date") else rows_after_ok[0].date == now_ts.date() - timedelta(days=365)
+
+        # Odômetro atual do veículo permanece 60.000 km (não regrediu para 42.000 km)
+        updated_veh = await v_repo.get_by_id(veh.id)
+        assert updated_veh.current_km == 60000
 
 
 @pytest.mark.asyncio
-async def test_current_date_retrograde_km_triggers_rollback_warning():
-    """Valida que manutenção em data recente/hoje com KM menor que a atual continua disparando o aviso de erro de digitação."""
-    service = ConversationService()
-    user_id = "5511999990077"
-    from src.domain.entities import Vehicle
-    civic = Vehicle(id=1, user_id=user_id, make="Honda", model="Civic", current_km=80000)
+async def test_adversarial_plate_validation_and_corrective_negation_deep_merge():
+    """
+    Teste Adversarial Real:
+    1. Negativas corretivas ('Não, o ano é 2008 e direção hidráulica') via upsert_draft atualizam o rascunho
+       sem cancelar a operação e sem tocar nos campos já preenchidos, mantendo reply_message idêntico ao da IA.
+    2. Validação estrita de placas no banco: aceita padrão antigo (ABC-1234) e Mercosul (BRA2E19),
+       mas rejeita formatos inválidos ('123-ABCD', 'INVALID99') com rollback transacional.
+    """
+    from datetime import timedelta, timezone
+    from src.domain.enums import IntentType
+    from src.infrastructure.database.repositories import VehicleRepository, UserRepository
+    from src.infrastructure.database.session import init_db, async_session_factory
+    from src.interfaces.api.webhook import _persist_confirmed_data
 
-    # Serviço relatado hoje com KM menor sem justificativa temporal
-    res = await service.handle_incoming_message(
-        user_id=user_id,
-        message_text="Troquei as pastilhas de freio do Civic hoje com 20000 km por 350 reais",
-        vehicles=[civic],
+    await init_db()
+    service = ConversationService()
+    user_id = "5511999998802"
+    ctx = service.get_context(user_id)
+    ctx.state = ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM
+    ctx.draft_payload = {
+        "make": "Fiat",
+        "model": "Hatch",
+        "year": 2010,
+        "plate": "ABC1234",
+        "odometer_km": 98500,
+        "engine": "1.4",
+        "transmission": "Manual",
+    }
+
+    arbitrary_ai_reply = "Entendido! Corrigi o ano para 2008 e a direção para Hidráulica [ID-9941-X]. Confirma?"
+    corrective_analysis = GeminiAnalysisResponse(
+        intent=IntentType.REGISTER_VEHICLE,
+        confidence=ConfidenceLevel.HIGH,
+        is_critical_action=True,
+        reply_message=arbitrary_ai_reply,
+        tool_call=ToolCallAction(name="upsert_draft", year=2008, steering="Hidráulica"),
     )
 
+    class SingleTurnGemini:
+        async def analyze_message(self, *args, **kwargs):
+            return corrective_analysis
+
+    service.gemini = SingleTurnGemini()
+    res = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="Não, o ano é 2008 e é direção hidráulica",
+        vehicles=[],
+    )
+
+    # Não cancelou; atualizou via deep merge e manteve o texto exato da IA
     assert res["action_type"] == "awaiting_confirmation"
-    assert "menor que a registrada anteriormente" in res["reply"]
-    assert "Foi um erro de digitação?" in res["reply"]
-    assert res["draft"].get("_is_odometer_rollback") is True
+    assert res["state"] == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value
+    assert res["reply"] == arbitrary_ai_reply
+    assert ctx.draft_payload["year"] == 2008
+    assert ctx.draft_payload["steering"] == "Hidráulica"
+    assert ctx.draft_payload["plate"] == "ABC1234"
+    assert ctx.draft_payload["odometer_km"] == 98500
+    assert ctx.draft_payload["engine"] == "1.4"
+
+    async with async_session_factory() as async_db_session:
+        await UserRepository(async_db_session).reset_user_data(user_id)
+        await UserRepository(async_db_session).get_or_create(user_id=user_id)
+        # Persistência com placa inválida deve falhar com 'invalid_plate' e fazer rollback
+        now_ts = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        invalid_plate_data = {
+            **ctx.draft_payload,
+            "_action_state": ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value,
+            "plate": "123-ABCD",
+        }
+        out_invalid = await _persist_confirmed_data(
+            async_db_session, user_id, "action_confirmed", invalid_plate_data, [], now_ts
+        )
+        assert out_invalid["success"] == []
+        assert out_invalid["failed"][0]["reason"] == "invalid_plate"
+        assert len(await VehicleRepository(async_db_session).get_vehicles_by_user_id(user_id)) == 0
+
+        # Persistência com placa Mercosul válida ('BRA2E19') deve gravar no SQLite
+        valid_mercosul_data = {
+            **ctx.draft_payload,
+            "_action_state": ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value,
+            "plate": "BRA-2E19",
+        }
+        out_valid = await _persist_confirmed_data(
+            async_db_session, user_id, "action_confirmed", valid_mercosul_data, [], now_ts
+        )
+        assert len(out_valid["success"]) == 1
+        saved_vehs = await VehicleRepository(async_db_session).get_vehicles_by_user_id(user_id)
+        assert len(saved_vehs) == 1
+        assert saved_vehs[0].plate == "BRA2E19"
+        assert saved_vehs[0].year == 2008
+        assert saved_vehs[0].steering == "Hidráulica"
+        assert saved_vehs[0].current_km == 98500
