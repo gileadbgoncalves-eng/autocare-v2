@@ -40,8 +40,8 @@ class Settings(BaseSettings):
 
     # 2. Google Gemini AI (Cérebro NLP)
     GEMINI_API_KEY: str = Field(default="", description="Chave de API do Google AI Studio / Gemini")
-    GEMINI_PRIMARY_MODEL: str = Field(default="gemini-2.5-flash", description="Modelo veloz e inteligente para análise de intenções")
-    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-2.0-flash-lite", description="Modelo alternativo para contingência de timeout")
+    GEMINI_PRIMARY_MODEL: str = Field(default="gemini-1.5-flash", description="Modelo veloz e inteligente para análise de intenções")
+    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-1.5-flash-8b", description="Modelo alternativo para contingência de timeout")
     GEMINI_TIMEOUT_SECONDS: float = Field(default=12.0, description="Timeout estrito para requisições de IA")
     GEMINI_MAX_RETRIES: int = Field(default=2, description="Tentativas rápidas em 5xx")
     GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=400, description="Teto de tokens de saída por chamada (guardrail de custo: 250-400)")
@@ -64,6 +64,26 @@ class Settings(BaseSettings):
     ZAPI_INSTANCE_ID: str = Field(default="")
     ZAPI_TOKEN: str = Field(default="")
     ZAPI_CLIENT_TOKEN: str = Field(default="")
+
+    @field_validator("GEMINI_PRIMARY_MODEL", mode="before")
+    @classmethod
+    def resolve_gemini_primary_model(cls, v: Optional[str]) -> str:
+        """Resolve modelo primário priorizando GEMINI_MODEL ou GEMINI_PRIMARY_MODEL do ambiente."""
+        env_model = os.getenv("GEMINI_MODEL") or os.getenv("GEMINI_PRIMARY_MODEL")
+        chosen = env_model or v or "gemini-1.5-flash"
+        if chosen in ("gemini-3.8-flash", "gemini-3.5-flash"):
+            return "gemini-1.5-flash"
+        return chosen
+
+    @field_validator("GEMINI_FALLBACK_MODEL", mode="before")
+    @classmethod
+    def resolve_gemini_fallback_model(cls, v: Optional[str]) -> str:
+        """Resolve modelo fallback priorizando GEMINI_FALLBACK_MODEL com default seguro."""
+        env_fallback = os.getenv("GEMINI_FALLBACK_MODEL")
+        chosen = env_fallback or v or "gemini-1.5-flash-8b"
+        if chosen in ("gemini-flash-latest", "gemini-flash-lite-latest"):
+            return "gemini-1.5-flash-8b"
+        return chosen
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod

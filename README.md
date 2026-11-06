@@ -56,7 +56,7 @@ autocare-v2/
    - Mensagens de cortesia e encerramento (*"ok"*, *"valeu"*, *"show"*, *"obrigado"*) são interceptadas por um analisador léxico determinístico ultrarrápido, respondendo instantaneamente em ~14ms com zero consumo de tokens e sem dependência de rede externa.
 
 3. **Structured Outputs com Google Gemini:**
-   - Integração com o modelo `gemini-3.8-flash` (e fallback `gemini-flash-latest`) forçando respostas estritamente validadas via JSON Schema, eliminando 100% de alucinações e formatações quebradas.
+   - Integração com o modelo `gemini-1.5-flash` (e fallback `gemini-1.5-flash-8b`) forçando respostas estritamente validadas via JSON Schema, eliminando 100% de alucinações e formatações quebradas.
    - Higienização e inlining automático de esquemas Pydantic v2 para compatibilidade com o padrão REST da Google AI.
 
 4. **Persistência Assíncrona e Multi-Dialeto:**

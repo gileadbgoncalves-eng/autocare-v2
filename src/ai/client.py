@@ -4,6 +4,7 @@ Cliente assíncrono para o Google Gemini com Structured Outputs (Pydantic v2),
 timeout estrito de 5s, exponential backoff com jitter para 429/5xx e fallback seguro.
 """
 
+import os
 import json
 import asyncio
 import hashlib
@@ -79,8 +80,30 @@ class GeminiClient:
         max_retries: Optional[int] = None,
     ):
         self.api_key = api_key or settings.GEMINI_API_KEY
-        self.primary_model = primary_model or settings.GEMINI_PRIMARY_MODEL
-        self.fallback_model = fallback_model or settings.GEMINI_FALLBACK_MODEL
+
+        # Modelo principal configurável via env GEMINI_MODEL ou GEMINI_PRIMARY_MODEL (default: gemini-1.5-flash)
+        resolved_primary = (
+            primary_model
+            or os.getenv("GEMINI_MODEL")
+            or os.getenv("GEMINI_PRIMARY_MODEL")
+            or getattr(settings, "GEMINI_PRIMARY_MODEL", None)
+            or "gemini-1.5-flash"
+        )
+        if resolved_primary in ("gemini-3.8-flash", "gemini-3.5-flash"):
+            resolved_primary = "gemini-1.5-flash"
+        self.primary_model = resolved_primary
+
+        # Modelo de contingência / fallback mais leve e rápido (default: gemini-1.5-flash-8b)
+        resolved_fallback = (
+            fallback_model
+            or os.getenv("GEMINI_FALLBACK_MODEL")
+            or getattr(settings, "GEMINI_FALLBACK_MODEL", None)
+            or "gemini-1.5-flash-8b"
+        )
+        if resolved_fallback in ("gemini-flash-latest", "gemini-flash-lite-latest"):
+            resolved_fallback = "gemini-1.5-flash-8b"
+        self.fallback_model = resolved_fallback
+
         self.timeout = timeout_seconds or settings.GEMINI_TIMEOUT_SECONDS
         self.max_retries = max_retries or settings.GEMINI_MAX_RETRIES
         # Sempre dentro da faixa segura 250-400, mesmo que a configuração externa fuja dela
