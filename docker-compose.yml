@@ -14,8 +14,8 @@ services:
       - LOG_LEVEL=info
       - DATABASE_URL=postgresql+asyncpg://autocare_user:autocare_pass@db:5432/autocare_db
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_PRIMARY_MODEL=${GEMINI_PRIMARY_MODEL:-gemini-1.5-flash}
-      - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemini-1.5-flash-8b}
+      - GEMINI_PRIMARY_MODEL=${GEMINI_PRIMARY_MODEL:-gemini-flash-lite-latest}
+      - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemini-2.0-flash-lite}
       - PROVIDER=${PROVIDER:-evolution}
       - EVOLUTION_BASE_URL=${EVOLUTION_BASE_URL}
       - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}

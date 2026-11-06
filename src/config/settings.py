@@ -40,9 +40,9 @@ class Settings(BaseSettings):
 
     # 2. Google Gemini AI (Cérebro NLP)
     GEMINI_API_KEY: str = Field(default="", description="Chave de API do Google AI Studio / Gemini")
-    GEMINI_PRIMARY_MODEL: str = Field(default="gemini-1.5-flash", description="Modelo veloz e inteligente para análise de intenções")
-    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-1.5-flash-8b", description="Modelo alternativo para contingência de timeout")
-    GEMINI_TIMEOUT_SECONDS: float = Field(default=12.0, description="Timeout estrito para requisições de IA")
+    GEMINI_PRIMARY_MODEL: str = Field(default="gemini-flash-lite-latest", description="Modelo veloz e inteligente para análise de intenções")
+    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-2.0-flash-lite", description="Modelo alternativo para contingência de timeout")
+    GEMINI_TIMEOUT_SECONDS: float = Field(default=30.0, description="Timeout estrito para requisições de IA")
     GEMINI_MAX_RETRIES: int = Field(default=2, description="Tentativas rápidas em 5xx")
     GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=400, description="Teto de tokens de saída por chamada (guardrail de custo: 250-400)")
     GEMINI_HISTORY_MAX_TURNS: int = Field(default=5, description="Quantidade máxima de turnos do histórico enviados à API")
@@ -70,9 +70,9 @@ class Settings(BaseSettings):
     def resolve_gemini_primary_model(cls, v: Optional[str]) -> str:
         """Resolve modelo primário priorizando GEMINI_MODEL ou GEMINI_PRIMARY_MODEL do ambiente."""
         env_model = os.getenv("GEMINI_MODEL") or os.getenv("GEMINI_PRIMARY_MODEL")
-        chosen = env_model or v or "gemini-1.5-flash"
+        chosen = env_model or v or "gemini-flash-lite-latest"
         if chosen in ("gemini-3.8-flash", "gemini-3.5-flash"):
-            return "gemini-1.5-flash"
+            return "gemini-flash-lite-latest"
         return chosen
 
     @field_validator("GEMINI_FALLBACK_MODEL", mode="before")
@@ -80,9 +80,7 @@ class Settings(BaseSettings):
     def resolve_gemini_fallback_model(cls, v: Optional[str]) -> str:
         """Resolve modelo fallback priorizando GEMINI_FALLBACK_MODEL com default seguro."""
         env_fallback = os.getenv("GEMINI_FALLBACK_MODEL")
-        chosen = env_fallback or v or "gemini-1.5-flash-8b"
-        if chosen in ("gemini-flash-latest", "gemini-flash-lite-latest"):
-            return "gemini-1.5-flash-8b"
+        chosen = env_fallback or v or "gemini-2.0-flash-lite"
         return chosen
 
     @field_validator("DATABASE_URL", mode="before")
