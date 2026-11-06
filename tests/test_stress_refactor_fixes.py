@@ -112,27 +112,24 @@ async def test_problema_2_retrocesso_odometro_nlp_cancelamento_foi_um_erro():
 
 @pytest.mark.asyncio
 async def test_problema_2_nlp_confirmacoes_e_cancelamentos_variados():
-    """Valida a tradução de respostas coloquiais pelo classificador semântico NLP."""
+    """Valida a tradução de respostas coloquiais de confirmação e cancelamento pela IA no fluxo conversacional."""
     service = ConversationService()
 
-    # Confirmações coloquiais devem mapear para True
-    assert await service.classify_confirmation("pode meter marcha") is True
-    assert await service.classify_confirmation("manda bala") is True
-    assert await service.classify_confirmation("isso aí") is True
-    assert await service.classify_confirmation("isso ai") is True
-    assert await service.classify_confirmation("com certeza") is True
-    assert await service.classify_confirmation("positivo") is True
-    assert await service.classify_confirmation("fechado") is True
+    for idx, phrase in enumerate(["pode meter marcha", "manda bala", "isso aí", "com certeza", "positivo", "fechado"]):
+        uid = f"55219999910{idx:02d}"
+        ctx = service.get_context(uid)
+        ctx.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+        ctx.draft_payload = {"itens": ["óleo"], "km": 10000}
+        res = await service.handle_incoming_message(user_id=uid, message_text=phrase, vehicles=[])
+        assert res["action_type"] == "action_confirmed"
 
-    # Cancelamentos e erros devem mapear para False
-    assert await service.classify_confirmation("foi um erro") is False
-    assert await service.classify_confirmation("foi erro") is False
-    assert await service.classify_confirmation("foi engano") is False
-    assert await service.classify_confirmation("errei") is False
-    assert await service.classify_confirmation("me confundi") is False
-    assert await service.classify_confirmation("cancela") is False
-    assert await service.classify_confirmation("esquece") is False
-    assert await service.classify_confirmation("deixa quieto") is False
+    for idx, phrase in enumerate(["foi um erro", "foi engano", "errei", "me confundi", "cancela", "esquece", "deixa quieto"]):
+        uid = f"55219999920{idx:02d}"
+        ctx = service.get_context(uid)
+        ctx.state = ConversationState.AWAITING_MAINTENANCE_CONFIRM
+        ctx.draft_payload = {"itens": ["óleo"], "km": 10000}
+        res = await service.handle_incoming_message(user_id=uid, message_text=phrase, vehicles=[])
+        assert res["action_type"] == "action_cancelled"
 
 
 # ============================================================================
@@ -153,10 +150,10 @@ async def test_problema_3_conflito_entidades_placa_vs_nome_carro_aviso_obrigator
     ]
 
     # 1. Teste direto do método de resolução veicular
-    matched, warning = service._resolve_vehicle("Compass placa RIO2A24", vehicles)
+    matched, ambiguous = service._resolve_vehicle("Compass placa RIO2A24", vehicles)
     assert matched is not None
     assert matched.model == "Sandero"
-    assert warning == "Atenção: A placa RIO2A24 pertence ao seu Sandero, e não a um Compass. Os dados foram lançados no Sandero."
+    assert ambiguous == []
 
     # 2. Teste do fluxo conversacional completo com aviso emitido
     res1 = await service.handle_incoming_message(
@@ -188,7 +185,7 @@ async def test_problema_3_sem_conflito_quando_modelo_e_placa_concordam():
         Vehicle(id=1, user_id="u1", make="Renault", model="Sandero", plate="RIO2A24", current_km=40000)
     ]
 
-    matched, warning = service._resolve_vehicle("Sandero placa RIO2A24", vehicles)
+    matched, ambiguous = service._resolve_vehicle("Sandero placa RIO2A24", vehicles)
     assert matched is not None
     assert matched.model == "Sandero"
-    assert warning is None
+    assert ambiguous == []

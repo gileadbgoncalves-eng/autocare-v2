@@ -182,8 +182,9 @@ def test_problema_4_fuzzy_matching_resolucao_sandeiro_para_sandero():
         Vehicle(id=2, user_id="123", make="Renault", model="Sandero", plate="XYZ9876"),
     ]
 
-    matched = service._resolve_vehicle_fuzzy("o sandeiro está em dia?", vehicles)
+    matched, ambiguous = service._resolve_vehicle(None, vehicles, "o sandeiro está em dia?")
     assert matched is not None
+    assert ambiguous == []
     assert matched.model == "Sandero"
     assert matched.id == 2
 

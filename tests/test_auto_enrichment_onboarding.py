@@ -1,11 +1,11 @@
 """
-AutoCare V2 - Testes de Enriquecimento Automático e Autopreenchimento de Ficha Técnica
-Valida os requisitos de UX inteligente no Onboarding:
-1. Sincronização e validação dos aliases em português (motor, cambio, direcao) no VehicleDraft.
-2. Inferência de ficha técnica oficial para modelos do mercado brasileiro (ex: Nivus Highline, Corolla XEI).
-3. Resposta de aprovação proativa sem interrogatório burocrático:
-   "Excelente escolha! Já puxei a ficha técnica do seu Nivus Highline (Motor 1.0 Turbo, Automático, Direção Elétrica). Posso salvar na garagem?"
-4. Persistência completa no banco de dados (SQLite/SQLAlchemy) com os 4 campos técnicos (engine, version, transmission, steering).
+AutoCare V2 - Testes do Fluxo Conversacional de Cadastro de Veículo (Arquitetura 100% AI-First)
+Valida os requisitos estritos da arquitetura AI-First:
+1. Sincronização de campos e aliases no VehicleDraft e ToolCallAction (upsert_draft).
+2. Proibição de inferência cega em Python: o backend nunca inventa direção, câmbio ou motor se a IA não enviou.
+3. Preservação integral da reply_message do Gemini sem injeção de templates ou rodapés hardcoded.
+4. Correção conversacional ("Não, é...") atualizando o rascunho via upsert_draft sem cancelar a operação.
+5. Persistência completa no banco de dados (SQLite/SQLAlchemy) após confirm_and_save_draft.
 """
 
 import sys
@@ -18,9 +18,9 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from src.ai.schemas import VehicleDraft
-from src.application.services.conversation import ConversationService, find_popular_vehicle_spec
-from src.domain.enums import ConversationState
+from src.ai.schemas import VehicleDraft, ToolCallAction, GeminiAnalysisResponse
+from src.application.services.conversation import ConversationService
+from src.domain.enums import ConversationState, IntentType, ConfidenceLevel
 from src.domain.entities import Vehicle
 from src.infrastructure.database.session import init_db, async_session_factory
 from src.infrastructure.database.repositories import VehicleRepository, UserRepository
@@ -32,24 +32,23 @@ async def setup_db():
 
 
 def test_vehicle_draft_schema_and_aliases_sync():
-    """Valida que o schema Pydantic V2 sincroniza aliases em português bidirecionalmente."""
-    # Instanciação usando aliases em português
+    """Valida que o schema Pydantic V2 sincroniza aliases em português e inglês bidirecionalmente."""
     draft_pt = VehicleDraft(
-        make="Volkswagen",
+        brand="Volkswagen",
         model="Nivus",
         version="Highline",
         motor="1.0 Turbo",
         cambio="Automático",
         direcao="Elétrica",
+        odometer=15000,
     )
+    assert draft_pt.make == "Volkswagen"
+    assert draft_pt.brand == "Volkswagen"
     assert draft_pt.engine == "1.0 Turbo"
     assert draft_pt.transmission == "Automático"
     assert draft_pt.steering == "Elétrica"
-    assert draft_pt.motor == "1.0 Turbo"
-    assert draft_pt.cambio == "Automático"
-    assert draft_pt.direcao == "Elétrica"
+    assert draft_pt.odometer_km == 15000
 
-    # Instanciação usando campos canônicos em inglês
     draft_en = VehicleDraft(
         make="Toyota",
         model="Corolla",
@@ -57,125 +56,104 @@ def test_vehicle_draft_schema_and_aliases_sync():
         engine="2.0 Dynamic Force",
         transmission="Automático",
         steering="Elétrica",
+        odometer_km=25000,
     )
+    assert draft_en.brand == "Toyota"
     assert draft_en.motor == "2.0 Dynamic Force"
     assert draft_en.cambio == "Automático"
     assert draft_en.direcao == "Elétrica"
-
-
-def test_find_popular_vehicle_spec_knowledge_base():
-    """Valida que a base de conhecimento automotivo identifica modelos e versões com precisão."""
-    nivus_spec = find_popular_vehicle_spec("Tenho um Nivus Highline 2022")
-    assert nivus_spec is not None
-    assert nivus_spec["model"] == "Nivus"
-    assert nivus_spec["version"] == "Highline"
-    assert nivus_spec["engine"] == "1.0 Turbo"
-    assert nivus_spec["transmission"] == "Automático"
-    assert nivus_spec["steering"] == "Elétrica"
-
-    corolla_spec = find_popular_vehicle_spec("Comprei um Corolla XEI")
-    assert corolla_spec is not None
-    assert corolla_spec["model"] == "Corolla"
-    assert corolla_spec["version"] == "XEI"
-    assert corolla_spec["engine"] == "2.0 Dynamic Force"
-    assert corolla_spec["transmission"] == "Automático"
-    assert corolla_spec["steering"] == "Elétrica"
+    assert draft_en.odometer == 25000
 
 
 @pytest.mark.asyncio
-async def test_onboarding_proactive_confirmation_nivus_highline():
+async def test_onboarding_no_python_spec_hallucination():
     """
-    Cenário: Usuário informa 'Tenho um Nivus Highline 2022 placa ABC1D23 com 15000 km'.
-    O sistema deve pular perguntas burocráticas e emitir a confirmação proativa exata:
-    'Excelente escolha! Já puxei a ficha técnica do seu Nivus Highline (Motor 1.0 Turbo, Automático, Direção Elétrica). Posso salvar na garagem?'
+    Cenário: Usuário informa 'Comprei um Fiat Palio 2008'.
+    O código Python NUNCA deve adivinhar se tem direção hidráulica, câmbio manual ou motor 1.0,
+    e o texto devolvido deve ser estritamente a reply_message gerada pelo Gemini.
     """
     service = ConversationService()
     user_id = "5521990001111"
 
     res = await service.handle_incoming_message(
         user_id=user_id,
-        message_text="Tenho um Nivus Highline 2022 placa ABC1D23 com 15000 km",
+        message_text="Comprei um Fiat Palio 2008",
         vehicles=[],
     )
 
     assert res["action_type"] == "awaiting_confirmation"
     assert res["state"] == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value
 
-    reply = res["reply"]
-    # Verifica a frase exata de aprovação proativa
-    assert "Excelente escolha! Já puxei a ficha técnica do seu Nivus Highline" in reply
-    assert "Motor 1.0 Turbo" in reply
-    assert "Automático" in reply
-    assert "Direção Elétrica" in reply
-    assert "Posso salvar na garagem?" in reply
-
-    # Garante que NÃO contém o interrogatório burocrático tradicional
-    assert "📌 *Deseja confirmar e registrar essas informações?*" not in reply
-    assert "👉 Responda *'Sim'* para salvar" not in reply
-
-    # Valida integridade do draft payload retido na máquina de estados
     draft = res["draft"]
-    assert draft["model"] == "Nivus"
-    assert draft["version"] == "Highline"
-    assert draft["engine"] == "1.0 Turbo"
-    assert draft["transmission"] == "Automático"
-    assert draft["steering"] == "Elétrica"
-    assert draft["plate"] == "ABC1D23"
-    assert draft["odometer_km"] == 15000
+    assert draft["make"] == "Fiat"
+    assert draft["model"] == "Palio"
+    assert draft["year"] == 2008
+    # Python não pode ter inventado direção, motor ou câmbio
+    assert draft.get("steering") is None
+    assert draft.get("engine") is None
+    assert draft.get("transmission") is None
 
 
 @pytest.mark.asyncio
-async def test_onboarding_proactive_confirmation_corolla_xei():
-    """Valida aprovação proativa para o Toyota Corolla XEI."""
+async def test_onboarding_correction_updates_draft_instead_of_cancelling():
+    """
+    Cenário: Rascunho de veículo aberto e usuário corrige dizendo:
+    'Não, ele não tem direção hidráulica, é mecânica, motor 1.0 manual, placa LPD8D80 com 144000 km'.
+    O sistema deve fazer deep merge no rascunho via upsert_draft sem cancelar a operação.
+    """
     service = ConversationService()
     user_id = "5521990002222"
 
-    res = await service.handle_incoming_message(
+    await service.handle_incoming_message(
         user_id=user_id,
-        message_text="Cadastra meu Corolla XEI 2023 placa BRA2E19",
+        message_text="Quero cadastrar meu Palio 2008",
         vehicles=[],
     )
 
-    assert res["action_type"] == "awaiting_confirmation"
-    assert res["state"] == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value
+    res2 = await service.handle_incoming_message(
+        user_id=user_id,
+        message_text="Não, ele é direção mecânica, motor 1.0 manual, placa LPD8D80 com 144000 km",
+        vehicles=[],
+    )
 
-    reply = res["reply"]
-    assert "Excelente escolha! Já puxei a ficha técnica do seu Corolla XEI" in reply
-    assert "Motor 2.0 Dynamic Force" in reply
-    assert "Automático" in reply
-    assert "Direção Elétrica" in reply
-    assert "Posso salvar na garagem?" in reply
+    assert res2["action_type"] == "awaiting_confirmation"
+    assert res2["state"] == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value
+    draft = res2["draft"]
+    assert draft["model"] == "Palio"
+    assert draft["year"] == 2008
+    assert draft["steering"] == "Mecânica"
+    assert draft["engine"] == "1.0"
+    assert draft["transmission"] == "Manual"
+    assert draft["plate"] == "LPD8D80"
+    assert draft["odometer_km"] == 144000
 
 
 @pytest.mark.asyncio
 async def test_onboarding_end_to_end_database_persistence():
     """
-    Fluxo ponta a ponta:
-    1. Usuário envia 'Tenho um Nivus Highline placa ABC1D23 com 12000 km'.
-    2. Bot responde com aprovação proativa e puxa a ficha técnica.
-    3. Usuário confirma com 'pode salvar'.
-    4. Veículo é gravado no banco de dados SQLite com todos os atributos técnicos.
+    Fluxo ponta a ponta 100% AI-First:
+    1. Usuário envia dados do veículo.
+    2. Usuário confirma com 'sim'.
+    3. Veículo é gravado no banco de dados SQLite com todos os atributos técnicos informados.
     """
     service = ConversationService()
     user_id = "5521990003333"
 
-    # Turno 1: Envio do cadastro
     res1 = await service.handle_incoming_message(
         user_id=user_id,
-        message_text="Tenho um Nivus Highline 2022 placa ABC1D23 com 12000 km",
+        message_text="Tenho um Nivus Highline 2022 1.0 Turbo automático direção elétrica placa ABC1D23 com 12000 km",
         vehicles=[],
     )
     assert res1["action_type"] == "awaiting_confirmation"
-    assert "Excelente escolha! Já puxei a ficha técnica do seu Nivus Highline" in res1["reply"]
 
-    # Turno 2: Confirmação afirmativa
     res2 = await service.handle_incoming_message(
         user_id=user_id,
-        message_text="pode salvar na garagem",
+        message_text="sim",
         vehicles=[],
     )
     assert res2["action_type"] == "action_confirmed"
-    assert "Veículo cadastrado com sucesso na sua garagem!" in res2["reply"]
+    # Verifica presença da pergunta de engajamento pós-cadastro gerada pela IA
+    assert "manutenção" in res2["reply"].lower() or "serviço" in res2["reply"].lower()
 
     committed = res2["committed_data"]
     assert committed["model"] == "Nivus"
@@ -183,13 +161,13 @@ async def test_onboarding_end_to_end_database_persistence():
     assert committed["engine"] == "1.0 Turbo"
     assert committed["transmission"] == "Automático"
     assert committed["steering"] == "Elétrica"
+    assert committed["plate"] == "ABC1D23"
+    assert committed["odometer_km"] == 12000
 
-    # Simula persistência no banco (espelhando a camada de webhook)
     async with async_session_factory() as session:
         user_repo = UserRepository(session)
         vehicle_repo = VehicleRepository(session)
 
-        # Garante condutor
         await user_repo.get_or_create(user_id=user_id, name="Piloto Nivus")
 
         new_vehicle = Vehicle(
@@ -206,7 +184,6 @@ async def test_onboarding_end_to_end_database_persistence():
         )
         saved = await vehicle_repo.add_vehicle(new_vehicle)
 
-        # 5. Asserção no banco real
         persisted = await vehicle_repo.get_by_id(saved.id)
         assert persisted is not None
         assert persisted.make == "Volkswagen"

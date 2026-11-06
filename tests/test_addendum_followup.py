@@ -520,12 +520,6 @@ async def test_multi_action_decomposition_runs_online_and_offline_consistently()
     online_svc = ConversationService(gemini_client=SingleIntentOnlineGemini())
     offline_svc = ConversationService(gemini_client=OfflineGemini())
 
-    # Testa diretamente a função utilitária pura
-    decomposed = online_svc._decompose_multi_action_message(msg, [veh])
-    assert len(decomposed) == 2
-    assert decomposed[0]["intent"] == IntentType.RECORD_MAINTENANCE
-    assert decomposed[1]["intent"] == IntentType.SET_REMINDER
-
     res_online = await online_svc.handle_incoming_message("5511999990013", msg, vehicles=[veh])
     res_offline = await offline_svc.handle_incoming_message("5511999990013", msg, vehicles=[veh])
 
@@ -659,12 +653,7 @@ async def test_ambiguous_followup_reprocesses_original_message_without_corruptio
     assert ctx2.pending_ambiguous_message is None
     assert ctx2.draft_payload is not None
     assert ctx2.draft_payload.get("_target_vehicle_ref") == "AAA1A11"
-
-    # Verificação de não-corrupção: _decompose_multi_action_message reprocessado produz os mesmos intents da mensagem original
-    orig_actions = service._decompose_multi_action_message(orig_msg, [v1, v2])
-    reprocessed_actions = service._decompose_multi_action_message(orig_msg, [v1, v2])
-    assert [a["intent"] for a in orig_actions] == [a["intent"] for a in reprocessed_actions]
-    assert len(orig_actions) == 2
+    assert len(ctx2.draft_payload.get("actions", [])) == 2
 
 
 @pytest.mark.integration

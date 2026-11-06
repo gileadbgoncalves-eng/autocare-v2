@@ -1,10 +1,10 @@
 """
 AutoCare V2 - Testes de Regressão: TTL de Rascunho, Fuso UTC-3 e Escape Global (Undo)
 
-Cobre as 3 diretrizes da Fase 1 de correção da máquina de estados:
+Cobre as 3 diretrizes da máquina de estados:
 1. TTL de 30 min no rascunho aguardando confirmação (fim do "Sim" atrasado).
 2. Injeção do momento exato em UTC-3 no prompt do LLM (e relógio BRT na persistência).
-3. Interceptor de "desfaz / cancela o último / apaga isso que te mandei" com soft delete
+3. Comando operacional de "desfaz / cancela o último / apaga isso que te mandei" com soft delete
    (status='cancelled') dos registros dos últimos 5 minutos.
 """
 
@@ -30,7 +30,6 @@ from src.application.services.conversation import (
     UNDO_NOTHING_REPLY,
     UNDO_DRAFT_DISCARDED_REPLY,
     is_undo_command,
-    looks_like_confirmation_reply,
 )
 from src.config.clock import BRT, build_temporal_context, now_brt_naive
 from src.domain.entities import MaintenanceRecord, Reminder, Vehicle
@@ -58,9 +57,7 @@ async def setup_db():
 
 
 def _uid() -> str:
-    # O identificador do usuário é um telefone sanitizado (somente dígitos)
     return "55219" + str(uuid.uuid4().int)[:8]
-
 
 
 async def _seed_user_with_vehicle(session, user_id: str) -> Vehicle:
@@ -103,7 +100,7 @@ async def test_draft_within_ttl_still_confirms():
     await service.handle_incoming_message(user_id=user_id, message_text=MIXED_MESSAGE, vehicles=[veh])
     soon = datetime.utcnow() + timedelta(minutes=10)
     service._utcnow = lambda: soon
-    res = await service.handle_incoming_message(user_id=user_id, message_text="sim, pode salvar", vehicles=[veh])
+    res = await service.handle_incoming_message(user_id=user_id, message_text="pode salvar", vehicles=[veh])
 
     assert res["action_type"] == "action_confirmed"
     assert res["committed_data"].get("_is_multi_action") is True
@@ -124,29 +121,16 @@ async def test_draft_ttl_is_configurable_and_boundary():
     assert service._is_draft_expired(ctx) is True
 
 
-def test_confirmation_reply_detector():
-    for text_ in ("Sim", "sim, pode salvar", "pode meter marcha", "ok", "não", "cancela", "isso aí"):
-        assert looks_like_confirmation_reply(text_), text_
-    for text_ in (
-        "Troquei o óleo do Civic por 300 reais ontem na oficina do Zé",
-        "qual o status do meu carro?",
-        "",
-    ):
-        assert not looks_like_confirmation_reply(text_), text_
-
-
 # ---------------------------------------------------------------------------
 # DIRETRIZ 2: Contexto temporal em UTC-3
 # ---------------------------------------------------------------------------
 def test_temporal_context_uses_brazil_timezone():
-    # 05:00 UTC == 02:00 em Brasília (o caso "amanhã de manhãzinha" às 2h da madrugada)
     utc_moment = datetime(2026, 10, 23, 5, 0, tzinfo=timezone.utc)
     ctx = build_temporal_context(utc_moment)
     assert "AGORA é 2026-10-23T02:00:00-03:00" in ctx
     assert "23/10/2026 02:00" in ctx
     assert "sexta-feira" in ctx
 
-    # 01:00 UTC == 22:00 do dia ANTERIOR em Brasília
     previous_day = build_temporal_context(datetime(2026, 10, 24, 1, 0, tzinfo=timezone.utc))
     assert "2026-10-23T22:00:00-03:00" in previous_day
 
@@ -156,7 +140,6 @@ def test_analysis_prompt_always_injects_temporal_context():
     assert "[CONTEXTO TEMPORAL]" in prompt
     assert "AGORA é" in prompt
     assert "-03:00" in prompt
-    # O contexto temporal precede qualquer outra seção do prompt
     assert prompt.index("[CONTEXTO TEMPORAL]") < prompt.index("[VEÍCULOS CADASTRADOS")
 
 
@@ -180,7 +163,7 @@ def test_undo_command_detection():
         "troquei o óleo e desfaz o resto",
         "apaga a placa antiga do Civic",
         "sim",
-        "cancelar",  # escape de fluxo já tratado em outro interceptor
+        "cancelar",
         "",
     ):
         assert not is_undo_command(phrase), phrase
@@ -220,20 +203,17 @@ async def test_soft_delete_last_record_within_5_minutes_and_batch():
 
         cancelled = await soft_delete_last_user_record(session, user_id)
 
-        # Lote da intenção mista cancelado junto; registro antigo (fora da janela) preservado
         assert cancelled["maintenance_ids"] == [recent_m.id]
         assert cancelled["reminder_ids"] == [recent_r.id]
         active = await maint_repo.get_by_user_id(user_id)
         assert [m.id for m in active] == [old.id]
-        assert await rem_repo.get_by_user_id(user_id) == []  # lembrete cancelado some das consultas
+        assert await rem_repo.get_by_user_id(user_id) == []
 
-        # Soft delete: a linha continua no banco com status 'cancelled'
         row = await maint_repo.get_by_id(recent_m.id)
         assert row is not None and row.status == "cancelled"
         rem_row = await rem_repo.get_by_id(recent_r.id)
         assert rem_row is not None and rem_row.status.value == "cancelled"
 
-        # Segunda chamada: nada novo na janela de 5 minutos
         again = await soft_delete_last_user_record(session, user_id)
         assert again == {"maintenance_ids": [], "reminder_ids": []}
 
@@ -277,7 +257,6 @@ async def test_webhook_undo_end_to_end(monkeypatch):
         assert (await maint_repo.get_by_id(saved.id)).status == "cancelled"
         assert await maint_repo.get_by_user_id(user_id) == []
 
-        # Sem nada recente para desfazer, a resposta é honesta (não finge ter apagado)
         resp2 = await webhook_module.receive_webhook(
             {"user_id": user_id, "message": "desfaz"}, session=session
         )
@@ -291,6 +270,6 @@ def test_migration_adds_status_column_to_legacy_table():
         conn.execute(text("CREATE TABLE maintenance_records (id INTEGER PRIMARY KEY, description TEXT)"))
         conn.execute(text("INSERT INTO maintenance_records (description) VALUES ('legado')"))
         _ensure_soft_delete_columns(conn)
-        _ensure_soft_delete_columns(conn)  # idempotente
+        _ensure_soft_delete_columns(conn)
         assert "status" in {c["name"] for c in inspect(conn).get_columns("maintenance_records")}
         assert conn.execute(text("SELECT status FROM maintenance_records")).scalar() == "active"

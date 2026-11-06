@@ -17,16 +17,18 @@ from src.domain.enums import (
 
 
 class VehicleDraft(BaseModel):
-    """Entidades extraídas para rascunho de cadastro de veículo com suporte a autopreenchimento de ficha técnica."""
+    """Entidades extraídas para rascunho de cadastro de veículo."""
     make: Optional[str] = Field(default=None, description="Montadora (ex: Fiat, Honda, Toyota, Volkswagen)")
+    brand: Optional[str] = Field(default=None, description="Alias para make / montadora (ex: Fiat, Honda, Toyota, Volkswagen)")
     model: Optional[str] = Field(default=None, description="Modelo (ex: Palio, CG 160 Titan, Corolla, Nivus)")
     version: Optional[str] = Field(default=None, description="Versão de acabamento ou pacote (ex: Highline, XEI, Comfortline, Premier)")
     year: Optional[int] = Field(default=None, description="Ano de fabricação / modelo (ex: 2018, 2022)")
     plate: Optional[str] = Field(default=None, description="Placa do veículo (ex: ABC1D23)")
     odometer_km: Optional[int] = Field(default=None, ge=0, description="Quilometragem inicial informada")
-    engine: Optional[str] = Field(default=None, description="Motorização oficial inferida ou informada (ex: 1.0 Turbo, 2.0 Dynamic Force, 160cc)")
-    transmission: Optional[str] = Field(default=None, description="Câmbio / transmissão oficial inferida ou informada (ex: Automático, Manual, CVT)")
-    steering: Optional[str] = Field(default=None, description="Tipo de direção oficial inferida ou informada (ex: Elétrica, Hidráulica, Mecânica)")
+    odometer: Optional[int] = Field(default=None, ge=0, description="Alias para odometer_km (quilometragem inicial informada)")
+    engine: Optional[str] = Field(default=None, description="Motorização informada pelo usuário (ex: 1.0, 1.0 Turbo, 2.0, 160cc)")
+    transmission: Optional[str] = Field(default=None, description="Câmbio / transmissão informada pelo usuário (ex: Automático, Manual, CVT)")
+    steering: Optional[str] = Field(default=None, description="Tipo de direção informada pelo usuário (ex: Elétrica, Hidráulica, Mecânica)")
     cambio: Optional[str] = Field(default=None, description="Alias para transmission (ex: Automático, Manual)")
     direcao: Optional[str] = Field(default=None, description="Alias para steering (ex: Elétrica, Hidráulica)")
     motor: Optional[str] = Field(default=None, description="Alias para engine (ex: 1.0 Turbo, 2.0)")
@@ -35,7 +37,15 @@ class VehicleDraft(BaseModel):
 
     @model_validator(mode="after")
     def sync_technical_specs(self) -> "VehicleDraft":
-        """Garante sincronização bidirecional entre aliases em português e campos canônicos."""
+        """Garante sincronização bidirecional entre aliases e campos canônicos."""
+        if not self.make and self.brand:
+            self.make = self.brand
+        if not self.brand and self.make:
+            self.brand = self.make
+        if self.odometer_km is None and self.odometer is not None:
+            self.odometer_km = self.odometer
+        if self.odometer is None and self.odometer_km is not None:
+            self.odometer = self.odometer_km
         if not self.engine and self.motor:
             self.engine = self.motor
         if not self.motor and self.engine:
@@ -243,11 +253,12 @@ class ActionDraft(BaseModel):
 class ToolCallAction(BaseModel):
     """
     Estrutura de Function Calling / Ação Estruturada decidida pela IA (Arquitetura AI-First).
-    Suporta as 4 operações centrais de manutenção e histórico:
-    - upsert_draft(itens, km, data, oficina, valor)
+    Suporta as operações centrais de cadastro de veículo, manutenção e histórico:
+    - upsert_draft(make/brand, model, version, year, engine, transmission, steering, plate, odometer/km, itens, data, oficina, valor)
     - confirm_and_save_draft()
     - update_last_saved_service(service_id, itens, km, data, oficina, valor)
     - get_service_history()
+    - patch_vehicle_profile(target_vehicle_ref, km/odometer, plate, engine, transmission, steering)
     """
     name: Literal[
         "upsert_draft",
@@ -264,6 +275,20 @@ class ToolCallAction(BaseModel):
         default=None,
         description="ID do serviço salvo no banco (usado em update_last_saved_service a partir de ultimo_servico_salvo)"
     )
+    # Campos para rascunho / patch de veículo
+    make: Optional[str] = Field(default=None, description="Montadora do veículo (ex: Fiat, Volkswagen, Honda)")
+    brand: Optional[str] = Field(default=None, description="Alias para montadora do veículo (ex: Fiat, Volkswagen)")
+    model: Optional[str] = Field(default=None, description="Modelo do veículo (ex: Palio, Gol, Nivus, Corolla)")
+    version: Optional[str] = Field(default=None, description="Versão do veículo (ex: Highline, XEI, ELX)")
+    year: Optional[int] = Field(default=None, description="Ano do veículo (ex: 2008, 2022)")
+    plate: Optional[str] = Field(default=None, description="Placa do veículo (ex: ABC1D23)")
+    odometer: Optional[int] = Field(default=None, ge=0, description="Quilometragem atual do veículo")
+    engine: Optional[str] = Field(default=None, description="Motorização informada pelo usuário (ex: 1.0, 1.0 Turbo, 2.0)")
+    transmission: Optional[str] = Field(default=None, description="Câmbio informado pelo usuário (ex: Manual, Automático, CVT)")
+    steering: Optional[str] = Field(default=None, description="Direção informada pelo usuário (ex: Hidráulica, Elétrica, Mecânica)")
+    vehicle_type: Optional[VehicleType] = Field(default=None, description="Tipo do veículo: carro, moto ou caminhonete")
+    fuel_type: Optional[FuelType] = Field(default=None, description="Combustível do veículo")
+    # Campos para rascunho de manutenção
     itens: Optional[List[str]] = Field(
         default=None,
         description="Lista completa de itens/peças/serviços (mesclada cumulativamente em upsert_draft ou atualizada em update_last_saved_service)"
@@ -357,18 +382,86 @@ class GeminiAnalysisResponse(BaseModel):
         if self.tool_call:
             tc = self.tool_call
             if tc.name == "upsert_draft":
-                if self.intent in (IntentType.UNKNOWN, IntentType.UPSERT_DRAFT):
-                    self.intent = IntentType.RECORD_MAINTENANCE
-                self.is_critical_action = True
-                if not self.maintenance and (tc.itens or tc.km is not None or tc.data or tc.oficina or tc.valor is not None):
-                    self.maintenance = MaintenanceDraft(
-                        components=list(tc.itens or []),
-                        service_summary=", ".join(tc.itens) if tc.itens else None,
-                        odometer_km=tc.km,
-                        date_str=tc.data,
-                        workshop_name=tc.oficina,
-                        total_cost=tc.valor,
+                has_vehicle_fields = any(
+                    v is not None
+                    for v in (
+                        tc.make,
+                        tc.brand,
+                        tc.model,
+                        tc.version,
+                        tc.year,
+                        tc.plate,
+                        tc.odometer,
+                        tc.engine,
+                        tc.transmission,
+                        tc.steering,
+                        tc.vehicle_type,
+                        tc.fuel_type,
                     )
+                )
+                has_maint_fields = any(
+                    v is not None
+                    for v in (tc.itens, tc.data, tc.oficina, tc.valor)
+                )
+
+                if self.intent == IntentType.REGISTER_VEHICLE or self.vehicle is not None or (has_vehicle_fields and not has_maint_fields):
+                    self.intent = IntentType.REGISTER_VEHICLE
+                    self.is_critical_action = True
+                    odo = tc.odometer if tc.odometer is not None else tc.km
+                    if not self.vehicle and (has_vehicle_fields or odo is not None):
+                        self.vehicle = VehicleDraft(
+                            make=tc.make or tc.brand,
+                            brand=tc.brand or tc.make,
+                            model=tc.model,
+                            version=tc.version,
+                            year=tc.year,
+                            plate=tc.plate,
+                            odometer_km=odo,
+                            odometer=odo,
+                            engine=tc.engine,
+                            transmission=tc.transmission,
+                            steering=tc.steering,
+                            vehicle_type=tc.vehicle_type,
+                            fuel_type=tc.fuel_type,
+                        )
+                    elif self.vehicle and (has_vehicle_fields or odo is not None):
+                        if tc.make or tc.brand:
+                            self.vehicle.make = self.vehicle.make or tc.make or tc.brand
+                            self.vehicle.brand = self.vehicle.brand or tc.brand or tc.make
+                        if tc.model:
+                            self.vehicle.model = self.vehicle.model or tc.model
+                        if tc.version:
+                            self.vehicle.version = self.vehicle.version or tc.version
+                        if tc.year is not None:
+                            self.vehicle.year = self.vehicle.year or tc.year
+                        if tc.plate:
+                            self.vehicle.plate = self.vehicle.plate or tc.plate
+                        if odo is not None and self.vehicle.odometer_km is None:
+                            self.vehicle.odometer_km = odo
+                            self.vehicle.odometer = odo
+                        if tc.engine:
+                            self.vehicle.engine = self.vehicle.engine or tc.engine
+                        if tc.transmission:
+                            self.vehicle.transmission = self.vehicle.transmission or tc.transmission
+                        if tc.steering:
+                            self.vehicle.steering = self.vehicle.steering or tc.steering
+                        if tc.vehicle_type:
+                            self.vehicle.vehicle_type = self.vehicle.vehicle_type or tc.vehicle_type
+                        if tc.fuel_type:
+                            self.vehicle.fuel_type = self.vehicle.fuel_type or tc.fuel_type
+                else:
+                    if self.intent in (IntentType.UNKNOWN, IntentType.UPSERT_DRAFT):
+                        self.intent = IntentType.RECORD_MAINTENANCE
+                    self.is_critical_action = True
+                    if not self.maintenance and (tc.itens or tc.km is not None or tc.data or tc.oficina or tc.valor is not None):
+                        self.maintenance = MaintenanceDraft(
+                            components=list(tc.itens or []),
+                            service_summary=", ".join(tc.itens) if tc.itens else None,
+                            odometer_km=tc.km,
+                            date_str=tc.data,
+                            workshop_name=tc.oficina,
+                            total_cost=tc.valor,
+                        )
             elif tc.name == "confirm_and_save_draft":
                 self.intent = IntentType.CONFIRM_ACTION
                 self.is_critical_action = False

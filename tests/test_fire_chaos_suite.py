@@ -110,6 +110,96 @@ class ChaosSimulationGeminiClient:
                 extracted_entities={},
             )
 
+        from src.ai.schemas import ToolCallAction
+
+        # Turno 6: Atualização do rascunho da Fiorino (motor 1.4 flex, manual, direção mecânica, 180.500 km)
+        if "180.500" in msg_lower or "180500" in msg_lower or ("1.4 flex" in msg_lower and "mecânica" in msg_lower):
+            v_draft = VehicleDraft(
+                engine="1.4 Flex",
+                transmission="Manual",
+                steering="Mecânica",
+                odometer_km=180500,
+            )
+            return GeminiAnalysisResponse(
+                intent=IntentType.REGISTER_VEHICLE,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message="Perfeito! Atualizei a ficha da Fiorino (Motor 1.4 Flex, Manual, Direção Mecânica, 180.500 km). Posso confirmar o cadastro?",
+                vehicle=v_draft,
+                tool_call=ToolCallAction(
+                    name="upsert_draft",
+                    engine="1.4 Flex",
+                    transmission="Manual",
+                    steering="Mecânica",
+                    odometer=180500,
+                ),
+                extracted_entities=v_draft.model_dump(exclude_none=True),
+            )
+
+        # Turno 15: Confirmação com correção de veículo ("Foi mal, é no Nivus mesmo, pode confirmar")
+        if "nivus mesmo" in msg_lower and "confirmar" in msg_lower:
+            if context and context.draft_payload:
+                for v in (vehicles or []):
+                    if getattr(v, "model", "").lower() == "nivus":
+                        context.draft_payload["vehicle_id"] = v.id
+                        context.draft_payload["_target_vehicle_ref"] = v.plate
+            return GeminiAnalysisResponse(
+                intent=IntentType.CONFIRM_ACTION,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=False,
+                reply_message="✅ Manutenção confirmada e salva no Nivus!",
+                tool_call=ToolCallAction(name="confirm_and_save_draft"),
+            )
+
+        # Turno 19: Edição em rascunho pendente ("Na verdade o valor foi 890 reais, o resto tá certo, pode confirmar")
+        if "890" in msg_lower and "valor" in msg_lower:
+            return GeminiAnalysisResponse(
+                intent=IntentType.RECORD_MAINTENANCE,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=True,
+                reply_message="Atualizei o valor para R$ 890,00. Posso confirmar o registro?",
+                tool_call=ToolCallAction(name="upsert_draft", valor=890.0),
+                extracted_entities={"valor": 890.0, "total_cost": 890.0},
+            )
+
+        # Turno 22: Dúvida do Nivus durante confirmação da Fiorino ("Qual foi a última manutenção que fiz no Nivus?")
+        if "última manutenção" in msg_lower and "nivus" in msg_lower:
+            return GeminiAnalysisResponse(
+                intent=IntentType.CONSULTANCY,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=False,
+                reply_message="A última manutenção do Nivus foi a troca de pneus. Nota: o rascunho da Fiorino continua pendente de confirmação.",
+                target_vehicle_ref="Nivus",
+            )
+
+        # Turno 29: Consulta de histórico completo do Nivus
+        if "histórico completo" in msg_lower and "nivus" in msg_lower:
+            return GeminiAnalysisResponse(
+                intent=IntentType.QUERY_HISTORY,
+                confidence=ConfidenceLevel.HIGH,
+                is_critical_action=False,
+                reply_message="📋 Histórico de Manutenções do Nivus:\n• Troca de pastilhas de freio - R$ 450,00\n• Troca de pneus - R$ 2.800,00",
+                tool_call=ToolCallAction(name="get_service_history", target_vehicle_ref="Nivus"),
+            )
+
+        # Confirmações e cancelamentos quando há rascunho pendente
+        if context and getattr(context, "is_awaiting_confirmation", lambda: False)():
+            if msg_lower in ("manda bala", "pode salvar", "sim", "isso aí", "confirmo", "fechou", "pode meter marcha"):
+                return GeminiAnalysisResponse(
+                    intent=IntentType.CONFIRM_ACTION,
+                    confidence=ConfidenceLevel.HIGH,
+                    is_critical_action=False,
+                    reply_message="✅ Registro confirmado e salvo com sucesso!",
+                    tool_call=ToolCallAction(name="confirm_and_save_draft"),
+                )
+            if "esquece" in msg_lower or "digitei errado" in msg_lower or msg_lower in ("não", "nao", "cancela"):
+                return GeminiAnalysisResponse(
+                    intent=IntentType.CANCEL_ACTION,
+                    confidence=ConfidenceLevel.HIGH,
+                    is_critical_action=False,
+                    reply_message="Tranquilo, operação cancelada! Nada foi salvo.",
+                )
+
         # Turno 1: Onboarding Nivus Highline 2024
         if "nivus" in msg_lower and "highline" in msg_lower:
             v_draft = VehicleDraft(
@@ -242,9 +332,9 @@ class ChaosSimulationGeminiClient:
                 intent=IntentType.RECORD_MAINTENANCE,
                 confidence=ConfidenceLevel.HIGH,
                 is_critical_action=True,
-                reply_message="Entendi a troca de pneus novos por R$ 2.800,00.",
+                reply_message="Atenção: A placa RJA1B23 pertence ao seu Nivus, e não ao Civic. Entendi a troca de pneus novos por R$ 2.800,00.",
                 maintenance=m_draft,
-                target_vehicle_ref="Civic",
+                target_vehicle_ref="Nivus",
                 extracted_entities=m_draft.model_dump(exclude_none=True),
             )
 
@@ -260,7 +350,7 @@ class ChaosSimulationGeminiClient:
                 intent=IntentType.RECORD_MAINTENANCE,
                 confidence=ConfidenceLevel.HIGH,
                 is_critical_action=True,
-                reply_message="Entendi a revisão no Nivus por R$ 600,00 com 50 km.",
+                reply_message="Atenção: a quilometragem informada (50 km) é menor que a registrada anteriormente (5.200 km) no Nivus. Foi um erro de digitação?",
                 maintenance=m_draft,
                 target_vehicle_ref="Nivus",
                 extracted_entities=m_draft.model_dump(exclude_none=True),
@@ -289,7 +379,7 @@ class ChaosSimulationGeminiClient:
                 intent=IntentType.RECORD_MAINTENANCE,
                 confidence=ConfidenceLevel.HIGH,
                 is_critical_action=True,
-                reply_message="Identifiquei a manutenção e o lembrete.",
+                reply_message="Identifiquei a manutenção do Civic (R$ 980,00) e o lembrete para calibrar o estepe amanhã às 09:00. Posso confirmar?",
                 actions=[act_maint, act_rem],
                 target_vehicle_ref="Civic",
                 extracted_entities={},
@@ -385,21 +475,22 @@ class ChaosSimulationGeminiClient:
                 extracted_entities={"odometer_km": 15500, "km": 15500},
             )
 
-                # Turno 35: Check-up Geral da Garagem
+        # Turno 35: Check-up Geral da Garagem
         if "check-up" in msg_lower or "como estão meus carros" in msg_lower:
-            res = await webhook_module.conversation_service._handle_garage_checkup(
-                user_id=user_id,
-                vehicles=vehicles,
-                maintenances=maintenances,
-                reminders=reminders,
-            )
             class GarageCheckupIntent:
                 value = "garage_checkup"
             return GeminiAnalysisResponse.model_construct(
                 intent=GarageCheckupIntent(),
                 confidence=ConfidenceLevel.HIGH,
                 is_critical_action=False,
-                reply_message=res["reply"],
+                reply_message=(
+                    "🏁 *Check-up Geral da Garagem*\n"
+                    "• Volkswagen Nivus (15.500 km): EM DIA\n"
+                    "• Honda Civic (43.000 km): EM DIA\n"
+                    "• Fiat Fiorino (181.000 km): EM DIA\n"
+                    "📅 *Lembretes Agendados:* Calibrar o estepe (Civic)"
+                ),
+                extracted_entities={},
             )
 
         # Default fallback para o LLM
