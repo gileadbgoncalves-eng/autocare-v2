@@ -17,7 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     JSON,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 
 from .session import Base
 from src.domain.enums import (
@@ -80,6 +80,10 @@ class VehicleModel(Base):
     usage_profile: Mapped[str] = mapped_column(String(30), default=UsageProfile.CONVENCIONAL.value)
     current_km: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Sinônimos relacionais para os 9 campos padronizados de onboarding
+    brand = synonym("make")
+    odometer = synonym("current_km")
 
     # Relacionamentos
     user: Mapped["UserModel"] = relationship("UserModel", back_populates="vehicles")

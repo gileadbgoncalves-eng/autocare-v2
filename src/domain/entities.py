@@ -6,7 +6,7 @@ Garante imutabilidade, validação de regras de integridade e serialização rá
 
 import datetime as dt
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .enums import (
     ConversationState,
@@ -63,22 +63,38 @@ class User(BaseModel):
 
 
 class Vehicle(BaseModel):
-    """Entidade do Veículo (Carro, Moto ou Caminhonete) cadastrado na garagem."""
+    """Entidade do Veículo (Carro, Moto ou Caminhonete) cadastrado na garagem com os 9 campos padronizados."""
     id: Optional[int] = Field(default=None, description="Identificador único no banco de dados")
     user_id: str = Field(..., description="ID do proprietário do veículo")
-    make: str = Field(..., description="Montadora / Fabricante (ex: Fiat, Honda, Toyota)")
+    brand: Optional[str] = Field(default=None, description="Marca / Montadora (ex: Fiat, Honda, Toyota, Volkswagen)")
+    make: Optional[str] = Field(default=None, description="Montadora / Fabricante (alias de brand)")
     model: str = Field(..., description="Modelo do veículo (ex: Palio, CG 160 Titan, Corolla)")
     year: Optional[int] = Field(default=None, description="Ano de fabricação / modelo")
     plate: Optional[str] = Field(default=None, description="Placa no formato Mercosul ou antigo")
-    engine: Optional[str] = Field(default=None, description="Motorização (ex: 1.0 Fire, 160cc, 2.0 Dynamic)")
-    version: Optional[str] = Field(default=None, description="Versão de acabamento (ex: Attractive, EX, XEi)")
-    transmission: Optional[str] = Field(default=None, description="Tipo de transmissão (Manual, Automático, CVT)")
-    steering: Optional[str] = Field(default=None, description="Tipo de direção (Hidráulica, Elétrica, Mecânica)")
+    odometer: Optional[int] = Field(default=None, ge=0, description="Quilometragem atual no odômetro")
+    current_km: Optional[int] = Field(default=None, ge=0, description="Quilometragem atual no odômetro (alias de odometer)")
+    version: Optional[str] = Field(default=None, description="Versão de acabamento (ex: Fire, Attractive, XEi, Highline)")
+    engine: Optional[str] = Field(default=None, description="Motorização (ex: 1.0, 1.4, 2.0, aspirado, turbo)")
+    transmission: Optional[str] = Field(default=None, description="Câmbio (manual, automático, automatizado, CVT)")
+    steering: Optional[str] = Field(default=None, description="Direção (mecânica, hidráulica, elétrica, eletro-hidráulica)")
     vehicle_type: VehicleType = Field(default=VehicleType.CARRO)
     fuel_type: FuelType = Field(default=FuelType.FLEX)
     usage_profile: UsageProfile = Field(default=UsageProfile.CONVENCIONAL)
-    current_km: Optional[int] = Field(default=None, ge=0, description="Quilometragem atual no odômetro")
     created_at: dt.datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def sync_brand_and_odometer(self) -> "Vehicle":
+        if not self.make and self.brand:
+            self.make = self.brand
+        elif not self.brand and self.make:
+            self.brand = self.make
+        elif not self.make and not self.brand:
+            self.make = self.brand = "Desconhecido"
+        if self.current_km is None and self.odometer is not None:
+            self.current_km = self.odometer
+        elif self.odometer is None and self.current_km is not None:
+            self.odometer = self.current_km
+        return self
 
     @field_validator("plate")
     @classmethod

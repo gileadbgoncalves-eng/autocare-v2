@@ -632,3 +632,220 @@ async def test_adversarial_plate_validation_and_corrective_negation_deep_merge()
         assert saved_vehs[0].year == 2008
         assert saved_vehs[0].steering == "Hidráulica"
         assert saved_vehs[0].current_km == 98500
+
+
+@pytest.mark.asyncio
+async def test_complete_vehicle_onboarding_9_fields_and_optional_specs_skip():
+    """
+    Valida o Playbook de Onboarding Veicular Completo (9 campos padronizados:
+    brand, model, year, plate, odometer, version, engine, transmission, steering):
+    - Cenário A: Condutor informa todos os 9 dados -> rascunho preenchido 100% e persistido no SQLite.
+    - Cenário B: Condutor pula as especificações técnicas (version, engine, transmission, steering) ->
+      veículo é salvo com sucesso no SQLite com esses campos nulos/None, sem travar o onboarding.
+    """
+    from datetime import timezone
+    from src.ai.schemas import VehicleDraft
+    from src.domain.entities import Vehicle
+    from src.domain.enums import IntentType
+    from src.infrastructure.database.models import VehicleModel
+    from src.infrastructure.database.repositories import VehicleRepository, UserRepository
+    from src.infrastructure.database.session import init_db, async_session_factory
+    from src.interfaces.api.webhook import _persist_confirmed_data
+
+    required_9_fields = ("brand", "model", "year", "plate", "odometer", "version", "engine", "transmission", "steering")
+    for field_name in required_9_fields:
+        assert field_name in VehicleDraft.model_fields, f"Campo {field_name} ausente em VehicleDraft"
+        assert field_name in Vehicle.model_fields, f"Campo {field_name} ausente em Vehicle"
+        assert hasattr(VehicleModel, field_name), f"Atributo {field_name} ausente em VehicleModel"
+
+    # Valida que o Playbook em 5 etapas consta no SYSTEM_INSTRUCTION
+    assert "Etapa 1: Dados Básicos (Marca, Modelo e Ano)" in SYSTEM_INSTRUCTION
+    assert "Etapa 2: Identificação e Odômetro (Placa e KM atual)" in SYSTEM_INSTRUCTION
+    assert "Etapa 3: Ficha Técnica (Versão, Motor, Câmbio e Direção)" in SYSTEM_INSTRUCTION
+    assert "Etapa 4: Confirmação e Salvamento" in SYSTEM_INSTRUCTION
+    assert "Etapa 5: Engajamento Imediato Pós-Salvamento" in SYSTEM_INSTRUCTION
+
+    await init_db()
+    now_ts = datetime(2026, 11, 7, 15, 0, tzinfo=timezone.utc)
+
+    # =========================================================================
+    # CENÁRIO A: Condutor informa todos os 9 dados -> rascunho 100% preenchido
+    # =========================================================================
+    service_a = ConversationService()
+    user_a = "5511999998901"
+
+    turns_a = [
+        # Turno 1 (Etapa 1): Marca, Modelo e Ano
+        GeminiAnalysisResponse(
+            intent=IntentType.REGISTER_VEHICLE,
+            confidence=ConfidenceLevel.HIGH,
+            is_critical_action=True,
+            reply_message="Ótimo, um Fiat Palio 2008! Qual é a placa e a quilometragem atual dele?",
+            tool_call=ToolCallAction(name="upsert_draft", brand="Fiat", model="Palio", year=2008),
+        ),
+        # Turno 2 (Etapa 2): Placa e Odômetro
+        GeminiAnalysisResponse(
+            intent=IntentType.REGISTER_VEHICLE,
+            confidence=ConfidenceLevel.HIGH,
+            is_critical_action=True,
+            reply_message="Para calibrar os planos de revisão: qual é a versão (ex: Attractive, Fire), o motor (ex: 1.0, 1.4), o câmbio (manual ou automático) e o tipo de direção (mecânica, hidráulica ou elétrica) dele?",
+            tool_call=ToolCallAction(name="upsert_draft", plate="KXY-1234", odometer=144000),
+        ),
+        # Turno 3 (Etapa 3): Ficha técnica completa (versão, motor, câmbio, direção)
+        GeminiAnalysisResponse(
+            intent=IntentType.REGISTER_VEHICLE,
+            confidence=ConfidenceLevel.HIGH,
+            is_critical_action=True,
+            reply_message="Resumo do veículo: Fiat Palio Fire 2008, motor 1.0, câmbio Manual, direção Hidráulica, placa KXY1234 e 144.000 km. Posso salvar na garagem?",
+            tool_call=ToolCallAction(
+                name="upsert_draft",
+                version="Fire",
+                engine="1.0",
+                transmission="Manual",
+                steering="Hidráulica",
+            ),
+        ),
+        # Turno 4 (Etapas 4 e 5): Confirmação e salvamento com engajamento pós-cadastro
+        GeminiAnalysisResponse(
+            intent=IntentType.CONFIRM_ACTION,
+            confidence=ConfidenceLevel.HIGH,
+            is_critical_action=False,
+            reply_message="✅ Veículo cadastrado com sucesso na garagem! Deseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?",
+            tool_call=ToolCallAction(name="confirm_and_save_draft"),
+        ),
+    ]
+    idx_a = 0
+
+    class StepGeminiA:
+        async def analyze_message(self, *args, **kwargs):
+            nonlocal idx_a
+            resp = turns_a[idx_a]
+            idx_a += 1
+            return resp
+
+    service_a.gemini = StepGeminiA()
+
+    await service_a.handle_incoming_message(user_id=user_a, message_text="Quero cadastrar um Fiat Palio 2008", vehicles=[])
+    await service_a.handle_incoming_message(user_id=user_a, message_text="Placa KXY-1234 e está com 144.000 km", vehicles=[])
+    r3_a = await service_a.handle_incoming_message(user_id=user_a, message_text="Versão Fire, motor 1.0, manual, direção hidráulica", vehicles=[])
+
+    draft_a = r3_a["draft"]
+    assert draft_a["brand"] == "Fiat"
+    assert draft_a["model"] == "Palio"
+    assert draft_a["year"] == 2008
+    assert draft_a["plate"] == "KXY1234"
+    assert draft_a["odometer"] == 144000
+    assert draft_a["version"] == "Fire"
+    assert draft_a["engine"] == "1.0"
+    assert draft_a["transmission"] == "Manual"
+    assert draft_a["steering"] == "Hidráulica"
+
+    # Verifica que build_draft_atual_dict expõe todos os 9 campos para a IA
+    invisible_draft_a = build_draft_atual_dict(service_a.get_context(user_a))
+    for k in required_9_fields:
+        assert invisible_draft_a[k] is not None, f"Campo {k} deveria estar preenchido em draft_atual"
+
+    r4_a = await service_a.handle_incoming_message(user_id=user_a, message_text="Sim, pode salvar", vehicles=[])
+    assert r4_a["action_type"] == "action_confirmed"
+    assert "Deseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?" in r4_a["reply"]
+
+    async with async_session_factory() as session:
+        await UserRepository(session).reset_user_data(user_a)
+        await UserRepository(session).get_or_create(user_id=user_a)
+        out_a = await _persist_confirmed_data(session, user_a, r4_a["action_type"], r4_a["committed_data"], [], now_ts)
+        assert len(out_a["success"]) == 1
+        vehs_a = await VehicleRepository(session).get_vehicles_by_user_id(user_a)
+        assert len(vehs_a) == 1
+        va = vehs_a[0]
+        assert va.brand == "Fiat" and va.make == "Fiat"
+        assert va.model == "Palio"
+        assert va.year == 2008
+        assert va.plate == "KXY1234"
+        assert va.odometer == 144000 and va.current_km == 144000
+        assert va.version == "Fire"
+        assert va.engine == "1.0"
+        assert va.transmission == "Manual"
+        assert va.steering == "Hidráulica"
+
+    # =========================================================================
+    # CENÁRIO B: Condutor pula as especificações técnicas (version/engine/transmission/steering)
+    # -> veículo é salvo com sucesso com esses campos nulos/None, sem travar o onboarding
+    # =========================================================================
+    service_b = ConversationService()
+    user_b = "5511999998902"
+
+    turns_b = [
+        # Turno 1: Marca, Modelo, Ano, Placa e Odômetro
+        GeminiAnalysisResponse(
+            intent=IntentType.REGISTER_VEHICLE,
+            confidence=ConfidenceLevel.HIGH,
+            is_critical_action=True,
+            reply_message="Anotei seu Fiat Palio 2008 (placa ABC-1234, 95.000 km). Para calibrar os planos de revisão: qual é a versão, o motor, o câmbio e o tipo de direção dele?",
+            tool_call=ToolCallAction(name="upsert_draft", brand="Fiat", model="Palio", year=2008, plate="ABC-1234", odometer=95000),
+        ),
+        # Turno 2: Usuário responde 'não sei, pode salvar só com isso' -> IA não insiste e salva com campos opcionais None
+        GeminiAnalysisResponse(
+            intent=IntentType.CONFIRM_ACTION,
+            confidence=ConfidenceLevel.HIGH,
+            is_critical_action=False,
+            reply_message="Sem problemas! Salvei seu Fiat Palio 2008 (placa ABC1234, 95.000 km) e você pode completar a ficha técnica quando quiser. Deseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?",
+            tool_call=ToolCallAction(name="confirm_and_save_draft"),
+        ),
+    ]
+    idx_b = 0
+
+    class StepGeminiB:
+        async def analyze_message(self, *args, **kwargs):
+            nonlocal idx_b
+            resp = turns_b[idx_b]
+            idx_b += 1
+            return resp
+
+    service_b.gemini = StepGeminiB()
+
+    r1_b = await service_b.handle_incoming_message(
+        user_id=user_b,
+        message_text="Quero cadastrar meu Fiat Palio 2008 placa ABC-1234 com 95000 km",
+        vehicles=[],
+    )
+    assert r1_b["action_type"] == "awaiting_confirmation"
+    assert r1_b["draft"]["version"] is None
+    assert r1_b["draft"]["engine"] is None
+    assert r1_b["draft"]["transmission"] is None
+    assert r1_b["draft"]["steering"] is None
+
+    r2_b = await service_b.handle_incoming_message(
+        user_id=user_b,
+        message_text="não sei, depois vejo, pode salvar só com isso",
+        vehicles=[],
+    )
+    assert r2_b["action_type"] == "action_confirmed"
+    committed_b = r2_b["committed_data"]
+    assert committed_b["brand"] == "Fiat"
+    assert committed_b["model"] == "Palio"
+    assert committed_b["year"] == 2008
+    assert committed_b["plate"] == "ABC1234"
+    assert committed_b["odometer"] == 95000
+    assert committed_b["version"] is None
+    assert committed_b["engine"] is None
+    assert committed_b["transmission"] is None
+    assert committed_b["steering"] is None
+
+    async with async_session_factory() as session:
+        await UserRepository(session).reset_user_data(user_b)
+        await UserRepository(session).get_or_create(user_id=user_b)
+        out_b = await _persist_confirmed_data(session, user_b, r2_b["action_type"], committed_b, [], now_ts)
+        assert len(out_b["success"]) == 1
+        assert out_b["failed"] == []
+        vehs_b = await VehicleRepository(session).get_vehicles_by_user_id(user_b)
+        assert len(vehs_b) == 1
+        vb = vehs_b[0]
+        assert vb.brand == "Fiat"
+        assert vb.model == "Palio"
+        assert vb.year == 2008
+        assert vb.plate == "ABC1234"
+        assert vb.odometer == 95000 and vb.current_km == 95000
+        assert vb.version is None
+        assert vb.engine is None
+        assert vb.transmission is None
+        assert vb.steering is None

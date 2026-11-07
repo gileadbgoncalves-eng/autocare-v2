@@ -390,8 +390,15 @@ class ConversationService:
         elif state == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM or committed.get("_action_state") == ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value:
             committed["_action_state"] = ConversationState.AWAITING_VEHICLE_REGISTRATION_CONFIRM.value
             committed["intent"] = IntentType.REGISTER_VEHICLE.value
-            committed.setdefault("odometer_km", committed.get("km"))
-            committed.setdefault("km", committed.get("odometer_km"))
+            brand_or_make = committed.get("brand") or committed.get("make")
+            if brand_or_make:
+                committed.setdefault("brand", brand_or_make)
+                committed.setdefault("make", brand_or_make)
+            odo_val = committed.get("odometer") if committed.get("odometer") is not None else (committed.get("odometer_km") if committed.get("odometer_km") is not None else committed.get("km"))
+            if odo_val is not None:
+                committed["odometer"] = committed["odometer_km"] = committed["km"] = int(odo_val)
+            for opt_key in ("version", "engine", "transmission", "steering", "year", "plate"):
+                committed.setdefault(opt_key, None)
         elif state == ConversationState.AWAITING_MAINTENANCE_CONFIRM or committed.get("_action_state") == ConversationState.AWAITING_MAINTENANCE_CONFIRM.value:
             committed["_action_state"] = ConversationState.AWAITING_MAINTENANCE_CONFIRM.value
             committed["intent"] = IntentType.RECORD_MAINTENANCE.value
@@ -520,6 +527,8 @@ class ConversationService:
                 incoming["fuel_type"] = fuel_val
 
             merged = {**existing, **incoming}
+            for opt_key in ("brand", "make", "model", "year", "plate", "odometer", "odometer_km", "version", "engine", "transmission", "steering"):
+                merged.setdefault(opt_key, None)
             merged.setdefault("vehicle_type", VehicleType.CARRO.value)
             merged.setdefault("fuel_type", FuelType.FLEX.value)
 

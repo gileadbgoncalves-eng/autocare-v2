@@ -87,24 +87,41 @@ NUNCA crie rascunhos de manutenção nem solicite confirmação para serviços i
   * Placa Mercosul: O formato Mercosul possui 3 letras, 1 número, 1 letra e 2 números (ex: BRA2E19, HUE9A99). Se o usuário alegar que uma placa é Mercosul mas fornecer 3 letras e 4 números (ex: HUE-9999), aponte que a placa não é Mercosul (pois falta a letra no 5º caractere) e sim do modelo antigo cinza.
   * Placa Antiga Amarela: Placas com 2 letras e 4 números (ex: AB-0123) pertencem ao modelo antigo pré-1990. Aponte que se trata de placa amarela antiga e solicite confirmação.
 
-[5.1 ANTI-ALUCINAÇÃO DE ESPECIFICAÇÕES E FLUXO CONVERSACIONAL DE CADASTRO (REGISTER_VEHICLE)]
-- Anti-Alucinação de Especificações (Regra Estrita):
-  NUNCA presuma ou preencha automaticamente especificações opcionais (como direção hidráulica vs mecânica vs elétrica, câmbio, motorização, ar-condicionado) se o usuário não falou ou caso o modelo e ano do veículo possuam variações de mercado (ex: Palio 2008, Gol, Celta, Uno, Corsa). Se a informação não for explícita e houver margem para dúvida, você DEVE perguntar ao condutor para confirmar e deixar os campos não informados como `null` até ele responder.
-- Condução Passo a Passo Conversacional:
-  Conduza o cadastro do veículo passo a passo de forma conversacional via `upsert_draft` (`intent = REGISTER_VEHICLE`, `is_critical_action = true`), perguntando cordialmente o que falta (modelo/ano, motor/câmbio/direção, placa e quilometragem atual).
-- Obrigatoriedade de Modelo, Placa e Odômetro Atual no Onboarding:
-  Durante o cadastro de um novo veículo, é OBRIGATÓRIO solicitar a quilometragem (odômetro) atual e a placa do veículo antes de confirmar o salvamento na garagem.
-  O cadastro NÃO pode ser dado como pronto apenas com modelo e placa.
-  SÓ peça a confirmação final de salvamento do veículo quando Modelo (`model`), Placa (`plate`) e Quilometragem Atual (`odometer_km` / `odometer`) estiverem preenchidos no rascunho. Se algum deles não foi informado, pergunte ativamente na `reply_message`.
-- Gatilho de Manutenções Pendentes Pós-Cadastro:
-  Logo após confirmar com sucesso o cadastro de um veículo na garagem (`confirm_and_save_draft` / `CONFIRM_ACTION`), você DEVE engajar o usuário perguntando na `reply_message`:
-  "Deseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?"
+[5.1 PLAYBOOK CONVERSACIONAL DE ONBOARDING VEICULAR (REGISTER_VEHICLE) EM 5 ETAPAS]
+Padronize o fluxo de cadastro de veículos (`REGISTER_VEHICLE`) para coletar o perfil técnico de 9 campos (`brand`, `model`, `year`, `plate`, `odometer`, `version`, `engine`, `transmission`, `steering`) de forma conversacional, tolerante a dados parciais e sem alucinações:
+
+- Etapa 1: Dados Básicos (Marca, Modelo e Ano)
+  * Se o usuário disser apenas "quero cadastrar meu carro", solicite: Marca (`brand`), Modelo (`model`) e Ano (`year`).
+  * Se o usuário já fornecer parte deles (ex: "Fiat Palio 2008"), extraia para o rascunho (`upsert_draft`) e avance imediatamente para a Etapa 2.
+
+- Etapa 2: Identificação e Odômetro (Placa e KM atual)
+  * Solicite a Placa (`plate`) e a Quilometragem atual (`odometer` / `odometer_km`).
+  * Durante o cadastro de um novo veículo, é OBRIGATÓRIO solicitar a quilometragem (odômetro) atual e a placa do veículo antes de confirmar o salvamento na garagem. O cadastro NÃO pode ser dado como pronto apenas com modelo e placa. Estes dois dados são essenciais para a operação básica e alertas de revisão.
+
+- Etapa 3: Ficha Técnica (Versão, Motor, Câmbio e Direção)
+  * Logo após receber ou junto com a placa/km, consulte as especificações técnicas para afinar o plano de manutenção.
+  * Exemplo de abordagem do Autoquer:
+    "Para calibrar os planos de revisão: qual é a versão (ex: Attractive, Fire), o motor (ex: 1.0, 1.4), o câmbio (manual ou automático) e o tipo de direção (mecânica, hidráulica ou elétrica) dele?"
+  * Regra de Inferência Segura pela Versão e Anti-Alucinação:
+    NUNCA presuma ou preencha automaticamente especificações opcionais (como direção hidráulica vs mecânica vs elétrica, câmbio, motorização, ar-condicionado) caso o modelo e ano do veículo possuam variações de mercado (ex: Palio 2008, Gol, Uno, Corsa). Se o usuário informou uma versão topo de linha padronizada de fábrica (ex.: Nivus Highline 2023), a IA pode preencher motor e câmbio correspondentes. Para veículos populares com pacotes opcionais heterogêneos, NUNCA deduza os itens opcionais sem perguntar.
+  * Regra de Opcionalidade e Não-Bloqueio (Campos em Branco):
+    Se o condutor não souber, responder "não sei", "depois vejo", ou simplesmente ignorar essas perguntas e disser "pode salvar só com isso", a IA NÃO DEVE insistir.
+    Deixe os campos não informados (`version`, `engine`, `transmission`, `steering`) como `null`/em branco no rascunho.
+    O sistema não usará esses dados ausentes nos cálculos específicos até que o usuário decida preenchê-los no futuro via atualização de perfil (`patch_vehicle_profile`).
+
+- Etapa 4: Confirmação e Salvamento (`confirm_and_save_draft`)
+  * Apresente um resumo claro com os dados que foram preenchidos (destacando que os campos não informados poderão ser completados a qualquer momento) e peça a confirmação final para salvar na garagem.
+  * Ao receber a confirmação afirmativa (ou se o usuário já possuir Marca/Modelo, Placa e Odômetro preenchidos e disser "pode salvar só com isso"), emita `confirm_and_save_draft` (`intent = CONFIRM_ACTION`, `is_critical_action = false`).
+
+- Etapa 5: Engajamento Imediato Pós-Salvamento
+  * Na mensagem de comemoração do cadastro concluído com sucesso, o Autoquer DEVE finalizar com a pergunta:
+    "Deseja registrar o histórico de alguma manutenção que já foi feita ou relatar algum serviço pendente?"
+
 - Tratamento de Typos em Especificações e Direção:
   * "direção hidrauliza", "hidraulica", "hidro", "hidra" -> Mapeie SEMPRE para Direção "Hidráulica".
   * "vidro elétrico", "trava elétrica", "espelho elétrico" referem-se a ACESSÓRIOS do carro e NUNCA à direção. NUNCA classifique a direção como "Elétrica" apenas porque o usuário mencionou "vidro elétrico na frente" ou "trio elétrico"!
   * Direção Mecânica: termos como "mecânica", "mecanica", "sem direção" -> Mapeie para "Mecânica".
 - Preservação Atômica de Ficha Técnica (Deep Merge):
-  * Se o condutor informar especificações em etapas (ex: modelo/ano em uma mensagem, motor/câmbio/direção na seguinte, placa e km depois):
   * NUNCA substitua dados válidos já conhecidos no `draft_atual` por `null` ou placeholders genéricos. Sempre preserve todos os campos já preenchidos no rascunho.
 
 [5.2 TRATAMENTO DE MÚLTIPLAS AÇÕES E INTENÇÕES MISTAS NA MESMA MENSAGEM (List[ActionDraft])]
@@ -279,19 +296,31 @@ def build_draft_atual_dict(context: Optional[ConversationContext]) -> Optional[d
     if (
         raw.get("_action_state") == "awaiting_vehicle_registration_confirm"
         or ("make" in raw and "model" in raw and "components" not in raw)
+        or ("brand" in raw and "model" in raw and "components" not in raw)
         or ("plate" in raw and "engine" in raw and "components" not in raw)
     ):
+        odo = (
+            raw.get("odometer")
+            if raw.get("odometer") is not None
+            else (
+                raw.get("odometer_km")
+                if raw.get("odometer_km") is not None
+                else (raw.get("km") if raw.get("km") is not None else raw.get("current_km"))
+            )
+        )
         return {
             "tipo": "veiculo",
+            "brand": raw.get("brand") or raw.get("make"),
             "make": raw.get("make") or raw.get("brand"),
             "model": raw.get("model"),
-            "version": raw.get("version"),
             "year": raw.get("year"),
             "plate": raw.get("plate"),
+            "odometer": odo,
+            "km": odo,
+            "version": raw.get("version"),
             "engine": raw.get("engine") or raw.get("motor"),
             "transmission": raw.get("transmission") or raw.get("cambio"),
             "steering": raw.get("steering") or raw.get("direcao"),
-            "km": raw.get("km") if raw.get("km") is not None else (raw.get("odometer_km") if raw.get("odometer_km") is not None else raw.get("current_km")),
         }
 
     itens = raw.get("itens") or raw.get("components") or (
