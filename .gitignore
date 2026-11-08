@@ -38,3 +38,5 @@ htmlcov/
 
 # Pasta isolada de arquivos legados da V1
 v1_ponto_de_parada_total/
+
+DUMP_*.md
