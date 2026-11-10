@@ -504,12 +504,24 @@ def _maint_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     desc_val = data.get("description") or sub.get("description") or data.get("service_summary") or sub.get("service_summary") or "Manutenção realizada"
     comp_val = data.get("itens") or data.get("components") or sub.get("components") or [desc_val]
     cost_val = data.get("valor") if data.get("valor") is not None else (data.get("total_cost") if data.get("total_cost") is not None else (sub.get("valor") if sub.get("valor") is not None else sub.get("total_cost", 0.0)))
+    raw_date_val = (
+        data.get("data")
+        or data.get("date_str")
+        or data.get("date")
+        or data.get("service_date")
+        or data.get("data_manutencao")
+        or sub.get("data")
+        or sub.get("date_str")
+        or sub.get("date")
+        or sub.get("service_date")
+        or sub.get("data_manutencao")
+    )
     return {
         "km": data.get("km") or data.get("odometer_km") or sub.get("odometer_km") or sub.get("km"),
         "description": desc_val,
         "components": comp_val if isinstance(comp_val, list) else [str(comp_val)],
         "cost": float(cost_val or 0.0),
-        "raw_date": data.get("data") or data.get("date_str") or data.get("date") or sub.get("date"),
+        "raw_date": raw_date_val,
         "workshop": data.get("oficina") or data.get("workshop_name") or sub.get("workshop_name"),
     }
 
@@ -532,17 +544,33 @@ async def _persist_maintenance(
     if parsed_date is None:
         _fail(outcome, label, "invalid_date", raw_date=str(f["raw_date"]))
         return
+    target_veh = await vehicle_repo.get_by_id(vehicle_id)
     if f["km"] is not None:
-        target_veh = await vehicle_repo.get_by_id(vehicle_id)
-        if (
-            target_veh
-            and target_veh.current_km is not None
-            and int(f["km"]) < target_veh.current_km
-            and parsed_date >= now_ts.date()
-            and not data.get("_allow_regressive_km")
-        ):
-            _fail(outcome, label, "regressive_km", km=int(f["km"]), current_km=target_veh.current_km)
-            return
+        event_km = int(f["km"])
+        today_date = now_ts.date()
+        # 1. Se a data da manutenção for hoje ou futura, trava de km regressiva em relação ao km_atual
+        if parsed_date >= today_date:
+            if (
+                target_veh
+                and target_veh.current_km is not None
+                and event_km < target_veh.current_km
+                and not data.get("_allow_regressive_km")
+            ):
+                _fail(outcome, label, "regressive_km", km=event_km, current_km=target_veh.current_km)
+                return
+        else:
+            # 2. Se a data for no passado, PERMITE km menor que km_atual, mas valida coerência cronológica
+            existing_maints = await maint_repo.get_by_vehicle_id(vehicle_id)
+            for m in existing_maints:
+                if m.date is not None and m.km is not None:
+                    m_date = m.date.date() if isinstance(m.date, datetime) else m.date
+                    if m_date < parsed_date and event_km < m.km:
+                        _fail(outcome, label, "chronological_incoherence", km=event_km, date=str(parsed_date), ref_km=m.km, ref_date=str(m_date))
+                        return
+                    if m_date > parsed_date and event_km > m.km:
+                        _fail(outcome, label, "chronological_incoherence", km=event_km, date=str(parsed_date), ref_km=m.km, ref_date=str(m_date))
+                        return
+
     new_maint = MaintenanceRecord(
         vehicle_id=vehicle_id,
         user_id=user_id,
@@ -558,8 +586,10 @@ async def _persist_maintenance(
         created_at=now_ts,
     )
     await maint_repo.add_record(new_maint, commit=False)
-    if new_maint.km:
-        await vehicle_repo.update_km(vehicle_id, new_maint.km, commit=False)
+    # 4. Protege km_atual: nunca regride km_atual em manutenções com km menor
+    if new_maint.km is not None:
+        if target_veh is None or target_veh.current_km is None or new_maint.km > target_veh.current_km:
+            await vehicle_repo.update_km(vehicle_id, new_maint.km, commit=False)
     _ok(outcome, label)
 
 
@@ -880,6 +910,7 @@ _FAIL_REASONS_PT = {
     "invalid_date": "a data informada não existe",
     "invalid_plate": "a placa informada não segue o padrão brasileiro (ABC-1234 ou Mercosul ABC1D23)",
     "regressive_km": "quilometragem inferior à atual do veículo para a data de hoje",
+    "chronological_incoherence": "quilometragem incompatível com o histórico cronológico de manutenções",
     "missing_km": "faltou a quilometragem",
     "unsupported_action": "tipo de ação não suportado",
     "persistence_error": "erro ao gravar no banco",

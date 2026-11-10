@@ -40,3 +40,6 @@ htmlcov/
 v1_ponto_de_parada_total/
 
 DUMP_*.md
+
+# Subprojetos e pastas externas locais
+Meu-Assistente/

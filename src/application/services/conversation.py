@@ -19,7 +19,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from src.domain.enums import IntentType, ConversationState, VehicleType, FuelType
 from src.domain.entities import Vehicle, ConversationContext, ConversationTurn
 from src.ai.client import GeminiClient
-from src.ai.schemas import GeminiAnalysisResponse, ToolCallAction
+from src.ai.schemas import GeminiAnalysisResponse, ToolCallAction, MaintenanceDraft
 from src.application.services.parsers import is_undo_command
 
 logger = logging.getLogger("autocare.conversation")
@@ -408,11 +408,24 @@ class ConversationService:
             committed["components"] = list(itens)
             if not committed.get("description"):
                 committed["description"] = committed.get("service_summary") or (", ".join(itens) if itens else "Manutenção preventiva")
-            committed.setdefault("km", committed.get("odometer_km"))
-            committed.setdefault("odometer_km", committed.get("km"))
+            km_val = (
+                committed.get("km")
+                if committed.get("km") is not None
+                else (committed.get("odometer_km") if committed.get("odometer_km") is not None else committed.get("odometer"))
+            )
+            if km_val is not None:
+                committed["km"] = committed["odometer_km"] = int(km_val)
+            date_val = (
+                committed.get("data")
+                or committed.get("date_str")
+                or committed.get("date")
+                or committed.get("service_date")
+                or committed.get("data_manutencao")
+            )
+            if date_val:
+                committed["data"] = committed["date_str"] = committed["date"] = date_val
             committed.setdefault("total_cost", committed.get("valor"))
             committed.setdefault("workshop_name", committed.get("oficina"))
-            committed.setdefault("date_str", committed.get("data"))
         elif state == ConversationState.AWAITING_REMINDER_CONFIRM or committed.get("_action_state") == ConversationState.AWAITING_REMINDER_CONFIRM.value:
             committed["_action_state"] = ConversationState.AWAITING_REMINDER_CONFIRM.value
             committed["intent"] = IntentType.SET_REMINDER.value
@@ -614,7 +627,19 @@ class ConversationService:
                 merged_items.append(item_clean)
 
         km_val = (tc.km if tc and tc.km is not None else None) if (tc and tc.km is not None) else (m_obj.odometer_km if (m_obj and m_obj.odometer_km is not None) else (ext.get("km") if ext.get("km") is not None else ext.get("odometer_km")))
-        data_val = (tc.data if tc and tc.data else None) or (m_obj.date_str if m_obj and m_obj.date_str else None) or ext.get("data") or ext.get("date_str")
+        data_val = (
+            (tc.data if tc and tc.data else None)
+            or (m_obj.date_str if m_obj and m_obj.date_str else None)
+            or ext.get("data")
+            or ext.get("date_str")
+            or ext.get("date")
+            or ext.get("service_date")
+            or ext.get("data_manutencao")
+        )
+        if data_val:
+            normalized_d = MaintenanceDraft.normalize_date_str(str(data_val))
+            if normalized_d:
+                data_val = normalized_d
         oficina_val = (tc.oficina if tc and tc.oficina else None) or (m_obj.workshop_name if m_obj and m_obj.workshop_name else None) or ext.get("oficina") or ext.get("workshop_name")
         valor_val = (tc.valor if tc and tc.valor is not None else None) if (tc and tc.valor is not None) else (m_obj.total_cost if (m_obj and m_obj.total_cost is not None) else (ext.get("valor") if ext.get("valor") is not None else ext.get("total_cost")))
         summary_val = (m_obj.service_summary if m_obj and m_obj.service_summary else None) or ext.get("service_summary") or ext.get("description")
@@ -638,7 +663,7 @@ class ConversationService:
         if km_val is not None:
             merged_maint["km"] = merged_maint["odometer_km"] = int(km_val)
         if data_val:
-            merged_maint["data"] = merged_maint["date_str"] = data_val
+            merged_maint["data"] = merged_maint["date_str"] = merged_maint["date"] = data_val
         if oficina_val:
             merged_maint["oficina"] = merged_maint["workshop_name"] = oficina_val
         if valor_val is not None:

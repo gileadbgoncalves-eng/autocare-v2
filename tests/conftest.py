@@ -77,12 +77,20 @@ def _sim_extract_items(text: str) -> List[str]:
 
 
 def _sim_extract_date(text: str) -> Optional[str]:
-    m = re.search(r"\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b", text or "")
+    # 0. Padrão ISO YYYY-MM-DD ou YYYY/MM/DD
+    m_iso = re.search(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b", text or "")
+    if m_iso:
+        return MaintenanceDraft.normalize_date_str(m_iso.group(1))
+    # 1. Padrão DD/MM/YYYY ou DD-MM-YYYY
+    m = re.search(r"\b(\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?)\b", text or "")
     if m:
         return MaintenanceDraft.normalize_date_str(m.group(1))
     m_txt = re.search(r"(?:dia\s+)?(\d{1,2})\s+de\s+([a-zA-ZçÇ]+)(?:\s+de\s+(\d{4}))?", text or "", re.IGNORECASE)
     if m_txt:
         return MaintenanceDraft.normalize_date_str(m_txt.group(0))
+    m_rel = re.search(r"\b(?:há|ha)\s+(\d+|um|uma)\s+(dia|dias|mês|mes|meses|ano|anos)\b", text or "", re.IGNORECASE)
+    if m_rel:
+        return MaintenanceDraft.normalize_date_str(m_rel.group(0))
     return None
 
 
@@ -649,6 +657,15 @@ async def simulated_gemini_analyze(
 
         # Verifica quilometragem regressiva em data recente/hoje (sem contexto temporal passado)
         is_past_context = any(p in tl for p in ("ano passado", "mês passado", "mes passado", "2024", "2025", "há um ano", "ha um ano"))
+        if not is_past_context and new_date:
+            try:
+                parts = new_date.split("/")
+                if len(parts) == 3:
+                    d_parsed = dt.date(int(parts[2]), int(parts[1]), int(parts[0]))
+                    if d_parsed < dt.date.today():
+                        is_past_context = True
+            except Exception:
+                pass
         curr_v_km = getattr(vehicles[0], "current_km", None) if vehicles else None
         is_rollback = bool(curr_v_km and new_km is not None and new_km < curr_v_km and not is_past_context)
 

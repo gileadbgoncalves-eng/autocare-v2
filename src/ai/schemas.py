@@ -77,6 +77,41 @@ class MaintenanceDraft(BaseModel):
     parts_brand: Optional[str] = Field(default=None, description="Marca das peças instaladas")
     warranty_months: Optional[int] = Field(default=None, ge=0, description="Meses de garantia")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_maintenance_aliases(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            date_candidate = (
+                data.get("date_str")
+                or data.get("data")
+                or data.get("date")
+                or data.get("service_date")
+                or data.get("data_manutencao")
+            )
+            if date_candidate:
+                data["date_str"] = str(date_candidate)
+            km_candidate = (
+                data.get("odometer_km")
+                if data.get("odometer_km") is not None
+                else (data.get("km") if data.get("km") is not None else data.get("odometer"))
+            )
+            if km_candidate is not None:
+                data["odometer_km"] = km_candidate
+            if not data.get("components") and data.get("itens"):
+                data["components"] = data.get("itens")
+            val_candidate = (
+                data.get("total_cost")
+                if data.get("total_cost") is not None
+                else (data.get("valor") if data.get("valor") is not None else data.get("cost"))
+            )
+            if val_candidate is not None:
+                data["total_cost"] = val_candidate
+            if not data.get("service_summary") and data.get("description"):
+                data["service_summary"] = data.get("description")
+            if not data.get("workshop_name") and data.get("oficina"):
+                data["workshop_name"] = data.get("oficina")
+        return data
+
     @field_validator("workshop_name", mode="before")
     @classmethod
     def validate_workshop_name(cls, v: Optional[str]) -> Optional[str]:
@@ -129,6 +164,15 @@ class MaintenanceDraft(BaseModel):
             "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
             "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
         }
+
+        # 0. Busca por padrão ISO: YYYY-MM-DD ou YYYY/MM/DD
+        iso_match = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", s)
+        if iso_match:
+            year = int(iso_match.group(1))
+            month = int(iso_match.group(2))
+            day = int(iso_match.group(3))
+            if 1 <= day <= 31 and 1 <= month <= 12:
+                return f"{day:02d}/{month:02d}/{year}"
 
         # 1. Busca por padrão textual: (dia )?15 de setembro (de 2026)?
         textual_match = re.search(
@@ -311,6 +355,44 @@ class ToolCallAction(BaseModel):
         ge=0.0,
         description="Valor financeiro total pago pelo serviço em reais (R$)"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_tool_call_inputs(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Normalização de aliases para data
+            date_candidate = (
+                data.get("data")
+                or data.get("date")
+                or data.get("date_str")
+                or data.get("service_date")
+                or data.get("data_manutencao")
+            )
+            if date_candidate:
+                data["data"] = str(date_candidate)
+            # Normalização de aliases para km
+            km_candidate = (
+                data.get("km")
+                if data.get("km") is not None
+                else (data.get("odometer") if data.get("odometer") is not None else data.get("odometer_km"))
+            )
+            if km_candidate is not None:
+                data["km"] = km_candidate
+            # Normalização de aliases para itens
+            if not data.get("itens") and data.get("components"):
+                data["itens"] = data.get("components")
+            # Normalização de aliases para valor
+            val_candidate = (
+                data.get("valor")
+                if data.get("valor") is not None
+                else (data.get("total_cost") if data.get("total_cost") is not None else data.get("cost"))
+            )
+            if val_candidate is not None:
+                data["valor"] = val_candidate
+            # Normalização de aliases para oficina
+            if not data.get("oficina") and data.get("workshop_name"):
+                data["oficina"] = data.get("workshop_name")
+        return data
 
     @field_validator("oficina", mode="before")
     @classmethod
