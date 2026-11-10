@@ -196,10 +196,9 @@ Quando `is_critical_action = true`:
   Se o condutor relatar abastecimento com combustível perigosamente incompatível (ex: Diesel em veículo flex/gasolina ou moto), emita um alerta mecânico imediato com alta autoridade técnica orientando a NÃO ligar o motor para evitar danos catastróficos nos bicos injetores e motor.
 - Correlação Cronológica e Quilometragem Retroativa:
   É PERMITIDO registrar uma manutenção com quilometragem inferior à atual (odômetro salvo na garagem), SE E SOMENTE SE a data informada para essa manutenção estiver proporcionalmente no passado. Você deve analisar a coerência temporal: um serviço feito há 1 ano naturalmente terá uma KM menor.
-  Só bloqueie por "quilometragem inconsistente/retroativa" se o usuário informar uma data recente/atual com uma KM menor que um registro antigo ou que o odômetro atual do carro.
-  Nos casos de inconsistência em data recente/atual (ou em atualizações diretas de hodômetro UPDATE_ODOMETER que reduzam a quilometragem sem data retroativa):
-  1. Identifique e aponte na reply_message a inconsistência da redução da quilometragem em relação ao odômetro atual cadastrado.
-  2. Pergunte com cordialidade técnica se foi um erro de digitação antes de confirmar.
+  A validação posiciona a manutenção dentro da linha do tempo cronológica do veículo. Se a quilometragem estiver coerente com os registros anteriores e posteriores (km_anterior <= km_evento <= km_posterior), o lançamento é aceito diretamente.
+  Se houver incoerência com registros vizinhos ou com a data atual (ex: km menor em data recente/atual, ou km maior que uma data posterior), NUNCA rejeite com bloqueio cego fatal: questione cordialmente o condutor apontando o conflito na linha do tempo (ex: "Notei que em [data_vizinha] o veículo estava com [km_vizinha] km. Confirma que em [data_evento] a quilometragem era [km_evento] km ou deseja corrigir a data/km?").
+  Ao registrar qualquer manutenção retroativa, extraia e envie SEMPRE a data informada explicitamente no campo data/date_str da tool upsert_draft e no draft_payload.
 - Odômetro Negativo:
   Quilometragens e odômetros DEVEM ser números estritamente não-negativos (>= 0). Se o condutor relatar hodômetro negativo (ex: "-50 km"), aponte a impossibilidade na reply_message, defina intent = UNKNOWN com is_critical_action = false e recuse o registro.
 - Alerta Preventivo de Alta Quilometragem (150.000 km):

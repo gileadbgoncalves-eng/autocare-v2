@@ -28,6 +28,7 @@ from src.interfaces.api.webhook import (
     _persist_confirmed_data,
     _persist_maintenance,
     _new_outcome,
+    _apply_persistence_outcome,
 )
 
 
@@ -124,7 +125,8 @@ async def test_retroactive_maintenance_full_lifecycle(async_db_session: AsyncSes
     assert (date(2026, 7, 6), 140000) in dates_kms
     assert (date(2026, 5, 20), 135000) in dates_kms
 
-    # 4. Tenta registrar manutenção com data de HOJE e 130.000 km -> Deve FALHAR
+    # 4. Tenta registrar manutenção na data de HOJE com 130.000 km (incoerente com km_atual = 144.000)
+    # DEVE acionar retorno de solicitação de confirmação/verificação com o usuário em vez de erro fatal cego
     payload_maint_today_regressive = {
         "description": "Revisão geral",
         "components": ["Velas", "Cabos"],
@@ -140,20 +142,31 @@ async def test_retroactive_maintenance_full_lifecycle(async_db_session: AsyncSes
 
     assert len(outcome_3["success"]) == 0
     assert len(outcome_3["failed"]) == 1
-    assert outcome_3["failed"][0]["reason"] == "regressive_km"
-    assert _FAIL_REASONS_PT["regressive_km"] == "quilometragem inferior à atual do veículo para a data de hoje"
+    fail_item_3 = outcome_3["failed"][0]
+    assert fail_item_3["reason"] == "timeline_incoherence"
+    assert fail_item_3["conflict_date"] == "09/11/2026"
+    assert fail_item_3["conflict_km"] == 144000
+    assert "Notei que em 09/11/2026 o veículo estava com 144.000 km" in fail_item_3["message"]
+    assert "Confirma que em 09/11/2026 a quilometragem era 130.000 km ou deseja corrigir a data/km?" in fail_item_3["message"]
 
-    # Veículo segue com 144.000 km
+    # Testa a aplicação do outcome no pipeline de webhook (resposta amigável e reabertura do rascunho)
+    pipeline_res_3 = {"reply": "", "action_type": ""}
+    _apply_persistence_outcome(pipeline_res_3, user_id, payload_maint_today_regressive, outcome_3)
+    assert pipeline_res_3["action_type"] == "timeline_divergence_verification"
+    assert "Notei que em 09/11/2026 o veículo estava com 144.000 km" in pipeline_res_3["reply"]
+
+    # Veículo segue com 144.000 km protegido
     veh_after_3 = await veh_repo.get_by_id(veh.id)
     assert veh_after_3.current_km == 144000
 
-    # 5. Teste adversarial de incoerência cronológica:
-    # Tenta inserir serviço em 20/05/2026 com 145.000 km (sendo que em 06/07/2026 o carro tinha 140.000 km)
+    # 5. Tenta registrar manutenção com incoerência na linha do tempo do passado:
+    # 2026-06-15 com 142.000 km (conflita com os 140.000 km de 06/07/2026)
+    # DEVE acionar retorno de solicitação de confirmação/verificação com o usuário apontando o conflito
     payload_maint_incoherent = {
         "description": "Alinhamento",
         "components": ["Alinhamento e balanceamento"],
-        "km": 145000,
-        "data": "20/05/2026",
+        "km": 142000,
+        "data": "15/06/2026",
         "total_cost": 120.0,
         "target_vehicle_ref": "BRA2E19",
         "vehicle_id": veh.id,
@@ -164,31 +177,35 @@ async def test_retroactive_maintenance_full_lifecycle(async_db_session: AsyncSes
 
     assert len(outcome_4["success"]) == 0
     assert len(outcome_4["failed"]) == 1
-    assert outcome_4["failed"][0]["reason"] == "chronological_incoherence"
-    assert _FAIL_REASONS_PT["chronological_incoherence"] == "quilometragem incompatível com o histórico cronológico de manutenções"
+    fail_item_4 = outcome_4["failed"][0]
+    assert fail_item_4["reason"] == "timeline_incoherence"
+    assert fail_item_4["conflict_date"] == "06/07/2026"
+    assert fail_item_4["conflict_km"] == 140000
+    assert "Notei que em 06/07/2026 o veículo estava com 140.000 km" in fail_item_4["message"]
+    assert "Confirma que em 15/06/2026 a quilometragem era 142.000 km ou deseja corrigir a data/km?" in fail_item_4["message"]
 
-    # 6. Teste adversarial complementar:
-    # Tenta inserir serviço em 15/08/2026 com 138.000 km (data posterior a 06/07/2026 mas com km menor que 140.000 km)
-    payload_maint_incoherent_future = {
-        "description": "Troca de palhetas",
-        "components": ["Palhetas do limpador"],
-        "km": 138000,
-        "data": "15/08/2026",
-        "total_cost": 80.0,
-        "target_vehicle_ref": "BRA2E19",
-        "vehicle_id": veh.id,
-    }
-    outcome_5 = await _persist_confirmed_data(
-        async_db_session, user_id, "action_confirmed", payload_maint_incoherent_future, [veh_after_3], now_ts
+    pipeline_res_4 = {"reply": "", "action_type": ""}
+    _apply_persistence_outcome(pipeline_res_4, user_id, payload_maint_incoherent, outcome_4)
+    assert pipeline_res_4["action_type"] == "timeline_divergence_verification"
+    assert "Notei que em 06/07/2026 o veículo estava com 140.000 km" in pipeline_res_4["reply"]
+
+    # 6. Fluxo de Confirmação Forçada / Aceite pelo Usuário:
+    # Caso o usuário confirme expressamente que o dado divergente está correto (flag force_timeline=True),
+    # o sistema permite a gravação sem travar o fluxo e protege o km_atual do veículo
+    payload_forced = dict(payload_maint_incoherent)
+    payload_forced["force_timeline"] = True
+
+    outcome_forced = await _persist_confirmed_data(
+        async_db_session, user_id, "action_confirmed", payload_forced, [veh_after_3], now_ts
     )
+    assert len(outcome_forced["success"]) == 1, f"Falha na gravação forçada: {outcome_forced['failed']}"
+    assert len(outcome_forced["failed"]) == 0
 
-    assert len(outcome_5["success"]) == 0
-    assert len(outcome_5["failed"]) == 1
-    assert outcome_5["failed"][0]["reason"] == "chronological_incoherence"
-
-    # Total de manutenções no banco permanece 2
+    # Total de manutenções no banco sobe para 3 e km_atual permanece 144.000
     final_maints = await maint_repo.get_by_vehicle_id(veh.id)
-    assert len(final_maints) == 2
+    assert len(final_maints) == 3
+    veh_final = await veh_repo.get_by_id(veh.id)
+    assert veh_final.current_km == 144000
 
 
 @pytest.mark.asyncio
@@ -322,3 +339,79 @@ async def test_retroactive_date_aliases_and_formats(async_db_session: AsyncSessi
     # Valida que ambos os registros foram gravados no banco
     records = await maint_repo.get_by_vehicle_id(veh.id)
     assert len(records) == 2
+
+
+@pytest.mark.asyncio
+async def test_check_vehicle_timeline_coherence_unit():
+    """
+    Teste unitário direto da função check_vehicle_timeline_coherence:
+    Cobre os limites imediatos anterior e posterior, detecção de divergência e mensagens explicativas.
+    """
+    from src.interfaces.api.webhook import check_vehicle_timeline_coherence
+    from src.domain.entities import Vehicle, MaintenanceRecord
+
+    veh = Vehicle(id=1, user_id="user1", make="Honda", model="Civic", plate="ABC1D23", current_km=144000)
+    today = date(2026, 11, 9)
+
+    # 1. Veículo a 144.000 km hoje: manutenção em 06/07/2026 com 140.000 km -> Coerente
+    ok1, conf1 = check_vehicle_timeline_coherence(
+        existing_maints=[],
+        target_veh=veh,
+        event_date=date(2026, 7, 6),
+        event_km=140000,
+        today_date=today,
+    )
+    assert ok1 is True
+    assert conf1 is None
+
+    maint_1 = MaintenanceRecord(
+        vehicle_id=1, user_id="user1", date=date(2026, 7, 6), km=140000,
+        components=["Óleo"], description="Troca de óleo"
+    )
+
+    # 2. Manutenção anterior em 20/05/2026 com 135.000 km -> Coerente (menor que 140.000 em 06/07)
+    ok2, conf2 = check_vehicle_timeline_coherence(
+        existing_maints=[maint_1],
+        target_veh=veh,
+        event_date=date(2026, 5, 20),
+        event_km=135000,
+        today_date=today,
+    )
+    assert ok2 is True
+    assert conf2 is None
+
+    maint_2 = MaintenanceRecord(
+        vehicle_id=1, user_id="user1", date=date(2026, 5, 20), km=135000,
+        components=["Pastilhas"], description="Pastilhas de freio"
+    )
+
+    # 3. Tentativa incoerente: 15/06/2026 com 142.000 km (conflita com 140.000 km em 06/07/2026)
+    ok3, conf3 = check_vehicle_timeline_coherence(
+        existing_maints=[maint_1, maint_2],
+        target_veh=veh,
+        event_date=date(2026, 6, 15),
+        event_km=142000,
+        today_date=today,
+    )
+    assert ok3 is False
+    assert conf3 is not None
+    assert conf3["conflict_date"] == date(2026, 7, 6)
+    assert conf3["conflict_km"] == 140000
+    assert "Notei que em 06/07/2026 o veículo estava com 140.000 km" in conf3["message"]
+    assert "Confirma que em 15/06/2026 a quilometragem era 142.000 km" in conf3["message"]
+
+    # 4. Tentativa incoerente na data de hoje: hoje com 130.000 km (conflita com marco atual de 144.000 km)
+    ok4, conf4 = check_vehicle_timeline_coherence(
+        existing_maints=[maint_1, maint_2],
+        target_veh=veh,
+        event_date=today,
+        event_km=130000,
+        today_date=today,
+    )
+    assert ok4 is False
+    assert conf4 is not None
+    assert conf4["conflict_date"] == today
+    assert conf4["conflict_km"] == 144000
+    assert "Notei que em 09/11/2026 o veículo estava com 144.000 km" in conf4["message"]
+    assert "Confirma que em 09/11/2026 a quilometragem era 130.000 km" in conf4["message"]
+

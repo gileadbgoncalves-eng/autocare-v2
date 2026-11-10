@@ -526,6 +526,133 @@ def _maint_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def check_vehicle_timeline_coherence(
+    existing_maints: List[Any],
+    target_veh: Optional[Any],
+    event_date: date,
+    event_km: int,
+    today_date: date,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """
+    Posiciona o par (event_date, event_km) dentro da linha do tempo completa do veículo
+    (histórico de manutenções registradas + leitura atual hoje / veiculo.km_atual).
+
+    Retorna (is_coherent, conflict_dict):
+    - Se for coerente: (True, None)
+    - Se for incoerente: (False, {
+        "conflict_date": date,
+        "conflict_km": int,
+        "direction": "anterior" | "posterior",
+        "message": str
+    })
+    """
+    past_points: List[Tuple[date, int]] = []
+    for m in (existing_maints or []):
+        m_date = getattr(m, "date", None)
+        m_km = getattr(m, "km", None)
+        if m_date is not None and m_km is not None:
+            d_val = m_date.date() if isinstance(m_date, datetime) else m_date
+            past_points.append((d_val, int(m_km)))
+
+    current_veh_km = getattr(target_veh, "current_km", None) if target_veh else None
+
+    # 1. Trava contra odômetro regressivo para a data de hoje ou futura:
+    # Se a data for hoje ou futura, a quilometragem NÃO pode ser menor que o km_atual registrado do veículo.
+    if current_veh_km is not None and event_date >= today_date and event_km < current_veh_km:
+        c_date_str = today_date.strftime("%d/%m/%Y")
+        e_date_str = event_date.strftime("%d/%m/%Y")
+        c_km_str = f"{current_veh_km:,} km".replace(",", ".")
+        e_km_str = f"{event_km:,} km".replace(",", ".")
+        msg = (
+            f"Notei que em {c_date_str} o veículo estava com {c_km_str}. "
+            f"Confirma que em {e_date_str} a quilometragem era {e_km_str} ou deseja corrigir a data/km?"
+        )
+        return False, {
+            "conflict_date": today_date,
+            "conflict_km": current_veh_km,
+            "direction": "anterior",
+            "message": msg,
+        }
+
+    # 2. Limites da linha do tempo baseados no histórico de manutenções:
+    # Busca registros imediatamente anterior e posterior a event_date
+    anterior_maints = [(d, km) for d, km in past_points if d <= event_date]
+    posterior_maints = [(d, km) for d, km in past_points if d >= event_date]
+
+    if anterior_maints:
+        max_ant_date = max(d for d, _ in anterior_maints)
+        km_anterior = max(km for d, km in anterior_maints if d == max_ant_date)
+        if event_km < km_anterior:
+            c_date_str = max_ant_date.strftime("%d/%m/%Y")
+            e_date_str = event_date.strftime("%d/%m/%Y")
+            c_km_str = f"{km_anterior:,} km".replace(",", ".")
+            e_km_str = f"{event_km:,} km".replace(",", ".")
+            msg = (
+                f"Notei que em {c_date_str} o veículo estava com {c_km_str}. "
+                f"Confirma que em {e_date_str} a quilometragem era {e_km_str} ou deseja corrigir a data/km?"
+            )
+            return False, {
+                "conflict_date": max_ant_date,
+                "conflict_km": km_anterior,
+                "direction": "anterior",
+                "message": msg,
+            }
+
+    if posterior_maints:
+        min_post_date = min(d for d, _ in posterior_maints)
+        km_posterior = min(km for d, km in posterior_maints if d == min_post_date)
+        if event_km > km_posterior:
+            c_date_str = min_post_date.strftime("%d/%m/%Y")
+            e_date_str = event_date.strftime("%d/%m/%Y")
+            c_km_str = f"{km_posterior:,} km".replace(",", ".")
+            e_km_str = f"{event_km:,} km".replace(",", ".")
+            msg = (
+                f"Notei que em {c_date_str} o veículo estava com {c_km_str}. "
+                f"Confirma que em {e_date_str} a quilometragem era {e_km_str} ou deseja corrigir a data/km?"
+            )
+            return False, {
+                "conflict_date": min_post_date,
+                "conflict_km": km_posterior,
+                "direction": "posterior",
+                "message": msg,
+            }
+
+    # 3. Verificação global contra qualquer registro no futuro com KM menor ou no passado com KM maior
+    for d, km in past_points:
+        if d > event_date and event_km > km:
+            c_date_str = d.strftime("%d/%m/%Y")
+            e_date_str = event_date.strftime("%d/%m/%Y")
+            c_km_str = f"{km:,} km".replace(",", ".")
+            e_km_str = f"{event_km:,} km".replace(",", ".")
+            msg = (
+                f"Notei que em {c_date_str} o veículo estava com {c_km_str}. "
+                f"Confirma que em {e_date_str} a quilometragem era {e_km_str} ou deseja corrigir a data/km?"
+            )
+            return False, {
+                "conflict_date": d,
+                "conflict_km": km,
+                "direction": "posterior",
+                "message": msg,
+            }
+        if d < event_date and event_km < km:
+            c_date_str = d.strftime("%d/%m/%Y")
+            e_date_str = event_date.strftime("%d/%m/%Y")
+            c_km_str = f"{km:,} km".replace(",", ".")
+            e_km_str = f"{event_km:,} km".replace(",", ".")
+            msg = (
+                f"Notei que em {c_date_str} o veículo estava com {c_km_str}. "
+                f"Confirma que em {e_date_str} a quilometragem era {e_km_str} ou deseja corrigir a data/km?"
+            )
+            return False, {
+                "conflict_date": d,
+                "conflict_km": km,
+                "direction": "anterior",
+                "message": msg,
+            }
+
+    return True, None
+
+
 async def _persist_maintenance(
     maint_repo: MaintenanceRepository,
     vehicle_repo: VehicleRepository,
@@ -548,28 +675,34 @@ async def _persist_maintenance(
     if f["km"] is not None:
         event_km = int(f["km"])
         today_date = now_ts.date()
-        # 1. Se a data da manutenção for hoje ou futura, trava de km regressiva em relação ao km_atual
-        if parsed_date >= today_date:
-            if (
-                target_veh
-                and target_veh.current_km is not None
-                and event_km < target_veh.current_km
-                and not data.get("_allow_regressive_km")
-            ):
-                _fail(outcome, label, "regressive_km", km=event_km, current_km=target_veh.current_km)
-                return
-        else:
-            # 2. Se a data for no passado, PERMITE km menor que km_atual, mas valida coerência cronológica
+        is_forced = bool(
+            data.get("force")
+            or data.get("force_timeline")
+            or data.get("confirmed_divergence")
+            or data.get("_allow_regressive_km")
+        )
+        if not is_forced:
             existing_maints = await maint_repo.get_by_vehicle_id(vehicle_id)
-            for m in existing_maints:
-                if m.date is not None and m.km is not None:
-                    m_date = m.date.date() if isinstance(m.date, datetime) else m.date
-                    if m_date < parsed_date and event_km < m.km:
-                        _fail(outcome, label, "chronological_incoherence", km=event_km, date=str(parsed_date), ref_km=m.km, ref_date=str(m_date))
-                        return
-                    if m_date > parsed_date and event_km > m.km:
-                        _fail(outcome, label, "chronological_incoherence", km=event_km, date=str(parsed_date), ref_km=m.km, ref_date=str(m_date))
-                        return
+            is_coherent, conflict = check_vehicle_timeline_coherence(
+                existing_maints=existing_maints,
+                target_veh=target_veh,
+                event_date=parsed_date,
+                event_km=event_km,
+                today_date=today_date,
+            )
+            if not is_coherent and conflict:
+                _fail(
+                    outcome,
+                    label,
+                    "timeline_incoherence",
+                    conflict_date=conflict["conflict_date"].strftime("%d/%m/%Y"),
+                    conflict_km=conflict["conflict_km"],
+                    event_date=parsed_date.strftime("%d/%m/%Y"),
+                    event_km=event_km,
+                    message=conflict["message"],
+                    direction=conflict["direction"],
+                )
+                return
 
     new_maint = MaintenanceRecord(
         vehicle_id=vehicle_id,
@@ -586,9 +719,14 @@ async def _persist_maintenance(
         created_at=now_ts,
     )
     await maint_repo.add_record(new_maint, commit=False)
-    # 4. Protege km_atual: nunca regride km_atual em manutenções com km menor
+    # 4. Protege km_atual: nunca regride km_atual em manutenções retroativas coerentes
+    # Só atualiza km_atual se o novo registro representar a maior leitura (km > current_km)
     if new_maint.km is not None:
-        if target_veh is None or target_veh.current_km is None or new_maint.km > target_veh.current_km:
+        if (
+            target_veh is None
+            or target_veh.current_km is None
+            or new_maint.km > target_veh.current_km
+        ):
             await vehicle_repo.update_km(vehicle_id, new_maint.km, commit=False)
     _ok(outcome, label)
 
@@ -911,6 +1049,7 @@ _FAIL_REASONS_PT = {
     "invalid_plate": "a placa informada não segue o padrão brasileiro (ABC-1234 ou Mercosul ABC1D23)",
     "regressive_km": "quilometragem inferior à atual do veículo para a data de hoje",
     "chronological_incoherence": "quilometragem incompatível com o histórico cronológico de manutenções",
+    "timeline_incoherence": "quilometragem incompatível com o histórico cronológico de manutenções",
     "missing_km": "faltou a quilometragem",
     "unsupported_action": "tipo de ação não suportado",
     "persistence_error": "erro ao gravar no banco",
@@ -934,6 +1073,10 @@ def _apply_persistence_outcome(
         return
 
     invalid_date = next((f for f in failed if f["reason"] == "invalid_date"), None)
+    timeline_issue = next(
+        (f for f in failed if f["reason"] in ("timeline_incoherence", "chronological_incoherence")),
+        None,
+    )
     if invalid_date:
         raw = invalid_date.get("raw_date", "")
         result["reply"] = (
@@ -956,6 +1099,28 @@ def _apply_persistence_outcome(
                 committed_data,
                 clear_keys=("data", "date_str", "date", "target_date_str", "due_date", "due_datetime"),
             )
+    elif timeline_issue:
+        msg = timeline_issue.get("message")
+        if not msg:
+            c_date = timeline_issue.get("conflict_date", "")
+            c_km = timeline_issue.get("conflict_km", "")
+            e_date = timeline_issue.get("event_date", "")
+            e_km = timeline_issue.get("event_km", "")
+            if c_date and c_km and e_date and e_km:
+                c_km_str = f"{int(c_km):,} km".replace(",", ".") if str(c_km).isdigit() else f"{c_km} km"
+                e_km_str = f"{int(e_km):,} km".replace(",", ".") if str(e_km).isdigit() else f"{e_km} km"
+                msg = f"Notei que em {c_date} o veículo estava com {c_km_str}. Confirma que em {e_date} a quilometragem era {e_km_str} ou deseja corrigir a data/km?"
+            else:
+                msg = "Notei uma divergência na linha do tempo da quilometragem informada. Confirma os dados ou deseja corrigir a data/km?"
+        result["reply"] = f"⚠️ {msg}"
+        result["action_type"] = "timeline_divergence_verification"
+        committed_copy = dict(committed_data)
+        committed_copy["_pending_timeline_verification"] = True
+        conversation_service.reopen_draft_for_correction(
+            user_id,
+            committed_copy,
+            clear_keys=(),
+        )
     else:
         lines = ["⚠️ *Salvei apenas parte das ações:*\n" if success else "⚠️ *Não consegui salvar:*\n"]
         lines += [f"✅ {s}" for s in success]

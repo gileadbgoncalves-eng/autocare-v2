@@ -422,8 +422,15 @@ class ConversationService:
                 or committed.get("service_date")
                 or committed.get("data_manutencao")
             )
+            if not date_val and analysis.reply_message:
+                date_val = MaintenanceDraft.normalize_date_str(analysis.reply_message)
             if date_val:
-                committed["data"] = committed["date_str"] = committed["date"] = date_val
+                norm_d = MaintenanceDraft.normalize_date_str(str(date_val)) or str(date_val)
+                committed["data"] = committed["date_str"] = committed["date"] = committed["service_date"] = committed["data_manutencao"] = norm_d
+            if committed.get("_pending_timeline_verification"):
+                committed["force_timeline"] = True
+                committed["confirmed_divergence"] = True
+                committed["_allow_regressive_km"] = True
             committed.setdefault("total_cost", committed.get("valor"))
             committed.setdefault("workshop_name", committed.get("oficina"))
         elif state == ConversationState.AWAITING_REMINDER_CONFIRM or committed.get("_action_state") == ConversationState.AWAITING_REMINDER_CONFIRM.value:
@@ -629,13 +636,30 @@ class ConversationService:
         km_val = (tc.km if tc and tc.km is not None else None) if (tc and tc.km is not None) else (m_obj.odometer_km if (m_obj and m_obj.odometer_km is not None) else (ext.get("km") if ext.get("km") is not None else ext.get("odometer_km")))
         data_val = (
             (tc.data if tc and tc.data else None)
+            or (tc.date if tc and tc.date else None)
+            or (tc.date_str if tc and tc.date_str else None)
+            or (tc.service_date if tc and tc.service_date else None)
+            or (tc.data_manutencao if tc and tc.data_manutencao else None)
             or (m_obj.date_str if m_obj and m_obj.date_str else None)
+            or (m_obj.data if m_obj and m_obj.data else None)
+            or (m_obj.date if m_obj and m_obj.date else None)
+            or (m_obj.service_date if m_obj and m_obj.service_date else None)
+            or (m_obj.data_manutencao if m_obj and m_obj.data_manutencao else None)
             or ext.get("data")
             or ext.get("date_str")
             or ext.get("date")
             or ext.get("service_date")
             or ext.get("data_manutencao")
+            or existing.get("data")
+            or existing.get("date_str")
+            or existing.get("date")
+            or existing.get("service_date")
+            or existing.get("data_manutencao")
         )
+        if not data_val:
+            data_val = MaintenanceDraft.normalize_date_str(clean_msg)
+        if not data_val and analysis.reply_message:
+            data_val = MaintenanceDraft.normalize_date_str(analysis.reply_message)
         if data_val:
             normalized_d = MaintenanceDraft.normalize_date_str(str(data_val))
             if normalized_d:
@@ -663,7 +687,7 @@ class ConversationService:
         if km_val is not None:
             merged_maint["km"] = merged_maint["odometer_km"] = int(km_val)
         if data_val:
-            merged_maint["data"] = merged_maint["date_str"] = merged_maint["date"] = data_val
+            merged_maint["data"] = merged_maint["date_str"] = merged_maint["date"] = merged_maint["service_date"] = merged_maint["data_manutencao"] = data_val
         if oficina_val:
             merged_maint["oficina"] = merged_maint["workshop_name"] = oficina_val
         if valor_val is not None:

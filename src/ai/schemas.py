@@ -70,6 +70,10 @@ class MaintenanceDraft(BaseModel):
     service_summary: Optional[str] = Field(default=None, description="Resumo do serviço executado")
     odometer_km: Optional[int] = Field(default=None, ge=0, description="Hodômetro no momento da revisão")
     date_str: Optional[str] = Field(default=None, description="Data informada (ex: 'hoje', 'ontem', '15/10/2026')")
+    data: Optional[str] = Field(default=None, description="Alias para date_str (DD/MM/AAAA ou ISO)")
+    date: Optional[str] = Field(default=None, description="Alias para date_str")
+    service_date: Optional[str] = Field(default=None, description="Alias para date_str")
+    data_manutencao: Optional[str] = Field(default=None, description="Alias para date_str")
     total_cost: Optional[float] = Field(default=None, ge=0.0, description="Valor financeiro total gasto")
     parts_cost: Optional[float] = Field(default=None, ge=0.0, description="Custo específico de peças")
     labor_cost: Optional[float] = Field(default=None, ge=0.0, description="Custo de mão de obra")
@@ -89,7 +93,8 @@ class MaintenanceDraft(BaseModel):
                 or data.get("data_manutencao")
             )
             if date_candidate:
-                data["date_str"] = str(date_candidate)
+                str_val = str(date_candidate)
+                data["date_str"] = data["data"] = data["date"] = data["service_date"] = data["data_manutencao"] = str_val
             km_candidate = (
                 data.get("odometer_km")
                 if data.get("odometer_km") is not None
@@ -241,6 +246,10 @@ class ActionDraft(BaseModel):
     components: List[str] = Field(default_factory=list, description="Peças ou serviços revisados")
     workshop_name: Optional[str] = Field(default=None, description="Oficina mecânica")
     date_str: Optional[str] = Field(default=None, description="Data da realização")
+    data: Optional[str] = Field(default=None, description="Alias para date_str")
+    date: Optional[str] = Field(default=None, description="Alias para date_str")
+    service_date: Optional[str] = Field(default=None, description="Alias para date_str")
+    data_manutencao: Optional[str] = Field(default=None, description="Alias para date_str")
     task_description: Optional[str] = Field(default=None, description="Descrição da tarefa para agendamento de lembrete")
     explicit_time: Optional[str] = Field(default=None, description="Horário explícito HH:MM (ex: '09:00', '14:30')")
     target_date_str: Optional[str] = Field(default=None, description="Data alvo (ex: 'amanhã', 'hoje')")
@@ -346,6 +355,10 @@ class ToolCallAction(BaseModel):
         default=None,
         description="Data do serviço no formato DD/MM/AAAA (apenas se informada explicitamente ou mantida do estado)"
     )
+    date: Optional[str] = Field(default=None, description="Alias para data")
+    date_str: Optional[str] = Field(default=None, description="Alias para data")
+    service_date: Optional[str] = Field(default=None, description="Alias para data")
+    data_manutencao: Optional[str] = Field(default=None, description="Alias para data")
     oficina: Optional[str] = Field(
         default=None,
         description="Nome da oficina ou mecânico onde o serviço foi realizado"
@@ -369,7 +382,8 @@ class ToolCallAction(BaseModel):
                 or data.get("data_manutencao")
             )
             if date_candidate:
-                data["data"] = str(date_candidate)
+                str_date = str(date_candidate)
+                data["data"] = data["date"] = data["date_str"] = data["service_date"] = data["data_manutencao"] = str_date
             # Normalização de aliases para km
             km_candidate = (
                 data.get("km")

@@ -504,7 +504,7 @@ async def test_adversarial_chronological_correlation_and_relative_dates_sqlite()
         )
         assert outcome_blocked["success"] == []
         assert len(outcome_blocked["failed"]) == 1
-        assert outcome_blocked["failed"][0]["reason"] == "regressive_km"
+        assert outcome_blocked["failed"][0]["reason"] in ("timeline_incoherence", "regressive_km")
 
         rows_after_block = (
             await async_db_session.execute(select(MaintenanceRecordModel).where(MaintenanceRecordModel.user_id == user_id))
