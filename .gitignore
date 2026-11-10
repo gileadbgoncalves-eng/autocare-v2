@@ -29,8 +29,10 @@ backups/
 **/backups/
 *.pdf
 **/dossiers/
+*_audit_report.json
 audit_test_report.json
 security_audit_report.json
+deep_audit_report.json
 .coverage
 .coverage.*
 htmlcov/
@@ -39,6 +41,8 @@ htmlcov/
 # Pasta isolada de arquivos legados da V1
 v1_ponto_de_parada_total/
 
+[dD][uU][mM][pP]_*.md
+dump_*.md
 DUMP_*.md
 
 # Subprojetos e pastas externas locais
